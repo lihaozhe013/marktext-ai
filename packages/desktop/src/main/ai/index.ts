@@ -1,22 +1,27 @@
 import crypto from 'crypto'
 import path from 'path'
-import fs from 'fs'
 import fsPromises from 'fs/promises'
 import { BrowserWindow, ipcMain } from 'electron'
 import log from 'electron-log'
 import type {
   AiChatMessage,
-  AiConnectionSettings,
-  AiConnectionSettingsInput,
+  AiChatSession,
+  AiConnectionInput,
+  AiDiscoveredModel,
   AiEditSummary,
   AiImageAttachment,
   AiImageMimeType,
+  AiMessageModel,
+  AiModelListInput,
+  AiModelProfile,
+  AiModelRef,
   AiProtocol,
   AiRecoveryInfo,
   AiPreparedRevision,
   AiRequest,
   AiResponse,
   AiRevisionRequest,
+  AiSettings,
   AiTestResult,
   AiUndoResult
 } from '@shared/types/ai'
@@ -38,6 +43,7 @@ import {
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
+const SETTINGS_SCHEMA_VERSION = 2
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
 const CHAT_FILE = 'ai-chat.json'
@@ -76,10 +82,28 @@ class ProviderRequestError extends Error {
 
 const normalizeRevisionMarkdown = (value: string): string => value.replace(/[\r\n]+$/, '')
 
-interface StoredSettings {
-  protocol: AiConnectionSettings['protocol']
+interface StoredConnection {
+  id: string
+  name: string
+  protocol: AiProtocol
   endpoint: string
-  model: string
+  models: AiModelProfile[]
+}
+
+interface StoredSettings {
+  schemaVersion: typeof SETTINGS_SCHEMA_VERSION
+  connections: StoredConnection[]
+  defaultModel?: AiModelRef
+}
+
+type StoredKeys = Record<string, string>
+
+interface ResolvedModelTarget {
+  connection: StoredConnection
+  model: AiModelProfile
+  apiKey: string
+  ref: AiModelRef
+  attribution: AiMessageModel
 }
 
 interface StoredRevision extends AiPreparedRevision {
@@ -93,6 +117,10 @@ interface StoredRevisionState {
 
 const featureLog = (message: string, ...args: unknown[]): void => {
   log.info(`[ai-editor] ${message}`, ...args)
+}
+
+const connectionLog = (message: string, ...args: unknown[]): void => {
+  log.info(`[ai-connection] ${message}`, ...args)
 }
 
 const normalizeAttachmentList = (value: unknown): AiImageAttachment[] | undefined => {
@@ -170,17 +198,134 @@ const validateEndpoint = (endpoint: string): string => {
   return url.toString()
 }
 
-const validateInput = (input: AiConnectionSettingsInput): StoredSettings => {
+const normalizeModelRef = (value: unknown): AiModelRef | undefined => {
+  if (!isRecord(value) || typeof value.connectionId !== 'string' || typeof value.modelId !== 'string') return undefined
+  if (!value.connectionId || !value.modelId) return undefined
+  return { connectionId: value.connectionId, modelId: value.modelId }
+}
+
+const normalizeModelCapabilities = (value: unknown): AiModelProfile['capabilities'] => {
+  if (!isRecord(value)) return undefined
+  const reasoningControl = value.reasoningControl
+  if (reasoningControl !== 'unknown' && reasoningControl !== 'effort' && reasoningControl !== 'budget') return undefined
+  return { reasoningControl }
+}
+
+const normalizeModelProfile = (value: unknown): AiModelProfile | undefined => {
+  if (!isRecord(value) || typeof value.model !== 'string' || !value.model.trim()) return undefined
+  const model = value.model.trim()
+  const source = value.source === 'discovered' ? 'discovered' : 'manual'
+  return {
+    id: typeof value.id === 'string' && value.id ? value.id : `model-${crypto.randomUUID()}`,
+    model,
+    label: typeof value.label === 'string' && value.label.trim() ? value.label.trim() : model,
+    source,
+    capabilities: normalizeModelCapabilities(value.capabilities)
+  }
+}
+
+const normalizeStoredConnection = (value: unknown, index: number): StoredConnection | undefined => {
+  if (!isRecord(value)) return undefined
+  const protocol = value.protocol === 'anthropic-messages' ? 'anthropic-messages' : DEFAULT_PROTOCOL
+  const endpoint = typeof value.endpoint === 'string' ? value.endpoint : ''
+  const models = Array.isArray(value.models)
+    ? value.models.map(model => normalizeModelProfile(model)).filter((model): model is AiModelProfile => !!model)
+    : []
+  const dedupedModels = Array.from(new Map(models.map(model => [model.model, model])).values())
+  return {
+    id: typeof value.id === 'string' && value.id ? value.id : `connection-${crypto.randomUUID()}`,
+    name: typeof value.name === 'string' && value.name.trim() ? value.name.trim() : `Connection ${index + 1}`,
+    protocol,
+    endpoint,
+    models: dedupedModels
+  }
+}
+
+const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; legacy: boolean } => {
+  if (value === undefined) {
+    return {
+      settings: { schemaVersion: SETTINGS_SCHEMA_VERSION, connections: [] },
+      legacy: false
+    }
+  }
+  if (isRecord(value) && Array.isArray(value.connections)) {
+    const connections = value.connections
+      .map((connection, index) => normalizeStoredConnection(connection, index))
+      .filter((connection): connection is StoredConnection => !!connection)
+    return {
+      settings: {
+        schemaVersion: SETTINGS_SCHEMA_VERSION,
+        connections,
+        defaultModel: normalizeModelRef(value.defaultModel)
+      },
+      legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION
+    }
+  }
+
+  const legacyValue = isRecord(value) ? value : {}
+  const legacyModel = typeof legacyValue.model === 'string' ? legacyValue.model.trim() : ''
+  const legacyConnection: StoredConnection = {
+    id: 'legacy-default',
+    name: 'Default connection',
+    protocol: legacyValue.protocol === 'anthropic-messages' ? 'anthropic-messages' : DEFAULT_PROTOCOL,
+    endpoint: typeof legacyValue.endpoint === 'string' ? legacyValue.endpoint : '',
+    models: legacyModel
+      ? [{ id: 'legacy-default-model', model: legacyModel, label: legacyModel, source: 'manual' }]
+      : []
+  }
+  return {
+    settings: {
+      schemaVersion: SETTINGS_SCHEMA_VERSION,
+      connections: [legacyConnection],
+      defaultModel: legacyModel
+        ? { connectionId: legacyConnection.id, modelId: legacyConnection.models[0].id }
+        : undefined
+    },
+    legacy: true
+  }
+}
+
+const normalizeStoredKeys = (value: unknown, settings: StoredSettings): { keys: StoredKeys; legacy: boolean } => {
+  if (isRecord(value) && !Array.isArray(value)) {
+    const keys: StoredKeys = {}
+    for (const [connectionId, apiKey] of Object.entries(value)) {
+      if (typeof apiKey === 'string' && apiKey.trim()) keys[connectionId] = apiKey.trim()
+    }
+    return { keys, legacy: false }
+  }
+  if (typeof value === 'string' && value.trim() && settings.connections[0]) {
+    return { keys: { [settings.connections[0].id]: value.trim() }, legacy: true }
+  }
+  return { keys: {}, legacy: true }
+}
+
+const validateConnectionInput = (input: AiConnectionInput): {
+  id: string
+  name: string
+  protocol: AiProtocol
+  endpoint: string
+  models: AiModelProfile[]
+} => {
   if (input.protocol !== 'openai-chat-completions' && input.protocol !== 'anthropic-messages') {
     throw new Error('Unsupported AI protocol.')
   }
   const endpoint = validateEndpoint(input.endpoint)
-  const model = input.model.trim()
-  if (!model) throw new Error('Model is required.')
-  return { protocol: input.protocol, endpoint, model }
+  const name = input.name.trim()
+  if (!name) throw new Error('Connection name is required.')
+  const models = input.models
+    .map(model => normalizeModelProfile({ ...model, model: model.model.trim() }))
+    .filter((model): model is AiModelProfile => !!model)
+  const dedupedModels = Array.from(new Map(models.map(model => [model.model, model])).values())
+  return {
+    id: input.id?.trim() || `connection-${crypto.randomUUID()}`,
+    name,
+    protocol: input.protocol,
+    endpoint,
+    models: dedupedModels
+  }
 }
 
-const resolveRequestEndpoint = (settings: StoredSettings): string => {
+const resolveRequestEndpoint = (settings: Pick<StoredConnection, 'protocol' | 'endpoint'>): string => {
   const url = new URL(settings.endpoint)
   const pathname = url.pathname.replace(/\/+$/, '')
   if (settings.protocol === 'openai-chat-completions') {
@@ -195,10 +340,51 @@ const resolveRequestEndpoint = (settings: StoredSettings): string => {
   return url.toString()
 }
 
-const toPublicSettings = (settings: StoredSettings, apiKey: string): AiConnectionSettings => ({
-  ...settings,
-  hasApiKey: apiKey.length > 0
+const resolveModelsEndpoint = (settings: Pick<StoredConnection, 'protocol' | 'endpoint'>): string => {
+  const url = new URL(settings.endpoint)
+  const pathname = url.pathname.replace(/\/+$/, '')
+  if (settings.protocol === 'openai-chat-completions') {
+    url.pathname = pathname.endsWith('/chat/completions')
+      ? `${pathname.slice(0, -'/chat/completions'.length)}/models`
+      : `${pathname}/models`
+  } else {
+    url.pathname = pathname.endsWith('/messages')
+      ? `${pathname.slice(0, -'/messages'.length)}/models`
+      : pathname.endsWith('/v1')
+        ? `${pathname}/models`
+        : `${pathname}/v1/models`
+  }
+  return url.toString()
+}
+
+const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
+  defaultModel: settings.defaultModel,
+  connections: settings.connections.map(connection => ({
+    ...connection,
+    models: connection.models.map(model => ({ ...model })),
+    hasApiKey: !!keys[connection.id]
+  }))
 })
+
+const toMessageModel = (target: ResolvedModelTarget): AiMessageModel => ({ ...target.attribution })
+
+const normalizeMessageModel = (value: unknown): AiMessageModel | undefined => {
+  if (!isRecord(value)) return undefined
+  if (
+    typeof value.connectionId !== 'string' ||
+    typeof value.modelId !== 'string' ||
+    typeof value.connectionName !== 'string' ||
+    typeof value.model !== 'string' ||
+    (value.protocol !== 'openai-chat-completions' && value.protocol !== 'anthropic-messages')
+  ) return undefined
+  return {
+    connectionId: value.connectionId,
+    modelId: value.modelId,
+    connectionName: value.connectionName,
+    model: value.model,
+    protocol: value.protocol
+  }
+}
 
 const normalizeMessages = (messages: unknown): AiChatMessage[] => {
   if (!Array.isArray(messages)) return []
@@ -253,10 +439,20 @@ const normalizeMessages = (messages: unknown): AiChatMessage[] => {
         ...item,
         revisionId: typeof item.revisionId === 'string' ? item.revisionId : undefined,
         editSummary,
-        attachments: normalizeAttachmentList(item.attachments)
+        attachments: normalizeAttachmentList(item.attachments),
+        model: normalizeMessageModel(item.model)
       }
     })
     .slice(-MAX_CONTEXT_MESSAGES)
+}
+
+const normalizeChatSession = (value: unknown): AiChatSession => {
+  if (Array.isArray(value)) return { messages: normalizeMessages(value) }
+  if (!isRecord(value)) return { messages: [] }
+  return {
+    messages: normalizeMessages(value.messages),
+    selectedModel: normalizeModelRef(value.selectedModel)
+  }
 }
 
 const extractText = (payload: unknown): string => {
@@ -293,7 +489,7 @@ const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean =>
   return choices[0].finish_reason === 'length'
 }
 
-class AiService {
+export class AiService {
   private readonly settingsPath: string
   private readonly keyPath: string
   private readonly chatPath: string
@@ -304,6 +500,7 @@ class AiService {
   private readonly attachmentMimeTypes = new Map<string, AiImageMimeType>()
   private readonly controllers = new Map<string, AbortController>()
   private readonly toolCapabilities = new Map<string, boolean>()
+  private settingsMutation: Promise<void> = Promise.resolve()
 
   constructor(userDataPath: string) {
     this.settingsPath = path.join(userDataPath, SETTINGS_FILE)
@@ -313,66 +510,233 @@ class AiService {
     this.attachmentStore = new AiAttachmentStore(userDataPath)
   }
 
-  private async readSettings(): Promise<{ settings: StoredSettings; apiKey: string }> {
-    const settings = await readJson<StoredSettings>(this.settingsPath, {
-      protocol: DEFAULT_PROTOCOL,
-      endpoint: '',
-      model: ''
-    })
-    const apiKeyValue = await readJson<unknown>(this.keyPath, '')
-    const apiKey = typeof apiKeyValue === 'string' ? apiKeyValue : ''
+  private queueSettingsMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.settingsMutation.then(operation, operation)
+    this.settingsMutation = result.then(() => undefined, () => undefined)
+    return result
+  }
+
+  private async readSettingsState(): Promise<{ settings: StoredSettings; keys: StoredKeys }> {
+    const rawSettings = await readJson<unknown>(this.settingsPath, undefined)
+    const normalizedSettings = normalizeStoredSettings(rawSettings)
+    const rawKeys = await readJson<unknown>(this.keyPath, undefined)
+    const normalizedKeys = normalizeStoredKeys(rawKeys, normalizedSettings.settings)
+    if (normalizedSettings.legacy || normalizedKeys.legacy) {
+      await writeJsonAtomic(this.settingsPath, normalizedSettings.settings)
+      await writeJsonAtomic(this.keyPath, normalizedKeys.keys)
+      featureLog('legacy connection settings migrated connectionCount=%s', normalizedSettings.settings.connections.length)
+    }
+    return { settings: normalizedSettings.settings, keys: normalizedKeys.keys }
+  }
+
+  private async resolveModelTarget(modelRef: AiModelRef, state?: { settings: StoredSettings; keys: StoredKeys }): Promise<ResolvedModelTarget> {
+    const current = state ?? await this.readSettingsState()
+    const connection = current.settings.connections.find(item => item.id === modelRef.connectionId)
+    if (!connection) throw new Error('The selected AI connection no longer exists.')
+    const model = connection.models.find(item => item.id === modelRef.modelId)
+    if (!model) throw new Error('The selected AI model no longer exists.')
+    const apiKey = current.keys[connection.id] ?? ''
+    if (!apiKey) throw new Error(`Configure an API key for connection "${connection.name}" first.`)
     return {
-      settings: {
-        protocol:
-          settings.protocol === 'anthropic-messages'
-            ? 'anthropic-messages'
-            : DEFAULT_PROTOCOL,
-        endpoint: typeof settings.endpoint === 'string' ? settings.endpoint : '',
-        model: typeof settings.model === 'string' ? settings.model : ''
-      },
-      apiKey
+      connection: { ...connection, models: connection.models.map(item => ({ ...item })) },
+      model: { ...model },
+      apiKey,
+      ref: { ...modelRef },
+      attribution: {
+        connectionId: connection.id,
+        modelId: model.id,
+        connectionName: connection.name,
+        model: model.model,
+        protocol: connection.protocol
+      }
     }
   }
 
-  async getSettings(): Promise<AiConnectionSettings> {
-    const { settings, apiKey } = await this.readSettings()
-    return toPublicSettings(settings, apiKey)
+  async getSettings(): Promise<AiSettings> {
+    const { settings, keys } = await this.readSettingsState()
+    return toPublicSettings(settings, keys)
   }
 
-  async saveSettings(input: AiConnectionSettingsInput): Promise<AiConnectionSettings> {
-    const settings = validateInput(input)
-    const previous = await this.readSettings()
-    await writeJsonAtomic(this.settingsPath, settings)
-    if (typeof input.apiKey === 'string' && input.apiKey.trim()) {
-      await writeJsonAtomic(this.keyPath, input.apiKey.trim())
-    } else if (!fs.existsSync(this.keyPath) && previous.apiKey) {
-      await writeJsonAtomic(this.keyPath, previous.apiKey)
-    }
-    featureLog('connection settings saved')
-    return toPublicSettings(settings, (await this.readSettings()).apiKey)
+  async saveConnection(input: AiConnectionInput): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      connectionLog(
+        'save start connectionId=%s protocol=%s endpoint=%s modelCount=%s',
+        input.id ?? 'new',
+        input.protocol,
+        input.endpoint,
+        input.models.length
+      )
+      const connection = validateConnectionInput(input)
+      const current = await this.readSettingsState()
+      const connections = current.settings.connections.some(item => item.id === connection.id)
+        ? current.settings.connections.map(item => item.id === connection.id ? connection : item)
+        : [...current.settings.connections, connection]
+      const defaultModel = current.settings.defaultModel && connections.some(item =>
+        item.id === current.settings.defaultModel?.connectionId &&
+        item.models.some(model => model.id === current.settings.defaultModel?.modelId)
+      )
+        ? current.settings.defaultModel
+        : connection.models[0]
+          ? { connectionId: connection.id, modelId: connection.models[0].id }
+          : undefined
+      const settings: StoredSettings = { schemaVersion: SETTINGS_SCHEMA_VERSION, connections, defaultModel }
+      const keys = { ...current.keys }
+      if (typeof input.apiKey === 'string' && input.apiKey.trim()) keys[connection.id] = input.apiKey.trim()
+      await writeJsonAtomic(this.settingsPath, settings)
+      await writeJsonAtomic(this.keyPath, keys)
+      connectionLog('save succeeded connectionId=%s modelCount=%s', connection.id, connection.models.length)
+      return toPublicSettings(settings, keys)
+    })
   }
 
-  async deleteKey(): Promise<AiConnectionSettings> {
+  async deleteConnection(connectionId: string): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const connections = current.settings.connections.filter(connection => connection.id !== connectionId)
+      if (connections.length === current.settings.connections.length) return toPublicSettings(current.settings, current.keys)
+      const keys = { ...current.keys }
+      delete keys[connectionId]
+      const fallbackConnection = connections.find(connection => connection.models.length > 0)
+      const defaultModel = current.settings.defaultModel?.connectionId === connectionId
+        ? fallbackConnection
+          ? { connectionId: fallbackConnection.id, modelId: fallbackConnection.models[0].id }
+          : undefined
+        : current.settings.defaultModel
+      const settings: StoredSettings = { schemaVersion: SETTINGS_SCHEMA_VERSION, connections, defaultModel }
+      await writeJsonAtomic(this.settingsPath, settings)
+      await writeJsonAtomic(this.keyPath, keys)
+      featureLog('connection deleted connectionId=%s', connectionId)
+      return toPublicSettings(settings, keys)
+    })
+  }
+
+  async deleteConnectionKey(connectionId: string): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const keys = { ...current.keys }
+      delete keys[connectionId]
+      await writeJsonAtomic(this.keyPath, keys)
+      featureLog('connection key deleted connectionId=%s', connectionId)
+      return toPublicSettings(current.settings, keys)
+    })
+  }
+
+  async setDefaultModel(modelRef: AiModelRef | null): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      if (modelRef) {
+        try {
+          await this.resolveModelTarget(modelRef, current)
+        } catch (error) {
+          if (!(error instanceof Error && error.message.includes('API key'))) throw error
+        }
+      }
+      const settings: StoredSettings = {
+        ...current.settings,
+        defaultModel: modelRef ?? undefined
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
+  async testConnection(input: AiConnectionInput): Promise<AiTestResult> {
+    connectionLog(
+      'test start connectionId=%s protocol=%s endpoint=%s modelCount=%s',
+      input.id ?? 'new',
+      input.protocol,
+      input.endpoint,
+      input.models.length
+    )
     try {
-      await fsPromises.unlink(this.keyPath)
-    } catch {
-      // Deleting an already absent key is idempotent.
+      const connection = validateConnectionInput(input)
+      const current = await this.readSettingsState()
+      const apiKey = input.apiKey?.trim() || (input.id ? current.keys[input.id] : '') || ''
+      const model = connection.models[0]
+      if (!model) throw new Error('Add at least one model before testing the connection.')
+      await this.requestProvider({
+        connection,
+        model,
+        apiKey,
+        ref: { connectionId: connection.id, modelId: model.id },
+        attribution: {
+          connectionId: connection.id,
+          modelId: model.id,
+          connectionName: connection.name,
+          model: model.model,
+          protocol: connection.protocol
+        }
+      }, connectionTestSystemPrompt, [{ role: 'user', content: connectionTestUserPrompt }], `test-${crypto.randomUUID()}`)
+      connectionLog('test succeeded connectionId=%s model=%s', connection.id, model.model)
+      return { ok: true, message: 'Connection succeeded.' }
+    } catch (error) {
+      connectionLog('test failed errorName=%s', error instanceof Error ? error.name : 'unknown')
+      return { ok: false, message: error instanceof Error ? error.message : String(error) }
     }
-    featureLog('connection key deleted')
-    return this.getSettings()
+  }
+
+  async listModels(input: AiModelListInput): Promise<AiDiscoveredModel[]> {
+    connectionLog(
+      'model discovery start connectionId=%s protocol=%s endpoint=%s',
+      input.connectionId ?? 'new',
+      input.protocol,
+      input.endpoint
+    )
+    const protocol = input.protocol
+    const endpoint = validateEndpoint(input.endpoint)
+    const current = await this.readSettingsState()
+    const apiKey = input.apiKey?.trim() || (input.connectionId ? current.keys[input.connectionId] : '') || ''
+    if (!apiKey) throw new Error('Configure an API key before refreshing models.')
+    const requestEndpoint = resolveModelsEndpoint({ protocol, endpoint })
+    const headers: Record<string, string> = { accept: 'application/json' }
+    if (protocol === 'anthropic-messages') {
+      headers['x-api-key'] = apiKey
+      headers['anthropic-version'] = ANTHROPIC_VERSION
+    } else {
+      headers.authorization = `Bearer ${apiKey}`
+      headers['api-key'] = apiKey
+    }
+    const response = await fetch(requestEndpoint, { method: 'GET', headers, redirect: 'error' })
+    const text = await response.text()
+    let payload: unknown
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      payload = null
+    }
+    if (!response.ok) throw new Error(`Model discovery failed with HTTP ${response.status}.`)
+    const values = isRecord(payload) && Array.isArray(payload.data)
+      ? payload.data
+      : isRecord(payload) && Array.isArray(payload.models)
+        ? payload.models
+        : []
+    const models = values.filter(isRecord).map(item => {
+      const model = typeof item.id === 'string' ? item.id : typeof item.name === 'string' ? item.name : ''
+      return {
+        model,
+        label: typeof item.display_name === 'string'
+          ? item.display_name
+          : typeof item.name === 'string' ? item.name : undefined,
+        ownedBy: typeof item.owned_by === 'string' ? item.owned_by : undefined
+      }
+    }).filter(item => !!item.model)
+    connectionLog('model discovery succeeded connectionId=%s modelCount=%s', input.connectionId ?? 'new', models.length)
+    return models
   }
 
   private async requestProvider(
-    settings: StoredSettings,
-    apiKey: string,
+    target: ResolvedModelTarget,
     system: string,
     messages: ProviderMessage[],
     requestId: string,
     signal?: AbortSignal,
     options: ProviderRequestOptions = {}
   ): Promise<ProviderResponse> {
+    const settings = target.connection
+    const model = target.model.model
+    const apiKey = target.apiKey
     if (!apiKey) throw new Error('Configure an API key in AI settings first.')
-    if (!settings.endpoint || !settings.model) {
+    if (!settings.endpoint || !model) {
       throw new Error('Configure an AI endpoint and model first.')
     }
     const requestEndpoint = resolveRequestEndpoint(settings)
@@ -380,7 +744,7 @@ class AiService {
       'request start protocol=%s endpoint=%s model=%s requestId=%s',
       settings.protocol,
       requestEndpoint,
-      settings.model,
+      model,
       requestId
     )
     const controller = new AbortController()
@@ -398,7 +762,7 @@ class AiService {
         'request timeout protocol=%s endpoint=%s model=%s requestId=%s timeoutMs=%s',
         settings.protocol,
         requestEndpoint,
-        settings.model,
+        model,
         requestId,
         REQUEST_TIMEOUT_MS
       )
@@ -414,7 +778,7 @@ class AiService {
         headers['x-api-key'] = apiKey
         headers['api-key'] = apiKey
         headers['anthropic-version'] = ANTHROPIC_VERSION
-        body = { model: settings.model, max_tokens: 4096, system, messages: serializeProviderMessages(settings.protocol, messages) }
+        body = { model, max_tokens: 4096, system, messages: serializeProviderMessages(settings.protocol, messages) }
         if (options.tool) {
           body.tools = [{ name: options.tool.name, description: options.tool.description, input_schema: options.tool.parameters }]
           body.tool_choice = { type: 'tool', name: options.tool.name }
@@ -424,7 +788,7 @@ class AiService {
         // Some OpenAI-compatible gateways, including MiMo Token Plan, document
         // `api-key` instead of the standard Authorization header.
         headers['api-key'] = apiKey
-        body = { model: settings.model, messages: [{ role: 'system', content: system }, ...serializeProviderMessages(settings.protocol, messages)] }
+        body = { model, messages: [{ role: 'system', content: system }, ...serializeProviderMessages(settings.protocol, messages)] }
         if (options.tool) {
           body.tools = [{ type: 'function', function: { name: options.tool.name, description: options.tool.description, parameters: options.tool.parameters } }]
           body.tool_choice = { type: 'function', function: { name: options.tool.name } }
@@ -442,7 +806,7 @@ class AiService {
         response.status,
         settings.protocol,
         requestEndpoint,
-        settings.model,
+        model,
         requestId
       )
       const text = await response.text()
@@ -474,7 +838,7 @@ class AiService {
           'request cancelled protocol=%s endpoint=%s model=%s requestId=%s',
           settings.protocol,
           requestEndpoint,
-          settings.model,
+          model,
           requestId
         )
         throw new Error('AI request was cancelled.')
@@ -494,7 +858,7 @@ class AiService {
           error instanceof Error ? error.message : String(error),
           settings.protocol,
           requestEndpoint,
-          settings.model,
+          model,
           requestId
         )
       }
@@ -506,31 +870,11 @@ class AiService {
     }
   }
 
-  async testSettings(input: AiConnectionSettingsInput): Promise<AiTestResult> {
-    try {
-      const settings = validateInput(input)
-      const current = await this.readSettings()
-      const apiKey = input.apiKey?.trim() || current.apiKey
-      await this.requestProvider(
-        settings,
-        apiKey,
-        connectionTestSystemPrompt,
-        [{ role: 'user', content: connectionTestUserPrompt }],
-        `test-${crypto.randomUUID()}`
-      )
-      return { ok: true, message: 'Connection succeeded.' }
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : String(error) }
-    }
-  }
-
   private async pruneAttachments(graceMs = ATTACHMENT_GRACE_MS): Promise<void> {
     const all = await readJson<Record<string, unknown>>(this.chatPath, {})
     const referenced = new Set<string>()
     for (const value of Object.values(all)) {
-      if (Array.isArray(value)) {
-        for (const id of collectAttachmentIds(normalizeMessages(value))) referenced.add(id)
-      }
+      for (const id of collectAttachmentIds(normalizeChatSession(value).messages)) referenced.add(id)
     }
     const now = Date.now()
     for (const [id, expiresAt] of this.pendingAttachmentIds) {
@@ -612,8 +956,7 @@ class AiService {
   }
 
   private async repairMarkdownResponse(
-    settings: StoredSettings,
-    apiKey: string,
+    target: ResolvedModelTarget,
     system: string,
     messages: ProviderMessage[],
     generated: ProviderResponse,
@@ -638,8 +981,7 @@ class AiService {
     const failure = inspection.issues.map(issue => issue.message).join(' ')
     try {
       const repaired = await this.requestProvider(
-        settings,
-        apiKey,
+        target,
         system,
         [
           ...messages,
@@ -678,7 +1020,7 @@ class AiService {
 
   async readAttachment(documentId: string, attachmentId: string): Promise<{ mimeType: AiImageMimeType; data: Uint8Array }> {
     const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-    const messages = normalizeMessages(all[documentId])
+    const messages = normalizeChatSession(all[documentId]).messages
     const metadata = messages.flatMap(message => message.attachments ?? []).find(attachment => attachment.id === attachmentId)
     const mimeType = metadata?.mimeType ?? this.attachmentMimeTypes.get(attachmentId)
     if (!mimeType) throw new Error('Image attachment was not found.')
@@ -687,7 +1029,9 @@ class AiService {
 
   async request(request: AiRequest): Promise<AiResponse> {
     if (!request.requestId || !request.documentId) throw new Error('Invalid AI request.')
-    const { settings, apiKey } = await this.readSettings()
+    const state = await this.readSettingsState()
+    const target = await this.resolveModelTarget(request.modelRef, state)
+    const settings = target.connection
     const currentAttachments = await this.saveRequestAttachments(request.attachments, request.documentId)
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))
     const recentMessages = normalizeMessages(request.messages).map(({ role, mode, content, attachments }) => ({
@@ -715,15 +1059,13 @@ class AiService {
         { role: 'user', content: buildDocumentPrompt(request.prompt, request.markdown, promptToken), attachments: currentAttachments }
       ], priorityAttachmentIds)
       const result = await this.requestProvider(
-        settings,
-        apiKey,
+        target,
         buildAnswerSystemPrompt(promptToken),
         messages,
         request.requestId
       )
       const repaired = await this.repairMarkdownResponse(
-        settings,
-        apiKey,
+        target,
         buildAnswerSystemPrompt(promptToken),
         messages,
         result,
@@ -744,7 +1086,8 @@ class AiService {
         content: repaired.content,
         recovery: repaired.recovery,
         documentId: request.documentId,
-        baseMarkdown: request.markdown
+        baseMarkdown: request.markdown,
+        model: toMessageModel(target)
       }
     }
 
@@ -758,8 +1101,7 @@ class AiService {
           { role: 'user', content: buildDocumentPrompt(request.prompt, request.markdown, promptToken), attachments: currentAttachments }
         ], priorityAttachmentIds)
         const result = await this.requestProvider(
-          settings,
-          apiKey,
+          target,
           buildRewriteSystemPrompt(promptToken),
           messages,
           request.requestId,
@@ -767,8 +1109,7 @@ class AiService {
         )
         if (result.truncated) throw new Error('The model response was truncated before a complete document was returned.')
         const repaired = await this.repairMarkdownResponse(
-          settings,
-          apiKey,
+          target,
           buildRewriteSystemPrompt(promptToken),
           messages,
           result,
@@ -791,7 +1132,8 @@ class AiService {
           markdown,
           recovery: repaired.recovery,
           documentId: request.documentId,
-          baseMarkdown: request.markdown
+          baseMarkdown: request.markdown,
+          model: toMessageModel(target)
         }
       }
 
@@ -802,13 +1144,12 @@ class AiService {
         attachments: currentAttachments,
         generateTool: async(agentRequest) => {
           const hasImages = agentRequest.messages.some(message => !!message.attachments?.length)
-          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${settings.model}|${hasImages ? 'image' : 'text'}`
+          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}|${hasImages ? 'image' : 'text'}`
           if (this.toolCapabilities.get(capabilityKey) === false) return { content: '', toolUnsupported: true }
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds)
           try {
             const generated = await this.requestProvider(
-              settings,
-              apiKey,
+              target,
               `${agentRequest.system}\nWhen the submit_markdown_edits tool is available, call it exactly once with the validated edit object instead of writing the text protocol. Do not emit prose or a text protocol outside the tool call.`,
               messages,
               agentRequest.requestId,
@@ -820,7 +1161,7 @@ class AiService {
           } catch (error) {
             if (error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)) {
               this.toolCapabilities.set(capabilityKey, false)
-              featureLog('output repair tool capability unavailable protocol=%s model=%s requestId=%s', settings.protocol, settings.model, agentRequest.requestId)
+              featureLog('output repair tool capability unavailable protocol=%s model=%s requestId=%s', settings.protocol, target.model.model, agentRequest.requestId)
               return { content: '', toolUnsupported: true }
             }
             throw error
@@ -831,8 +1172,7 @@ class AiService {
         generate: async(agentRequest) => {
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds)
           const generated = await this.requestProvider(
-            settings,
-            apiKey,
+            target,
             agentRequest.system,
             messages,
             agentRequest.requestId,
@@ -843,8 +1183,7 @@ class AiService {
         generateWhole: async(agentRequest) => {
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds)
           const generated = await this.requestProvider(
-            settings,
-            apiKey,
+            target,
             agentRequest.system,
             messages,
             agentRequest.requestId,
@@ -886,7 +1225,8 @@ class AiService {
         editSummary: result.summary,
         recovery: result.recovery,
         documentId: request.documentId,
-        baseMarkdown: request.markdown
+        baseMarkdown: request.markdown,
+        model: toMessageModel(target)
       }
     } finally {
       this.controllers.delete(request.requestId)
@@ -900,14 +1240,17 @@ class AiService {
     }
   }
 
-  async loadChat(documentId: string): Promise<AiChatMessage[]> {
+  async loadChat(documentId: string): Promise<AiChatSession> {
     const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-    return normalizeMessages(all[documentId])
+    return normalizeChatSession(all[documentId])
   }
 
-  async saveChat(documentId: string, messages: AiChatMessage[]): Promise<void> {
+  async saveChat(documentId: string, session: AiChatSession): Promise<void> {
     const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-    const normalized = normalizeMessages(messages)
+    const normalized: AiChatSession = {
+      messages: normalizeMessages(session.messages),
+      selectedModel: normalizeModelRef(session.selectedModel)
+    }
     all[documentId] = normalized
     for (const [id, pendingDocumentId] of this.pendingAttachmentDocuments) {
       if (pendingDocumentId === documentId) {
@@ -1068,27 +1411,38 @@ const extractToolCalls = (payload: unknown, protocol: AiProtocol): ProviderToolC
 
 export const registerAiIpcHandlers = (userDataPath: string): void => {
   const aiService = new AiService(userDataPath)
-  const broadcastSettings = (settings: AiConnectionSettings): void => {
+  const broadcastSettings = (settings: AiSettings): void => {
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) window.webContents.send('mt::ai-settings-changed', settings)
     }
   }
   ipcMain.handle('mt::ai::get-settings', () => aiService.getSettings())
-  ipcMain.handle('mt::ai::save-settings', async(_event, settings: AiConnectionSettingsInput) => {
-    const saved = await aiService.saveSettings(settings)
+  ipcMain.handle('mt::ai::save-connection', async(_event, connection: AiConnectionInput) => {
+    const saved = await aiService.saveConnection(connection)
     broadcastSettings(saved)
     return saved
   })
-  ipcMain.handle('mt::ai::delete-key', async() => {
-    const saved = await aiService.deleteKey()
+  ipcMain.handle('mt::ai::delete-connection', async(_event, connectionId: string) => {
+    const saved = await aiService.deleteConnection(connectionId)
     broadcastSettings(saved)
     return saved
   })
-  ipcMain.handle('mt::ai::test-settings', (_event, settings: AiConnectionSettingsInput) => aiService.testSettings(settings))
+  ipcMain.handle('mt::ai::delete-connection-key', async(_event, connectionId: string) => {
+    const saved = await aiService.deleteConnectionKey(connectionId)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-default-model', async(_event, modelRef) => {
+    const saved = await aiService.setDefaultModel(modelRef)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::test-connection', (_event, connection: AiConnectionInput) => aiService.testConnection(connection))
+  ipcMain.handle('mt::ai::list-models', (_event, connection: AiModelListInput) => aiService.listModels(connection))
   ipcMain.handle('mt::ai::request', (_event, request: AiRequest) => aiService.request(request))
   ipcMain.on('mt::ai::cancel', (_event, requestId: string) => aiService.cancel(requestId))
   ipcMain.handle('mt::ai::chat-load', (_event, documentId: string) => aiService.loadChat(documentId))
-  ipcMain.handle('mt::ai::chat-save', (_event, documentId: string, messages: AiChatMessage[]) => aiService.saveChat(documentId, messages))
+  ipcMain.handle('mt::ai::chat-save', (_event, documentId: string, session: AiChatSession) => aiService.saveChat(documentId, session))
   ipcMain.handle('mt::ai::chat-clear', (_event, documentId: string) => aiService.clearChat(documentId))
   ipcMain.handle('mt::ai::attachment-read', (_event, documentId: string, attachmentId: string) => aiService.readAttachment(documentId, attachmentId))
   ipcMain.handle('mt::ai::revision-prepare', (_event, request: AiRevisionRequest) => aiService.prepareRevision(request))

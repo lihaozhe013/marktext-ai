@@ -33,13 +33,16 @@ import type {
 import type { BufferedState as BufferedStateType } from './bufferedState'
 import type { MenuTemplate, MenuPopupPosition } from './menu'
 import type {
-  AiChatMessage,
-  AiConnectionSettings,
-  AiConnectionSettingsInput,
+  AiChatSession,
+  AiConnectionInput,
   AiImageData,
+  AiDiscoveredModel,
+  AiModelListInput,
+  AiModelRef,
   AiPreparedRevision,
   AiRequest,
   AiResponse,
+  AiSettings,
   AiTestResult,
   AiUndoResult,
   AiRevisionRequest
@@ -50,13 +53,16 @@ import type {
 // =================================================================
 
 export interface IpcInvokeChannels {
-  'mt::ai::get-settings': { args: []; ret: AiConnectionSettings }
-  'mt::ai::save-settings': { args: [settings: AiConnectionSettingsInput]; ret: AiConnectionSettings }
-  'mt::ai::delete-key': { args: []; ret: AiConnectionSettings }
-  'mt::ai::test-settings': { args: [settings: AiConnectionSettingsInput]; ret: AiTestResult }
+  'mt::ai::get-settings': { args: []; ret: AiSettings }
+  'mt::ai::save-connection': { args: [connection: AiConnectionInput]; ret: AiSettings }
+  'mt::ai::delete-connection': { args: [connectionId: string]; ret: AiSettings }
+  'mt::ai::delete-connection-key': { args: [connectionId: string]; ret: AiSettings }
+  'mt::ai::set-default-model': { args: [modelRef: AiModelRef | null]; ret: AiSettings }
+  'mt::ai::test-connection': { args: [connection: AiConnectionInput]; ret: AiTestResult }
+  'mt::ai::list-models': { args: [connection: AiModelListInput]; ret: AiDiscoveredModel[] }
   'mt::ai::request': { args: [request: AiRequest]; ret: AiResponse }
-  'mt::ai::chat-load': { args: [documentId: string]; ret: AiChatMessage[] }
-  'mt::ai::chat-save': { args: [documentId: string, messages: AiChatMessage[]]; ret: void }
+  'mt::ai::chat-load': { args: [documentId: string]; ret: AiChatSession }
+  'mt::ai::chat-save': { args: [documentId: string, session: AiChatSession]; ret: void }
   'mt::ai::chat-clear': { args: [documentId: string]; ret: void }
   'mt::ai::attachment-read': { args: [documentId: string, attachmentId: string]; ret: AiImageData }
   'mt::ai::revision-prepare': { args: [request: AiRevisionRequest]; ret: AiPreparedRevision }
@@ -249,7 +255,7 @@ export interface IpcMainEventChannels {
   'mt::UPDATE_NOT_AVAILABLE': [info?: unknown]
   'mt::about-dialog': []
   'mt::ask-for-close': []
-  'mt::ai-settings-changed': [settings: AiConnectionSettings]
+  'mt::ai-settings-changed': [settings: AiSettings]
   'mt::ai-toggle-panel': []
   'mt::bootstrap-editor': [config: BootstrapEditorConfig]
   'mt::cm-copy-as-html': []
