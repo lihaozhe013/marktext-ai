@@ -589,7 +589,7 @@ export const useAiStore = defineStore('ai', () => {
         if (settled) return
         settled = true
         error.value = 'The AI edit could not be applied because the editor is unavailable.'
-        void discardPreparedRevision(revisionId).finally(() => {
+        discardPreparedRevision(revisionId).finally(() => {
           pendingRevision.value = null
           resolve()
         })

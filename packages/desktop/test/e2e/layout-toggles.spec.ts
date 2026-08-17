@@ -74,7 +74,8 @@ test.describe('Layout panel toggles', () => {
   // Regression for the gap left between the sidebar and editor when the
   // sidebar collapses to its 45px icon strip (rightColumn=''). The store's
   // `sideBarWidth` is clamped to ≥220, so the editor's max-width must come
-  // from the *effective* sidebar width, not the raw store value.
+  // from the *effective* sidebar width, not the raw store value. The AI panel
+  // is hidden here so its optional fixed width does not mask that regression.
   test('Editor fills width after collapsing sidebar to icon strip', async() => {
     // Ensure sidebar is visible.
     const sideBar = page.locator('.side-bar')
@@ -88,6 +89,12 @@ test.describe('Layout panel toggles', () => {
         null,
         { timeout: 5000 }
       )
+    }
+
+    const aiPanel = page.locator('.ai-panel')
+    if (await aiPanel.isVisible()) {
+      await clickMenuById(app, 'aiEditorPanelMenuItem')
+      await expect(aiPanel).toBeHidden()
     }
 
     // Open search panel and then collapse it back to the icon strip by
