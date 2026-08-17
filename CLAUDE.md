@@ -47,6 +47,56 @@ AI logs use `[ai-editor]` and `[ai-output-repair]`; they must not include API
 keys, image bytes/base64, attachment paths, or document content. Relevant
 tests are in `packages/desktop/test/unit/specs/ai-*.spec.ts`.
 
+### AI Edit Transaction Contract
+
+This is a fork-owned design contract for AI document mutations. Read it before
+changing the AI editor, editor-tab coordination, or revision journal. The goal
+is to preserve arbitrary source Markdown while keeping AI edits atomic and
+safe to merge with upstream MarkText.
+
+- The contract applies to `edit`, `rewrite`, and AI `undo`. `answer` does not
+  mutate the document and must not lock the editor.
+- After the active editor is flushed, an edit session captures the raw
+  `currentFile.markdown`, document identity, tab identity, active surface, and
+  a monotonic content revision. The raw snapshot is the conflict boundary.
+- While an edit session is running, the active WYSIWYG and source-code editing
+  surfaces are read-only. Document mutations, formatting commands, tab
+  switches, source/WYSIWYG switches, and other document replacement paths must
+  be blocked at both the UI and command/store boundaries. The AI panel may
+  still stop a request or resolve a recovery confirmation.
+- An external reload or file change invalidates the session. The pending AI
+  result must not be applied; cancel or ignore the request and unlock only
+  after the request/apply promise has settled.
+- Never compare raw `currentFile.markdown` with `Muya.getMarkdown()` to decide
+  whether the document changed. Muya serializes some valid Markdown into a
+  different canonical form, notably wide HTML-containing tables such as the
+  repository README. Freezing input does not remove this representation
+  mismatch.
+- AI revision preparation, commit, undo, and file save use the raw Markdown
+  snapshot and raw AI result. Muya may be updated to render the result and
+  maintain blocks, TOC, and undo state, but its canonical serialization must
+  not silently replace the raw text persisted for this AI transaction.
+- The WYSIWYG `json-change` path needs an explicit, one-shot AI raw-Markdown
+  override/suppression boundary when `replaceContent()` is used. Do not solve
+  the README problem by changing the upstream Muya table serializer or by
+  globally normalizing Markdown.
+- `ai-apply-markdown` must target exactly one active surface. An inactive
+  editor listener must ignore the event rather than call `onApplied(false)`;
+  the store callback must also be idempotent. This prevents WYSIWYG and source
+  mode listeners from racing on the same apply payload.
+- Prepared revisions that fail, are cancelled, become stale, or are discarded
+  during recovery must be discarded from the revision journal. Only a
+  successfully applied result may become `committed`.
+- Keep the lock/session state, raw-Markdown bridge, and cleanup logic in
+  additive fork-owned renderer/main modules where practical. Keep changes to
+  existing upstream editor files as small adapters, do not modify
+  `packages/muya` serialization for this feature, and isolate any new IPC
+  channels in the typed shared contract.
+- Required regression coverage includes a non-canonical README-style table,
+  raw save/undo preservation, WYSIWYG and source mode, blocked editing and tab
+  switching, external-change invalidation, cancellation, recovery accept and
+  discard, unlock-on-every-exit-path, and the single-callback listener rule.
+
 ### Runtime data paths
 
 Runtime state is rooted at `<userDataPath>`:

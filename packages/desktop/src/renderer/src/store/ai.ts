@@ -3,6 +3,16 @@ import { defineStore } from 'pinia'
 import log from 'electron-log'
 import bus from '../bus'
 import { useEditorStore } from './editor'
+import { usePreferencesStore } from './preferences'
+import {
+  aiEditSession,
+  beginAiEditSession,
+  endAiEditSession,
+  getAiDocumentRevision,
+  isAiEditLocked,
+  setAiEditSessionStatus,
+  type AiEditorSurface
+} from './aiEditSession'
 import type {
   AiChatMessage,
   AiConnectionSettings,
@@ -24,6 +34,7 @@ import { AiChangeTracker, rangesFromSummary, fullDocumentRange, type AiChangeMar
 
 export interface AiApplyPayload {
   tabId: string
+  surface: AiEditorSurface
   mode: 'edit' | 'undo'
   beforeMarkdown: string
   markdown: string
@@ -38,9 +49,11 @@ export interface PendingAiImage {
 }
 
 export interface PendingAiRecovery {
+  requestId: string
   response: AiResponse
   tabId: string
   beforeMarkdown: string
+  surface: AiEditorSurface
 }
 
 const createId = (): string => {
@@ -105,6 +118,7 @@ const toIpcChatMessages = (items: readonly AiChatMessage[]): AiChatMessage[] =>
 
 export const useAiStore = defineStore('ai', () => {
   const editorStore = useEditorStore()
+  const preferencesStore = usePreferencesStore()
   const settings = ref<AiConnectionSettings>({
     protocol: 'openai-chat-completions',
     endpoint: '',
@@ -216,6 +230,15 @@ export const useAiStore = defineStore('ai', () => {
     const data = payload as { id?: string; markdown?: string } | undefined
     if (!data?.id || typeof data.markdown !== 'string') return
     changeTracker.updateDocument(data.id, data.markdown)
+    const session = aiEditSession.value
+    if (
+      session &&
+      session.tabId === data.id &&
+      session.status !== 'applying' &&
+      data.markdown !== session.beforeMarkdown
+    ) {
+      setAiEditSessionStatus(session.requestId, 'stale')
+    }
     refreshChangeMarker(data.id)
   })
   bus.on('ai-document-saved', (tabId) => {
@@ -228,6 +251,10 @@ export const useAiStore = defineStore('ai', () => {
   bus.on('file-loaded', (payload) => {
     const data = payload as { id?: string; markdown?: string } | undefined
     if (!data?.id || typeof data.markdown !== 'string') return
+    const session = aiEditSession.value
+    if (session?.tabId === data.id && data.markdown !== session.beforeMarkdown) {
+      setAiEditSessionStatus(session.requestId, 'stale')
+    }
     const marker = changeTracker.get(data.id)
     if (marker && data.markdown !== marker.currentMarkdown && data.markdown !== marker.beforeMarkdown && data.markdown !== marker.afterMarkdown) {
       changeTracker.clear(data.id)
@@ -299,6 +326,9 @@ export const useAiStore = defineStore('ai', () => {
     messages.value = []
     lastAnswer.value = ''
     attachmentError.value = ''
+    if (pendingRecovery.value) {
+      endAiEditSession(pendingRecovery.value.requestId)
+    }
     pendingRecovery.value = null
     if (activeDocumentId.value) {
       await window.electron.ipcRenderer.invoke('mt::ai::chat-clear', activeDocumentId.value)
@@ -326,43 +356,57 @@ export const useAiStore = defineStore('ai', () => {
   const submit = async(prompt: string): Promise<void> => {
     const file = editorStore.currentFile
     const value = prompt.trim()
-    if (!file || !value || loading.value || pendingRecovery.value) return
+    if (!file || !value || loading.value || pendingRecovery.value || isAiEditLocked()) return
     editorStore.flushActiveEditor()
-    const requestTabId = file.id
-    const requestDocumentId = normalizeDocumentId(file.id, file.pathname)
-    const requestId = createId()
-    await loadChat(requestDocumentId)
     const requestFile = editorStore.currentFile
-    if (
-      !requestFile ||
-      requestFile.id !== requestTabId ||
-      normalizeDocumentId(requestFile.id, requestFile.pathname) !== requestDocumentId
-    ) {
-      featureLog('request skipped because active document changed requestId=%s', requestId)
-      await loadChat()
-      return
-    }
+    if (!requestFile) return
+    const requestTabId = requestFile.id
+    const requestDocumentId = normalizeDocumentId(requestFile.id, requestFile.pathname)
+    const requestId = createId()
     const documentId = requestDocumentId
     const baseMarkdown = requestFile.markdown
     const requestMode = mode.value
+    const requestSurface: AiEditorSurface = preferencesStore.sourceCode ? 'source' : 'wysiwyg'
+    const editSession = requestMode === 'answer'
+      ? null
+      : beginAiEditSession({
+        requestId,
+        tabId: requestTabId,
+        documentId,
+        surface: requestSurface,
+        beforeMarkdown: baseMarkdown
+      })
+    if (requestMode !== 'answer' && !editSession) return
     const pending = pendingAttachments.value.map(item => ({ ...item, attachment: { ...item.attachment } }))
     const attachments = pending.map(item => item.attachment)
     const uploads: AiImageUpload[] = pending.map(item => ({ ...item.attachment, data: new Uint8Array(item.data) }))
-    pendingAttachments.value = []
-    attachmentError.value = ''
-    appendMessage('user', value, requestMode, { attachments })
-    featureLog(
-      'request snapshot mode=%s documentKind=%s markdownChars=%s contextMessages=%s requestId=%s',
-      requestMode,
-      documentIdentityKind(documentId),
-      baseMarkdown.length,
-      messages.value.length - 1,
-      requestId
-    )
-    error.value = ''
-    loading.value = true
-    activeRequestId.value = requestId
+    let keepEditSession = false
     try {
+      await loadChat(requestDocumentId)
+      const activeFile = editorStore.currentFile
+      if (
+        !activeFile ||
+        activeFile.id !== requestTabId ||
+        normalizeDocumentId(activeFile.id, activeFile.pathname) !== requestDocumentId
+      ) {
+        featureLog('request skipped because active document changed requestId=%s', requestId)
+        await loadChat()
+        return
+      }
+      pendingAttachments.value = []
+      attachmentError.value = ''
+      appendMessage('user', value, requestMode, { attachments })
+      featureLog(
+        'request snapshot mode=%s documentKind=%s markdownChars=%s contextMessages=%s requestId=%s',
+        requestMode,
+        documentIdentityKind(documentId),
+        baseMarkdown.length,
+        messages.value.length - 1,
+        requestId
+      )
+      error.value = ''
+      loading.value = true
+      activeRequestId.value = requestId
       const response: AiResponse = await window.electron.ipcRenderer.invoke('mt::ai::request', {
         requestId,
         documentId,
@@ -379,9 +423,20 @@ export const useAiStore = defineStore('ai', () => {
         await saveChat()
       } else if (response.markdown !== undefined) {
         if (response.recovery?.requiresConfirmation) {
-          pendingRecovery.value = { response, tabId: requestTabId, beforeMarkdown: baseMarkdown }
+          if (!setAiEditSessionStatus(requestId, 'awaiting-confirmation')) {
+            error.value = 'The document changed while the AI was working. The edit was discarded.'
+            return
+          }
+          pendingRecovery.value = {
+            requestId,
+            response,
+            tabId: requestTabId,
+            beforeMarkdown: baseMarkdown,
+            surface: requestSurface
+          }
+          keepEditSession = true
         } else {
-          await applyEdit(response, requestTabId, baseMarkdown)
+          await applyEdit(response, requestId, requestTabId, baseMarkdown)
         }
       }
     } catch (err) {
@@ -393,14 +448,35 @@ export const useAiStore = defineStore('ai', () => {
         loading.value = false
         activeRequestId.value = null
       }
+      if (!keepEditSession) endAiEditSession(requestId)
     }
   }
 
-  const applyEdit = async(response: AiResponse, tabId: string, beforeMarkdown: string): Promise<void> => {
+  const discardPreparedRevision = async(revisionId: string): Promise<void> => {
+    try {
+      await window.electron.ipcRenderer.invoke('mt::ai::revision-discard', revisionId)
+    } catch (err) {
+      featureLog('revision discard failed revisionId=%s reason=%s', revisionId, err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const applyEdit = async(
+    response: AiResponse,
+    requestId: string,
+    tabId: string,
+    beforeMarkdown: string
+  ): Promise<void> => {
     editorStore.flushActiveEditor()
     const currentFile = editorStore.currentFile
     const nextMarkdown = response.markdown
+    const session = aiEditSession.value
     if (
+      !session ||
+      session.requestId !== requestId ||
+      session.tabId !== tabId ||
+      session.documentId !== response.documentId ||
+      session.status === 'stale' ||
+      getAiDocumentRevision(tabId) !== session.beforeRevision ||
       response.baseMarkdown !== beforeMarkdown ||
       response.documentId !== currentDocumentId.value ||
       currentFile?.id !== tabId ||
@@ -415,6 +491,10 @@ export const useAiStore = defineStore('ai', () => {
       await saveChat()
       return
     }
+    if (!setAiEditSessionStatus(requestId, 'applying')) {
+      error.value = 'The document changed while the AI was working. The edit was discarded.'
+      return
+    }
     const revision = await window.electron.ipcRenderer.invoke('mt::ai::revision-prepare', {
       documentId: response.documentId,
       beforeMarkdown,
@@ -422,34 +502,60 @@ export const useAiStore = defineStore('ai', () => {
       mode: response.mode
     })
     pendingRevision.value = revision
+    const revisionId = revision.revisionId
+    const preparedSession = aiEditSession.value
+    if (
+      !preparedSession ||
+      preparedSession.requestId !== requestId ||
+      preparedSession.status === 'stale' ||
+      editorStore.currentFile?.id !== tabId ||
+      editorStore.currentFile.markdown !== beforeMarkdown
+    ) {
+      await discardPreparedRevision(revisionId)
+      pendingRevision.value = null
+      error.value = 'The document changed while the AI was working. The edit was discarded.'
+      return
+    }
     const applySaveSequence = saveSequence
     await new Promise<void>((resolve) => {
+      let settled = false
       const payload: AiApplyPayload = {
         tabId,
+        surface: session.surface,
         mode: 'edit',
         beforeMarkdown,
         markdown: nextMarkdown,
         onApplied: (success, markdown) => {
+          if (settled) return
+          settled = true
           const finishApply = async(): Promise<void> => {
-            if (!success || !markdown || !pendingRevision.value) {
+            if (!success || typeof markdown !== 'string' || !pendingRevision.value) {
               error.value = 'The AI edit could not be applied because the document changed.'
+              await discardPreparedRevision(revisionId)
               pendingRevision.value = null
               resolve()
               return
             }
+            let committed = false
             try {
               await window.electron.ipcRenderer.invoke(
                 'mt::ai::revision-commit',
-                pendingRevision.value.revisionId,
+                revisionId,
                 response.documentId,
                 markdown
               )
+              committed = true
+              if (aiEditSession.value?.status === 'stale') {
+                pendingRevision.value = null
+                resolve()
+                return
+              }
               const ranges = response.mode === 'rewrite'
                 ? fullDocumentRange(markdown)
                 : rangesFromSummary(markdown, response.editSummary)
               changeTracker.apply(
                 tabId,
-                pendingRevision.value.revisionId,
+                revisionId,
                 beforeMarkdown,
                 markdown,
                 ranges
@@ -459,21 +565,35 @@ export const useAiStore = defineStore('ai', () => {
               }
               refreshChangeMarker(tabId)
               appendMessage('assistant', response.summary ?? '', response.mode, {
-                revisionId: pendingRevision.value.revisionId,
+                revisionId,
                 editSummary: response.editSummary
               })
               await saveChat()
             } catch (err) {
               error.value = err instanceof Error ? err.message : String(err)
+              if (!committed) await discardPreparedRevision(revisionId)
             } finally {
               pendingRevision.value = null
               resolve()
             }
           }
-          finishApply().catch(() => resolve())
+          finishApply().catch(err => {
+            error.value = err instanceof Error ? err.message : String(err)
+            pendingRevision.value = null
+            resolve()
+          })
         }
       }
       bus.emit('ai-apply-markdown', payload)
+      queueMicrotask(() => {
+        if (settled) return
+        settled = true
+        error.value = 'The AI edit could not be applied because the editor is unavailable.'
+        void discardPreparedRevision(revisionId).finally(() => {
+          pendingRevision.value = null
+          resolve()
+        })
+      })
     })
   }
 
@@ -481,10 +601,12 @@ export const useAiStore = defineStore('ai', () => {
     const proposal = pendingRecovery.value
     if (!proposal || loading.value) return
     pendingRecovery.value = null
-    await applyEdit(proposal.response, proposal.tabId, proposal.beforeMarkdown)
+    await applyEdit(proposal.response, proposal.requestId, proposal.tabId, proposal.beforeMarkdown)
+    endAiEditSession(proposal.requestId)
   }
 
   const discardPendingRecovery = (): void => {
+    if (pendingRecovery.value) endAiEditSession(pendingRecovery.value.requestId)
     pendingRecovery.value = null
   }
 
@@ -501,27 +623,60 @@ export const useAiStore = defineStore('ai', () => {
     const documentId = currentDocumentId.value
     if (!file || !documentId || loading.value) return
     editorStore.flushActiveEditor()
-    const result = await window.electron.ipcRenderer.invoke('mt::ai::revision-undo', documentId, file.markdown)
-    if (!result) {
-      error.value = 'AI undo refused because the document has changed since the AI edit.'
-      return
-    }
-    await new Promise<void>((resolve) => {
-      const payload: AiApplyPayload = {
-        tabId: file.id,
-        mode: 'undo',
-        beforeMarkdown: file.markdown,
-        markdown: result.afterMarkdown,
-        onApplied: (success) => {
-          if (!success) error.value = 'The AI undo could not be applied.'
-          resolve()
-        }
-      }
-      bus.emit('ai-apply-markdown', payload)
+    const beforeMarkdown = file.markdown
+    const requestId = createId()
+    const surface: AiEditorSurface = preferencesStore.sourceCode ? 'source' : 'wysiwyg'
+    const session = beginAiEditSession({
+      requestId,
+      tabId: file.id,
+      documentId,
+      surface,
+      beforeMarkdown
     })
-    if (result) {
+    if (!session) return
+    try {
+      const result = await window.electron.ipcRenderer.invoke('mt::ai::revision-undo', documentId, beforeMarkdown)
+      if (!result) {
+        error.value = 'AI undo refused because the document has changed since the AI edit.'
+        return
+      }
+      if (
+        !setAiEditSessionStatus(requestId, 'applying') ||
+        editorStore.currentFile?.id !== file.id ||
+        editorStore.currentFile.markdown !== beforeMarkdown
+      ) {
+        error.value = 'The document changed while the AI undo was working.'
+        return
+      }
+      const success = await new Promise<boolean>((resolve) => {
+        let settled = false
+        const payload: AiApplyPayload = {
+          tabId: file.id,
+          surface,
+          mode: 'undo',
+          beforeMarkdown,
+          markdown: result.afterMarkdown,
+          onApplied: (applied) => {
+            if (settled) return
+            settled = true
+            resolve(applied)
+          }
+        }
+        bus.emit('ai-apply-markdown', payload)
+        queueMicrotask(() => {
+          if (settled) return
+          settled = true
+          resolve(false)
+        })
+      })
+      if (!success) {
+        error.value = 'The AI undo could not be applied.'
+        return
+      }
       changeTracker.clear(file.id)
       refreshChangeMarker(file.id)
+    } finally {
+      endAiEditSession(requestId)
     }
   }
 

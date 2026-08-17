@@ -22,13 +22,6 @@
         >
           ⚙
         </button>
-        <button
-          class="icon-button"
-          :title="labels.close"
-          @click="ai.setVisible(false)"
-        >
-          ×
-        </button>
       </div>
     </header>
 

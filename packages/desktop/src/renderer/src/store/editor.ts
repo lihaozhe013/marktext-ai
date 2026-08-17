@@ -22,6 +22,11 @@ import { useLayoutStore } from './layout'
 import { useMainStore } from '.'
 import { t } from '../i18n'
 import { debouncedSendBufferedState, sendBufferedState } from './bufferedState'
+import {
+  bumpAiDocumentRevision,
+  isAiEditLocked,
+  invalidateAiEditSession
+} from './aiEditSession'
 import type {
   IFileState,
   FileNotification,
@@ -360,6 +365,8 @@ export const useEditorStore = defineStore('editor', {
       }
 
       // Update file content and restore some entries.
+      invalidateAiEditSession(tab.id)
+      bumpAiDocumentRevision(tab.id)
       Object.assign(tab, newFileState)
       tab.id = oldId
       tab.notifications = oldNotifications
@@ -694,6 +701,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     ASK_FOR_SAVE_ALL(closeTabs: boolean): void {
+      if (closeTabs && isAiEditLocked()) return
       const { tabs } = this
       const projectStore = useProjectStore()
       const unsavedFiles = tabs
@@ -724,6 +732,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     MOVE_FILE_TO(): void {
+      if (isAiEditLocked()) return
       if (!this.currentFile) return
       this.flushActiveEditor()
       const projectStore = useProjectStore()
@@ -767,6 +776,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     RESPONSE_FOR_RENAME(): void {
+      if (isAiEditLocked()) return
       if (!this.currentFile) return
       this.flushActiveEditor()
       const projectStore = useProjectStore()
@@ -792,6 +802,7 @@ export const useEditorStore = defineStore('editor', {
 
     // ask for main process to rename this file to a new name `newFilename`
     RENAME(newFilename: string): void {
+      if (isAiEditLocked()) return
       if (!this.currentFile) return
       const { id, pathname, filename } = this.currentFile
       if (typeof filename === 'string' && filename !== newFilename) {
@@ -810,6 +821,7 @@ export const useEditorStore = defineStore('editor', {
      * Invoked from the sidebar rename flow (project.ts:RENAME_IN_SIDEBAR).
      */
     RENAME_IF_NEEDED({ src, dest }: { src: string; dest: string }): void {
+      if (isAiEditLocked()) return
       this.tabs.forEach((tab) => {
         if (tab.pathname === src) {
           tab.pathname = dest
@@ -827,6 +839,7 @@ export const useEditorStore = defineStore('editor', {
 
     UPDATE_CURRENT_FILE(currentFile: IFileState): void {
       const oldCurrentFile = this.currentFile
+      if (isAiEditLocked() && oldCurrentFile?.id !== currentFile.id) return
       let didUpdateCurrentFile = false
       if (oldCurrentFile == null || oldCurrentFile.id !== currentFile.id) {
         const { id, markdown, cursor, history, pathname, scrollTop, blocks, muyaIndexCursor } =
@@ -965,6 +978,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     CLOSE_TAB(file: IFileState | null = null): void {
+      if (isAiEditLocked()) return
       const target = file ?? this.currentFile
       if (target === null) return
 
@@ -1009,6 +1023,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     FORCE_CLOSE_TAB(file: IFileState): void {
+      if (isAiEditLocked()) return
       const { tabs, currentFile } = this
       const index = tabs.findIndex((t) => t.id === file.id)
       if (index > -1) {
@@ -1060,6 +1075,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     CLOSE_UNSAVED_TAB(file: IFileState): void {
+      if (isAiEditLocked()) return
       const { id, pathname, filename, markdown } = file
       const options = getOptionsFromState(file)
       window.electron.ipcRenderer.send('mt::save-and-close-tabs', [
@@ -1068,6 +1084,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     CLOSE_OTHER_TABS(file: IFileState): void {
+      if (isAiEditLocked()) return
       this.tabs
         .filter((f) => f.id !== file.id)
         .forEach((tab) => {
@@ -1076,6 +1093,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     CLOSE_SAVED_TABS(): void {
+      if (isAiEditLocked()) return
       this.tabs
         .filter((f) => f.isSaved)
         .forEach((tab) => {
@@ -1084,12 +1102,14 @@ export const useEditorStore = defineStore('editor', {
     },
 
     CLOSE_ALL_TABS(): void {
+      if (isAiEditLocked()) return
       this.tabs.slice().forEach((tab) => {
         this.CLOSE_TAB(tab)
       })
     },
 
     CLOSE_TABS(tabIdList: string[]): void {
+      if (isAiEditLocked()) return
       if (!tabIdList || tabIdList.length === 0) return
 
       let tabIndex = 0
@@ -1144,6 +1164,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     EXCHANGE_TABS_BY_ID(tabIDs: { fromId: string; toId: string | null }): void {
+      if (isAiEditLocked()) return
       const { fromId, toId } = tabIDs
       const { tabs } = this
       const moveItem = <T>(arr: T[], from: number, to: number): boolean => {
@@ -1172,12 +1193,14 @@ export const useEditorStore = defineStore('editor', {
     },
 
     RENAME_FILE(file: IFileState): void {
+      if (isAiEditLocked()) return
       this.UPDATE_CURRENT_FILE(file)
       bus.emit('rename')
     },
 
     // Direction is a boolean where false is left and true right.
     CYCLE_TABS(direction: boolean): void {
+      if (isAiEditLocked()) return
       const { tabs, currentFile } = this
       if (tabs.length <= 1) {
         return
@@ -1208,6 +1231,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     SWITCH_TAB_BY_FILEPATH(filePath: string): void {
+      if (isAiEditLocked()) return
       const { tabs } = this
 
       if (!filePath) {
@@ -1225,6 +1249,7 @@ export const useEditorStore = defineStore('editor', {
     },
 
     SWITCH_TAB_BY_INDEX(nextTabIndex: number): void {
+      if (isAiEditLocked()) return
       const { tabs, currentFile } = this
       if (nextTabIndex < 0 || nextTabIndex >= tabs.length) {
         console.warn('Invalid tab index:', nextTabIndex)
@@ -1252,6 +1277,7 @@ export const useEditorStore = defineStore('editor', {
       markdown: markdownString,
       selected
     }: { markdown?: string; selected?: boolean }): void {
+      if (isAiEditLocked()) return
       if (selected == null) {
         selected = true
       }
@@ -1290,6 +1316,7 @@ export const useEditorStore = defineStore('editor', {
       options?: TabOptions
       selected?: boolean
     }): void {
+      if (isAiEditLocked()) return
       if (!markdownDocument) {
         console.warn('Cannot create a file tab without a markdown document!')
         this.NEW_UNTITLED_TAB({})
@@ -1426,6 +1453,7 @@ export const useEditorStore = defineStore('editor', {
       markdown = adjustTrailingNewlines(markdown, trimTrailingNewline)
       tab.markdown = markdown
       if (markdown !== oldMarkdown) {
+        bumpAiDocumentRevision(id)
         bus.emit('ai-document-content-changed', { id, oldMarkdown, markdown })
       }
 
