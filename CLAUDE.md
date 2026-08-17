@@ -33,6 +33,11 @@ If upstream introduces genuinely new functionality in one of these areas
 (e.g. a brand-new dialog), port the logic but re-title and re-word it to
 match this fork's conventions.
 
+- **Configuration defaults** — when upstream changes default values in
+  preference schemas, startup configuration, or other config files that
+  affect runtime behavior, keep this fork's defaults unless the change is
+  clearly a bug fix. Resolve conflicts in favor of this project.
+
 - **Documentation** — never discard upstream documentation changes during a
   merge; bring them all in. Fork-specific documentation must live in clearly
   separated sections or paragraphs so that upstream docs remain intact and
