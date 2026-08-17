@@ -974,6 +974,14 @@ class AiService {
     )
   }
 
+  async discardRevision(revisionId: string): Promise<void> {
+    const state = await this.readRevisions()
+    const nextRevisions = state.revisions.filter(item => item.revisionId !== revisionId || item.status !== 'prepared')
+    if (nextRevisions.length === state.revisions.length) return
+    await writeJsonAtomic(this.revisionPath, { revisions: nextRevisions })
+    featureLog('revision discarded revisionId=%s', revisionId)
+  }
+
   async undoRevision(documentId: string, currentMarkdown: string): Promise<AiUndoResult | null> {
     const state = await this.readRevisions()
     const revision = [...state.revisions]
@@ -1085,6 +1093,7 @@ export const registerAiIpcHandlers = (userDataPath: string): void => {
   ipcMain.handle('mt::ai::attachment-read', (_event, documentId: string, attachmentId: string) => aiService.readAttachment(documentId, attachmentId))
   ipcMain.handle('mt::ai::revision-prepare', (_event, request: AiRevisionRequest) => aiService.prepareRevision(request))
   ipcMain.handle('mt::ai::revision-commit', (_event, revisionId: string, documentId: string, afterMarkdown: string) => aiService.commitRevision(revisionId, documentId, afterMarkdown))
+  ipcMain.handle('mt::ai::revision-discard', (_event, revisionId: string) => aiService.discardRevision(revisionId))
   ipcMain.handle('mt::ai::revision-undo', (_event, documentId: string, currentMarkdown: string) => aiService.undoRevision(documentId, currentMarkdown))
   ipcMain.handle('mt::ai::revision-migrate', (_event, fromDocumentId: string, toDocumentId: string) => aiService.migrateDocumentIdentity(fromDocumentId, toDocumentId))
   aiService.cleanupAttachments().catch(error => featureLog('startup attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))

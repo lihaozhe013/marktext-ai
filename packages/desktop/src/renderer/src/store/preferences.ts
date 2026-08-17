@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import bus from '../bus'
 import { setLanguage } from '../i18n'
+import { isAiEditLocked } from './aiEditSession'
 
 // Finite-value unions where the runtime currently constrains the field.
 // We keep these as plain strings everywhere else to avoid forcing prematurely
@@ -263,10 +264,12 @@ export const usePreferencesStore = defineStore('preferences', {
     },
 
     SET_MODE({ type, checked }: ModeTogglePayload): void {
+      if (isAiEditLocked() && ['sourceCode', 'typewriter', 'focus'].includes(type as string)) return
       ;(this as unknown as Record<string, unknown>)[type as string] = checked
     },
 
     TOGGLE_VIEW_MODE(entryName: keyof PreferencesState | string): void {
+      if (isAiEditLocked() && ['sourceCode', 'typewriter', 'focus'].includes(entryName as string)) return
       const target = this as unknown as Record<string, unknown>
       target[entryName as string] = !target[entryName as string]
     },

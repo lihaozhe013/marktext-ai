@@ -9,6 +9,7 @@
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useEditorStore } from '@/store/editor'
 import { usePreferencesStore } from '@/store/preferences'
+import { aiEditLocked, isAiEditLocked } from '@/store/aiEditSession'
 import type { AiChangeMarker } from '@/store/aiChangeTracker'
 import { findMarkdownHeadingLine, scrollSourceEditorToLine } from '@/util/sourceModeToc'
 import { storeToRefs } from 'pinia'
@@ -43,11 +44,18 @@ const editor = ref<CMInstance>(null)
 const commitTimer = ref<ReturnType<typeof setTimeout> | null>(null)
 const viewDestroyed = ref(false)
 const tabId = ref<string | null>(null)
+let aiRawApplyInProgress = false
 
 const { theme, sourceCode } = storeToRefs(preferencesStore)
 const { currentFile: currentTab } = storeToRefs(editorStore)
 const gutterLines = new Set<number>()
 let activeChangeMarker: Pick<AiChangeMarker, 'revisionId' | 'status' | 'visible' | 'ranges'> | undefined
+
+const applyAiSourceLock = (locked: boolean): void => {
+  editor.value?.setOption('readOnly', locked)
+}
+
+watch(aiEditLocked, locked => applyAiSourceLock(locked), { immediate: true })
 
 const isValidMuyaIndexCursor = (cursor: unknown): cursor is MuyaIndexCursorLike => {
   const c = cursor as MuyaIndexCursorLike | null | undefined
@@ -163,32 +171,33 @@ interface FileChangePayloadLike {
 
 interface AiApplyPayload {
   tabId: string
+  surface: 'wysiwyg' | 'source'
   mode: 'edit' | 'undo'
   beforeMarkdown: string
   markdown: string
   onApplied: (success: boolean, markdown?: string) => void
 }
 
-const sameAiMarkdown = (left: string, right: string): boolean =>
-  left.replace(/[\r\n]+$/, '') === right.replace(/[\r\n]+$/, '')
-
 const handleAiApply = (payload: unknown): void => {
   const request = payload as AiApplyPayload
-  if (!request || !sourceCode.value || !editor.value || tabId.value !== request.tabId) {
+  if (!request || request.surface !== 'source') return
+  if (!editor.value || tabId.value !== request.tabId) {
     request?.onApplied(false)
     return
   }
-  const currentMarkdown = editor.value.getValue()
-  if (!sameAiMarkdown(currentMarkdown, request.beforeMarkdown)) {
-    request.onApplied(false, currentMarkdown)
-    return
+  try {
+    aiRawApplyInProgress = true
+    const lastLine = editor.value.lineCount() - 1
+    const end = { line: lastLine, ch: editor.value.getLine(lastLine).length }
+    editor.value.replaceRange(request.markdown, { line: 0, ch: 0 }, end, 'ai-editor')
+    saveContent(editor.value)
+    request.onApplied(true, request.markdown)
+  } catch (err) {
+    console.error('[ai-editor] source Markdown apply failed', err)
+    request.onApplied(false)
+  } finally {
+    aiRawApplyInProgress = false
   }
-  const lastLine = editor.value.lineCount() - 1
-  const end = { line: lastLine, ch: editor.value.getLine(lastLine).length }
-  editor.value.replaceRange(request.markdown, { line: 0, ch: 0 }, end, 'ai-editor')
-  saveContent(editor.value)
-  const appliedMarkdown = editor.value.getValue()
-  request.onApplied(true, appliedMarkdown)
 }
 
 const handleFileChange = (payload: unknown) => {
@@ -286,6 +295,7 @@ const handleSelectAll = () => {
 }
 
 const handleUndo = () => {
+  if (isAiEditLocked()) return
   if (!sourceCode.value) {
     return
   }
@@ -296,6 +306,7 @@ const handleUndo = () => {
 }
 
 const handleRedo = () => {
+  if (isAiEditLocked()) return
   if (!sourceCode.value) {
     return
   }
@@ -312,6 +323,7 @@ interface ImageActionPayload {
 }
 
 const handleImageAction = (payload: unknown) => {
+  if (isAiEditLocked()) return
   const { id, result, alt } = payload as ImageActionPayload
   const value: string = editor.value.getValue()
   const focus = editor.value.getCursor('focus')
@@ -362,6 +374,7 @@ const handleImageAction = (payload: unknown) => {
 }
 
 const saveContent = (cm: CMInstance) => {
+  if (isAiEditLocked() && !aiRawApplyInProgress) return
   const { cursor, markdown: newMarkdown } = getMarkdownAndCursor(cm)
   // Attention: the cursor may be `{focus: null, anchor: null}` when press `backspace`
   const wordCount = getWordCount(newMarkdown)
@@ -481,6 +494,7 @@ onMounted(() => {
   }
 
   editor.value = codeMirrorInstance
+  applyAiSourceLock(aiEditLocked.value)
   tabId.value = id
 
   listenChange()
@@ -506,13 +520,15 @@ onBeforeUnmount(() => {
   bus.off('ai-change-marker-updated', handleAiMarkerUpdate)
   clearGutterMarkers()
 
-  const { cursor, markdown: newMarkdown } = getMarkdownAndCursor(editor.value)
-  bus.emit('file-changed', {
-    id: tabId.value,
-    markdown: newMarkdown,
-    muyaIndexCursor: cursor,
-    renderCursor: true
-  })
+  if (!isAiEditLocked()) {
+    const { cursor, markdown: newMarkdown } = getMarkdownAndCursor(editor.value)
+    bus.emit('file-changed', {
+      id: tabId.value,
+      markdown: newMarkdown,
+      muyaIndexCursor: cursor,
+      renderCursor: true
+    })
+  }
 })
 </script>
 

@@ -129,6 +129,7 @@ import { addCommonStyle, setEditorWidth } from '@/util/theme'
 import { usePreferencesStore } from '@/store/preferences'
 import { useEditorStore } from '@/store/editor'
 import { useProjectStore } from '@/store/project'
+import { aiEditLocked, isAiEditLocked, pruneAiDocumentRevisions } from '@/store/aiEditSession'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { SyntheticHistory, type IFileHistoryLike } from './syntheticHistory'
@@ -285,6 +286,7 @@ let switchLanguageCommand: SpellcheckerLanguageCommand | null = null
 let imageViewer: SimpleImageViewer | null = null
 // The engine has no `scroll` event; we listen on the scroll container directly.
 let scrollHandler: ((e: Event) => void) | null = null
+let aiRawMarkdownOverride: string | null = null
 
 // The engine's undo/redo history (`getHistory()`) has a different shape than
 // the desktop store's `tab.history` (which drives the save/dirty tracking and
@@ -530,7 +532,9 @@ class SimpleImageViewer {
 watch(
   () => tabs.value.map((t) => t.id),
   (ids) => {
-    pruneClosedTabState(new Set(ids))
+    const liveTabIds = new Set(ids)
+    pruneClosedTabState(liveTabIds)
+    pruneAiDocumentRevisions(liveTabIds)
   }
 )
 
@@ -1056,6 +1060,7 @@ const openSpellcheckerLanguageCommand = () => {
 }
 
 const replaceMisspelling = (payload: unknown) => {
+  if (isAiEditLocked()) return
   const { word, replacement } = payload as { word: string; replacement: string }
   if (editor.value) {
     editor.value.replaceCurrentWordInlineUnsafe(word, replacement)
@@ -1063,6 +1068,7 @@ const replaceMisspelling = (payload: unknown) => {
 }
 
 const handleUndo = () => {
+  if (isAiEditLocked()) return
   if (sourceCode.value) {
     return
   }
@@ -1073,6 +1079,7 @@ const handleUndo = () => {
 }
 
 const handleRedo = () => {
+  if (isAiEditLocked()) return
   if (sourceCode.value) {
     return
   }
@@ -1111,6 +1118,7 @@ const COPY_PASTE_METHOD_MAP: Record<string, 'copyAsRich' | 'copyAsHtml' | 'paste
   pasteAsPlainText: 'pasteAsPlainText'
 }
 const handleCopyPaste = (type: unknown) => {
+  if (isAiEditLocked() && type === 'pasteAsPlainText') return
   if (editor.value) {
     const method = COPY_PASTE_METHOD_MAP[type as string]
     if (method) editor.value[method]()
@@ -1118,6 +1126,7 @@ const handleCopyPaste = (type: unknown) => {
 }
 
 const insertImage = (src: unknown) => {
+  if (isAiEditLocked()) return
   if (!sourceCode.value) {
     editor.value && editor.value.insertImage({ src })
   }
@@ -1147,11 +1156,13 @@ const handleSearch = (payload: unknown) => {
 }
 
 const handReplace = (payload: unknown) => {
+  if (isAiEditLocked()) return
   const { value, opt } = payload as { value: string; opt: unknown }
   editorStore.SEARCH(toSearchMatches(editor.value.replace(value, opt)))
 }
 
 const handleUploadedImage = (url: unknown, deletionUrl?: unknown) => {
+  if (isAiEditLocked()) return
   insertImage(url)
   editorStore.SHOW_IMAGE_DELETION_URL(deletionUrl as string)
 }
@@ -1161,6 +1172,16 @@ const handleUploadedImage = (url: unknown, deletionUrl?: unknown) => {
 // The legacy engine exposed the same element as `muya.container`.
 const getScrollContainer = (): HTMLElement | null =>
   (editor.value?.domNode as HTMLElement | undefined) ?? null
+
+const applyAiEditorLock = (locked: boolean): void => {
+  const root = getScrollContainer()
+  if (!root) return
+  root.contentEditable = locked ? 'false' : 'true'
+  root.classList.toggle('ai-editor-locked', locked)
+  root.setAttribute('aria-disabled', String(locked))
+}
+
+watch(aiEditLocked, locked => applyAiEditorLock(locked), { immediate: true })
 
 // Viewport-relative caret rect (mirrors the engine's `Selection.getCursorCoords`
 // / legacy `cursorCoords`). Used for typewriter + keep-cursor-visible scrolling
@@ -1390,6 +1411,7 @@ const pushSelectionMenuState = (changes: MuyaChange) => {
 }
 
 const handleEditParagraph = (type: unknown) => {
+  if (isAiEditLocked()) return
   // These commands act on the hidden WYSIWYG engine, so block them in
   // source-code mode (mirrors handleUndo/handleSelectAll) — otherwise e.g. the
   // Insert Table wizard opens and writes to the invisible editor (#3531).
@@ -1416,6 +1438,7 @@ const handleEditParagraph = (type: unknown) => {
 
 // handle `duplicate`, `delete`, `create paragraph below`
 const handleParagraph = (type: unknown) => {
+  if (isAiEditLocked()) return
   if (sourceCode.value) {
     return
   }
@@ -1437,6 +1460,7 @@ const handleParagraph = (type: unknown) => {
 }
 
 const handleInlineFormat = (type: unknown) => {
+  if (isAiEditLocked()) return
   if (sourceCode.value) {
     return
   }
@@ -1444,6 +1468,7 @@ const handleInlineFormat = (type: unknown) => {
 }
 
 const handleDialogTableConfirm = () => {
+  if (isAiEditLocked()) return
   dialogTableVisible.value = false
   editor.value && editor.value.createTable(tableChecker)
 }
@@ -1501,30 +1526,31 @@ interface FileChangePayload {
 
 interface AiApplyPayload {
   tabId: string
+  surface: 'wysiwyg' | 'source'
   mode: 'edit' | 'undo'
   beforeMarkdown: string
   markdown: string
   onApplied: (success: boolean, markdown?: string) => void
 }
 
-const sameAiMarkdown = (left: string, right: string): boolean =>
-  left.replace(/[\r\n]+$/, '') === right.replace(/[\r\n]+$/, '')
-
 const handleAiApply = (payload: unknown): void => {
   const request = payload as AiApplyPayload
-  if (!request || sourceCode.value || !editor.value || currentFile.value?.id !== request.tabId) {
+  if (!request || request.surface !== 'wysiwyg') return
+  if (!editor.value || currentFile.value?.id !== request.tabId) {
     request?.onApplied(false)
     return
   }
-  const currentMarkdown = editor.value.getMarkdown()
-  if (!sameAiMarkdown(currentMarkdown, request.beforeMarkdown)) {
-    request.onApplied(false, currentMarkdown)
-    return
+  try {
+    aiRawMarkdownOverride = request.markdown
+    editor.value.replaceContent(request.markdown)
+    editorStore.UPDATE_TOC(editor.value.getTOC())
+    request.onApplied(true, request.markdown)
+  } catch (err) {
+    log.error('[ai-editor] WYSIWYG Markdown apply failed', err)
+    request.onApplied(false)
+  } finally {
+    aiRawMarkdownOverride = null
   }
-  editor.value.replaceContent(request.markdown)
-  editorStore.UPDATE_TOC(editor.value.getTOC())
-  const appliedMarkdown = editor.value.getMarkdown()
-  request.onApplied(true, appliedMarkdown)
 }
 
 const handleAiNavigate = (payload: unknown): void => {
@@ -1661,6 +1687,7 @@ const handleFileChange = (payload: unknown) => {
 }
 
 const handleInsertParagraph = (location: unknown) => {
+  if (isAiEditLocked()) return
   editor.value && editor.value.insertParagraph(location)
 }
 
@@ -1837,6 +1864,7 @@ onMounted(() => {
   // the document tree and instantiates the registered UI plugins).
   muya.init()
   editor.value = muya
+  applyAiEditorLock(aiEditLocked.value)
   // The first document's content is set via constructor options, so no
   // `file-loaded` / `setMarkdownToEditor` runs for it — seed its TOC here.
   editorStore.UPDATE_TOC(muya.getTOC())
@@ -1913,7 +1941,7 @@ onMounted(() => {
     if (!currentFile.value || !editor.value) return
     const { id } = currentFile.value
     if (!id) return
-    const markdown = editor.value.getMarkdown()
+    const markdown = aiRawMarkdownOverride ?? editor.value.getMarkdown()
     // Stash the real engine history for in-session tab-switch restoration. The
     // synthetic save-tracking id is derived from the live document content (a
     // monotonic, never-reused id — see `syntheticHistory.ts`), NOT the engine
@@ -2134,6 +2162,11 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
   cursor: default;
   overflow-anchor: none !important;
+}
+
+.editor-component.ai-editor-locked {
+  pointer-events: none;
+  user-select: none;
 }
 
 .editor-component .mu-container {

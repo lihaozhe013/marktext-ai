@@ -61,6 +61,7 @@ export interface IpcInvokeChannels {
   'mt::ai::attachment-read': { args: [documentId: string, attachmentId: string]; ret: AiImageData }
   'mt::ai::revision-prepare': { args: [request: AiRevisionRequest]; ret: AiPreparedRevision }
   'mt::ai::revision-commit': { args: [revisionId: string, documentId: string, afterMarkdown: string]; ret: void }
+  'mt::ai::revision-discard': { args: [revisionId: string]; ret: void }
   'mt::ai::revision-undo': { args: [documentId: string, currentMarkdown: string]; ret: AiUndoResult | null }
   'mt::ai::revision-migrate': { args: [fromDocumentId: string, toDocumentId: string]; ret: void }
   'mt::ask-for-image-path': { args: []; ret: string[] }
