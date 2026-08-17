@@ -1,6 +1,8 @@
 export type AiProtocol = 'openai-chat-completions' | 'anthropic-messages'
 export type AiInteractionMode = 'answer' | 'edit' | 'rewrite'
 export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback'
+export type AiModelSource = 'manual' | 'discovered'
+export type AiReasoningControl = 'unknown' | 'effort' | 'budget'
 
 export interface AiRecoveryInfo {
   strategy: AiRecoveryStrategy
@@ -39,18 +41,77 @@ export interface AiImageData {
   data: Uint8Array
 }
 
-export interface AiConnectionSettings {
-  protocol: AiProtocol
-  endpoint: string
-  model: string
-  hasApiKey: boolean
+export interface AiModelCapabilities {
+  reasoningControl?: AiReasoningControl
 }
 
-export interface AiConnectionSettingsInput {
+export interface AiModelProfile {
+  id: string
+  model: string
+  label: string
+  source: AiModelSource
+  capabilities?: AiModelCapabilities
+}
+
+export interface AiConnectionProfile {
+  id: string
+  name: string
   protocol: AiProtocol
   endpoint: string
-  model: string
+  hasApiKey: boolean
+  models: AiModelProfile[]
+}
+
+export interface AiModelRef {
+  connectionId: string
+  modelId: string
+}
+
+export interface AiSettings {
+  connections: AiConnectionProfile[]
+  defaultModel?: AiModelRef
+}
+
+/** Compatibility alias for renderer code that refers to the AI settings object. */
+export type AiConnectionSettings = AiSettings
+
+export interface AiConnectionInput {
+  id?: string
+  name: string
+  protocol: AiProtocol
+  endpoint: string
+  models: Array<{
+    id?: string
+    model: string
+    label?: string
+    source?: AiModelSource
+    capabilities?: AiModelCapabilities
+  }>
   apiKey?: string
+}
+
+/** Compatibility alias retained for callers during the settings migration. */
+export type AiConnectionSettingsInput = AiConnectionInput
+
+export interface AiModelListInput {
+  connectionId?: string
+  protocol: AiProtocol
+  endpoint: string
+  apiKey?: string
+}
+
+export interface AiDiscoveredModel {
+  model: string
+  label?: string
+  ownedBy?: string
+}
+
+export interface AiMessageModel {
+  connectionId: string
+  modelId: string
+  connectionName: string
+  model: string
+  protocol: AiProtocol
 }
 
 export interface AiChatMessage {
@@ -62,6 +123,12 @@ export interface AiChatMessage {
   revisionId?: string
   editSummary?: AiEditSummary
   attachments?: AiImageAttachment[]
+  model?: AiMessageModel
+}
+
+export interface AiChatSession {
+  messages: AiChatMessage[]
+  selectedModel?: AiModelRef
 }
 
 export interface AiRequest {
@@ -71,6 +138,7 @@ export interface AiRequest {
   prompt: string
   markdown: string
   messages: AiChatMessage[]
+  modelRef: AiModelRef
   attachments?: AiImageUpload[]
 }
 
@@ -103,6 +171,7 @@ export interface AiResponse {
   recovery?: AiRecoveryInfo
   documentId: string
   baseMarkdown: string
+  model: AiMessageModel
 }
 
 export interface AiTestResult {

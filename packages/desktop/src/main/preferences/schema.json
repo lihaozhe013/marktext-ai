@@ -13,7 +13,7 @@
   "titleBarStyle": {
     "description": "General--The title bar style (Windows and Linux system only).",
     "enum": ["custom", "native"],
-    "default": "custom"
+    "default": "native"
   },
   "openFilesInNewWindow": {
     "description": "General--Open files in a new window.",
@@ -60,7 +60,7 @@
   "startUpAction": {
     "description": "General--The action after MarkText startup, open the last opened folder, open the specified folder or blank page",
     "enum": ["folder", "openLastFolder", "blank", "restoreAll"],
-    "default": "restoreAll"
+    "default": "blank"
   },
   "defaultDirectoryToOpen": {
     "description": "General--The default directory that should be opened on startup when startUp=folder.",
@@ -337,12 +337,12 @@
   "imageInsertAction": {
     "description": "Image--The default behavior after insert image from local folder",
     "enum": ["upload", "folder", "path"],
-    "default": "path"
+    "default": "folder"
   },
   "imagePreferRelativeDirectory": {
     "description": "Image--Whether to prefer the relative image directory.",
     "type": "boolean",
-    "default": false
+    "default": true
   },
   "imageRelativeDirectoryBase": {
     "description": "Image--Where relative images are copied.",

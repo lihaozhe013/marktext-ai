@@ -15,13 +15,16 @@ import {
 } from './aiEditSession'
 import type {
   AiChatMessage,
+  AiChatSession,
   AiConnectionSettings,
   AiEditSummary,
   AiImageAttachment,
   AiImageMimeType,
   AiImageUpload,
   AiInteractionMode,
+  AiMessageModel,
   AiPreparedRevision,
+  AiModelRef,
   AiResponse
 } from '@shared/types/ai'
 import {
@@ -103,6 +106,7 @@ const toIpcChatMessage = (message: AiChatMessage): AiChatMessage => ({
   createdAt: message.createdAt,
   revisionId: message.revisionId,
   attachments: message.attachments?.map(attachment => ({ ...attachment })),
+  model: message.model ? { ...message.model } : undefined,
   editSummary: message.editSummary
     ? {
       operationCount: message.editSummary.operationCount,
@@ -120,15 +124,13 @@ export const useAiStore = defineStore('ai', () => {
   const editorStore = useEditorStore()
   const preferencesStore = usePreferencesStore()
   const settings = ref<AiConnectionSettings>({
-    protocol: 'openai-chat-completions',
-    endpoint: '',
-    model: '',
-    hasApiKey: false
+    connections: []
   })
   const mode = ref<AiInteractionMode>((localStorage.getItem('ai-mode') as AiInteractionMode) || 'answer')
   const visible = ref(localStorage.getItem('ai-panel-visible') !== 'false')
   const width = ref(Number(localStorage.getItem('ai-panel-width')) || 380)
   const messages = ref<AiChatMessage[]>([])
+  const selectedModel = ref<AiModelRef | undefined>()
   const pendingAttachments = ref<PendingAiImage[]>([])
   const attachmentError = ref<AiAttachmentError>('')
   const loading = ref(false)
@@ -144,6 +146,37 @@ export const useAiStore = defineStore('ai', () => {
   let saveSequence = 0
   let chatLoadSequence = 0
   let loadedChatDocumentId = ''
+
+  const modelRefKey = (value: AiModelRef | undefined): string => value
+    ? JSON.stringify(value)
+    : ''
+
+  const modelOptions = computed(() => settings.value.connections.flatMap(connection => connection.models.map(model => ({
+    ref: { connectionId: connection.id, modelId: model.id },
+    connectionId: connection.id,
+    connectionName: connection.name,
+    modelId: model.id,
+    model: model.model,
+    label: model.label,
+    protocol: connection.protocol,
+    hasApiKey: connection.hasApiKey
+  }))))
+  const hasAnyApiKey = computed(() => settings.value.connections.some(connection => connection.hasApiKey))
+
+  const isValidModelRef = (value: AiModelRef | undefined): value is AiModelRef =>
+    !!value && modelOptions.value.some(option => option.ref.connectionId === value.connectionId && option.ref.modelId === value.modelId)
+
+  const resolveSelectedModel = (): AiModelRef | undefined => {
+    if (isValidModelRef(selectedModel.value)) return { ...selectedModel.value }
+    const fallback = settings.value.defaultModel
+    if (isValidModelRef(fallback)) {
+      selectedModel.value = { ...fallback }
+      return { ...fallback }
+    }
+    const first = modelOptions.value[0]?.ref
+    selectedModel.value = first ? { ...first } : undefined
+    return first ? { ...first } : undefined
+  }
 
   const clearPendingAttachments = (): void => {
     pendingAttachments.value = []
@@ -286,9 +319,26 @@ export const useAiStore = defineStore('ai', () => {
     bus.emit('ai-navigate-to-line', { tabId, line: Math.max(1, Math.round(line)) })
   }
 
+  const setSettings = (value: AiConnectionSettings): void => {
+    settings.value = value
+    if (!isValidModelRef(selectedModel.value)) resolveSelectedModel()
+  }
+
+  const selectModel = (value: AiModelRef): void => {
+    if (!isValidModelRef(value)) return
+    selectedModel.value = { ...value }
+    saveChat().catch(err => featureLog('model selection save failed reason=%s', err instanceof Error ? err.message : String(err)))
+  }
+
+  const setDefaultModel = async(value: AiModelRef | null): Promise<AiConnectionSettings> => {
+    const next = await window.electron.ipcRenderer.invoke('mt::ai::set-default-model', value)
+    setSettings(next)
+    return next
+  }
+
   const loadSettings = async(): Promise<void> => {
     try {
-      settings.value = await window.electron.ipcRenderer.invoke('mt::ai::get-settings')
+      setSettings(await window.electron.ipcRenderer.invoke('mt::ai::get-settings'))
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err)
     }
@@ -299,14 +349,17 @@ export const useAiStore = defineStore('ai', () => {
     const loadSequence = ++chatLoadSequence
     activeDocumentId.value = documentId
     try {
-      const loadedMessages: AiChatMessage[] = await window.electron.ipcRenderer.invoke('mt::ai::chat-load', documentId)
+      const loadedSession: AiChatSession = await window.electron.ipcRenderer.invoke('mt::ai::chat-load', documentId)
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
-      messages.value = loadedMessages
+      messages.value = loadedSession.messages
+      selectedModel.value = loadedSession.selectedModel
+      resolveSelectedModel()
       loadedChatDocumentId = documentId
     } catch (err) {
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
       error.value = err instanceof Error ? err.message : String(err)
       messages.value = []
+      resolveSelectedModel()
       loadedChatDocumentId = documentId
     }
   }
@@ -316,7 +369,10 @@ export const useAiStore = defineStore('ai', () => {
       await window.electron.ipcRenderer.invoke(
         'mt::ai::chat-save',
         activeDocumentId.value,
-        toIpcChatMessages(messages.value.slice(-10))
+        {
+          messages: toIpcChatMessages(messages.value.slice(-10)),
+          selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined
+        }
       )
     }
   }
@@ -324,6 +380,7 @@ export const useAiStore = defineStore('ai', () => {
   const clearChat = async(): Promise<void> => {
     clearPendingAttachments()
     messages.value = []
+    selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
     attachmentError.value = ''
     if (pendingRecovery.value) {
@@ -339,7 +396,7 @@ export const useAiStore = defineStore('ai', () => {
     role: 'user' | 'assistant',
     content: string,
     messageMode: AiInteractionMode,
-    options: { revisionId?: string; editSummary?: AiEditSummary; attachments?: AiImageAttachment[] } = {}
+    options: { revisionId?: string; editSummary?: AiEditSummary; attachments?: AiImageAttachment[]; model?: AiMessageModel } = {}
   ): void => {
     messages.value.push({
       id: createId(),
@@ -393,6 +450,11 @@ export const useAiStore = defineStore('ai', () => {
         await loadChat()
         return
       }
+      const requestModel = resolveSelectedModel()
+      if (!requestModel) {
+        error.value = 'Configure at least one AI model before sending a request.'
+        return
+      }
       pendingAttachments.value = []
       attachmentError.value = ''
       appendMessage('user', value, requestMode, { attachments })
@@ -413,12 +475,13 @@ export const useAiStore = defineStore('ai', () => {
         mode: requestMode,
         prompt: value,
         markdown: baseMarkdown,
+        modelRef: requestModel,
         attachments: uploads,
         messages: toIpcChatMessages(messages.value.slice(0, -1))
       })
       if (requestId !== activeRequestId.value || documentId !== currentDocumentId.value) return
       if (requestMode === 'answer') {
-        appendMessage('assistant', response.content, requestMode)
+        appendMessage('assistant', response.content, requestMode, { model: response.model })
         lastAnswer.value = response.content
         await saveChat()
       } else if (response.markdown !== undefined) {
@@ -566,7 +629,8 @@ export const useAiStore = defineStore('ai', () => {
               refreshChangeMarker(tabId)
               appendMessage('assistant', response.summary ?? '', response.mode, {
                 revisionId,
-                editSummary: response.editSummary
+                editSummary: response.editSummary,
+                model: response.model
               })
               await saveChat()
             } catch (err) {
@@ -589,7 +653,7 @@ export const useAiStore = defineStore('ai', () => {
         if (settled) return
         settled = true
         error.value = 'The AI edit could not be applied because the editor is unavailable.'
-        void discardPreparedRevision(revisionId).finally(() => {
+        discardPreparedRevision(revisionId).finally(() => {
           pendingRevision.value = null
           resolve()
         })
@@ -682,6 +746,10 @@ export const useAiStore = defineStore('ai', () => {
 
   return {
     settings,
+    modelOptions,
+    hasAnyApiKey,
+    selectedModel,
+    selectedModelKey: computed(() => modelRefKey(selectedModel.value)),
     mode,
     visible,
     width,
@@ -697,6 +765,9 @@ export const useAiStore = defineStore('ai', () => {
     setVisible,
     togglePanel,
     setMode,
+    setSettings,
+    selectModel,
+    setDefaultModel,
     setWidth,
     addImageFiles,
     removePendingAttachment,

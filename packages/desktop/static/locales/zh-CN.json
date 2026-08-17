@@ -730,8 +730,8 @@
     }
   },
   "about": {
-    "copyright": "版权",
-    "copyrightContributors": "版权贡献者"
+    "copyright": "版权所有 © MarkText 团队 2017-{year}",
+    "copyrightContributors": "由 Github 贡献者用 ❤ 制作"
   },
   "commands": {
     "mt": {

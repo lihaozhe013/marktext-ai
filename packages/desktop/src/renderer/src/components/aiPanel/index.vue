@@ -49,6 +49,37 @@
       </button>
     </div>
 
+    <div class="ai-model-select">
+      <label for="ai-model-selector">{{ labels.model }}</label>
+      <select
+        id="ai-model-selector"
+        :value="ai.selectedModelKey"
+        :disabled="!ai.modelOptions.length"
+        @change="selectModel"
+      >
+        <option
+          v-if="!ai.modelOptions.length"
+          value=""
+        >
+          {{ labels.noModels }}
+        </option>
+        <optgroup
+          v-for="group in modelGroups"
+          :key="group.connectionId"
+          :label="group.connectionName"
+        >
+          <option
+            v-for="option in group.models"
+            :key="option.modelId"
+            :value="modelOptionValue(option.ref)"
+          >
+            {{ option.label }}{{ option.label === option.model ? '' : ` (${option.model})` }}
+          </option>
+        </optgroup>
+      </select>
+      <small>{{ labels.modelHint }}</small>
+    </div>
+
     <p class="ai-mode-help">
       {{ modeHelp }}
     </p>
@@ -68,6 +99,12 @@
       >
         <div class="ai-message-role">
           {{ message.role === 'user' ? labels.you : labels.ai }}
+        </div>
+        <div
+          v-if="message.model"
+          class="ai-message-model"
+        >
+          {{ message.model.connectionName }} / {{ message.model.model }}
         </div>
         <div
           v-if="message.content"
@@ -277,7 +314,7 @@
         {{ labels.undo }}
       </button>
       <span
-        v-if="!ai.settings.hasApiKey"
+        v-if="!ai.hasAnyApiKey"
         class="ai-unconfigured"
       >
         {{ labels.unconfigured }}
@@ -291,7 +328,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
-import type { AiChatMessage } from '@shared/types/ai'
+import type { AiChatMessage, AiModelRef } from '@shared/types/ai'
 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
@@ -307,6 +344,9 @@ const labels = computed(() => chinese.value
   ? {
       title: 'AI 编辑器',
       settings: 'AI 设置',
+      model: '模型',
+      modelHint: '切换后从下一次请求生效；当前请求使用已选模型。',
+      noModels: '请先在 AI 设置中添加模型',
       close: '关闭',
       answer: '回答',
       edit: '修改文档',
@@ -344,6 +384,9 @@ const labels = computed(() => chinese.value
   : {
       title: 'AI Editor',
       settings: 'AI settings',
+      model: 'Model',
+      modelHint: 'Changes apply to the next request; the current request keeps its model.',
+      noModels: 'Add a model in AI settings first',
       close: 'Close',
       answer: 'Answer',
       edit: 'Edit document',
@@ -386,7 +429,21 @@ const modeHelp = computed(() => {
   if (ai.mode === 'rewrite') return labels.value.rewriteHelp
   return ai.mode === 'answer' ? labels.value.answerHelp : labels.value.editHelp
 })
+const modelGroups = computed(() => {
+  const groups = new Map<string, { connectionId: string; connectionName: string; models: typeof ai.modelOptions }>()
+  for (const option of ai.modelOptions) {
+    const group = groups.get(option.connectionId) ?? {
+      connectionId: option.connectionId,
+      connectionName: option.connectionName,
+      models: []
+    }
+    group.models.push(option)
+    groups.set(option.connectionId, group)
+  }
+  return Array.from(groups.values())
+})
 const hasDocument = computed(() => !!currentDocumentId.value)
+const modelOptionValue = (value: AiModelRef): string => JSON.stringify(value)
 const attachmentErrorLabel = computed(() => {
   if (ai.attachmentError === 'unsupported') return labels.value.attachmentUnsupported
   if (ai.attachmentError === 'too-large') return labels.value.attachmentTooLarge
@@ -416,6 +473,12 @@ const send = (): void => {
   if (!value) return
   draft.value = ''
   ai.submit(value).catch(() => undefined)
+}
+
+const selectModel = (event: Event): void => {
+  const value = (event.target as HTMLSelectElement).value
+  const option = ai.modelOptions.find(item => modelOptionValue(item.ref) === value)
+  if (option) ai.selectModel(option.ref)
 }
 
 const makeUnifiedDiff = (before: string, after: string): string => {
@@ -508,7 +571,7 @@ onMounted(() => {
   ai.loadSettings().catch(() => undefined)
   ai.loadChat().catch(() => undefined)
   window.electron.ipcRenderer.on('mt::ai-settings-changed', (_event, value) => {
-    ai.settings = value
+    ai.setSettings(value)
   })
   window.electron.ipcRenderer.on('mt::ai-toggle-panel', ai.togglePanel)
 })
@@ -566,12 +629,17 @@ onUnmounted(() => {
 .ai-mode-switch button { flex: 1; padding: 8px; border: 1px solid transparent; border-radius: 5px; color: var(--sideBarColor); background: transparent; }
 .ai-mode-switch button:hover:not(:disabled) { background: var(--sideBarItemHoverBgColor); }
 .ai-mode-switch button.active { border-color: var(--themeColor); color: var(--themeColor); background: var(--buttonBgColorActive); font-weight: 600; }
+.ai-model-select { display: flex; flex-direction: column; gap: 5px; margin: 10px 14px 0; }
+.ai-model-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
+.ai-model-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }
+.ai-model-select small { color: var(--editorColor50); font-size: 10px; }
 .ai-mode-help { margin: 8px 14px; color: var(--editorColor60); font-size: 12px; line-height: 1.4; }
 .ai-messages { flex: 1; overflow: auto; padding: 0 12px 12px; }
 .ai-empty { padding: 30px 8px; color: var(--editorColor60); text-align: center; font-size: 13px; }
 .ai-message { margin: 10px 0; padding: 9px 0; border-bottom: 1px solid var(--editorColor10); }
 .ai-message.user { padding-left: 9px; border-left: 2px solid var(--themeColor); }
 .ai-message-role { margin-bottom: 5px; color: var(--editorColor60); font-size: 11px; font-weight: 600; }
+.ai-message-model { margin: -2px 0 6px; color: var(--editorColor50); font-size: 10px; }
 .ai-edit-summary { color: var(--editorColor80); font-size: 13px; line-height: 1.4; }
 .ai-message-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.45; }
 .ai-message-attachments, .ai-pending-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }

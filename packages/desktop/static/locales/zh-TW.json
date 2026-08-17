@@ -728,8 +728,8 @@
     }
   },
   "about": {
-    "copyright": "版權",
-    "copyrightContributors": "版權貢獻者"
+    "copyright": "版權所有 © MarkText 團隊 2017-{year}",
+    "copyrightContributors": "由 Github 貢獻者用 ❤ 製作"
   },
   "commands": {
     "mt": {
