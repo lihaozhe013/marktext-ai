@@ -32,6 +32,11 @@
         </el-col>
         <el-col :span="24">
           <div class="text">
+            {{ author }}
+          </div>
+        </el-col>
+        <el-col :span="24">
+          <div class="text">
             {{ copyrightContributors }}
           </div>
         </el-col>
@@ -49,8 +54,9 @@ import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
 
-const name = 'MarkText'
+const name = 'MarkText+AI'
 const copyright = t('about.copyright', { year: new Date().getFullYear() })
+const author = 'Author: Li Haozhe'
 const copyrightContributors = t('about.copyrightContributors')
 const showAboutDialog = ref(false)
 
