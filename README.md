@@ -1,3 +1,12 @@
+<div align="center">
+  <strong>🤖 Fork of <a href="https://github.com/marktext/marktext">MarkText</a></strong><br>
+  This repository is a fork of MarkText, primarily focused on adding AI-powered features (e.g., AI-assisted writing, smart completions, etc.).<br>
+  <sub>This project will stay in sync with <a href="https://github.com/marktext/marktext">upstream</a>, keeping up with the latest updates and fixes.</sub>
+  <sub>All AI features are built as extensions on top of the original project. All existing features and capabilities are fully preserved.</sub>
+</div>
+
+<br>
+
 <p align="center"><img src="docs/assets/logo-small.png" alt="MarkText" width="100" height="100"></p>
 
 <h1 align="center">MarkText</h1>
