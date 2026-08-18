@@ -1,6 +1,7 @@
 <template>
   <aside
     v-if="ai.visible"
+    ref="panelElement"
     class="ai-panel"
     :style="{ width: `${ai.width}px` }"
     :aria-busy="ai.loading"
@@ -226,28 +227,23 @@
       <span>{{ currentProgressLabel || (ai.renderingPdf ? labels.preparingPdf : labels.working) }}</span>
     </div>
 
-    <div
-      class="ai-composer"
-      @dragenter.prevent="dragOver = true"
-      @dragover.prevent="dragOver = true"
-      @dragleave="dragOver = false"
-      @drop.prevent="dropFiles"
-    >
+    <div class="ai-composer">
       <input
-        ref="fileInput"
+        id="ai-attachment-input"
         class="ai-file-input"
         type="file"
         accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,.pdf"
         multiple
+        :disabled="ai.loading || !hasDocument"
         @change="selectFiles"
       >
-      <div
+      <label
+        for="ai-attachment-input"
         class="ai-attachment-dropzone"
-        :class="{ active: dragOver }"
-        @click="openFilePicker"
+        :class="{ active: dragOver, disabled: ai.loading || !hasDocument }"
       >
         <span>📎 {{ labels.attachHint }}</span>
-      </div>
+      </label>
       <p class="ai-attachment-privacy">
         {{ labels.attachmentPrivacy }}
       </p>
@@ -382,12 +378,13 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
+import bus from '@/bus'
 import type { AiChatMessage, AiModelRef, AiProgressInfo } from '@shared/types/ai'
 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
+const panelElement = ref<HTMLElement | null>(null)
 const draft = ref('')
-const fileInput = ref<HTMLInputElement | null>(null)
 const dragOver = ref(false)
 const resizing = ref(false)
 const resizeStartX = ref(0)
@@ -651,24 +648,60 @@ const makeUnifiedDiff = (before: string, after: string): string => {
   return result.length > 12000 ? `${result.slice(0, 12000)}\n…` : result
 }
 
-const openFilePicker = (): void => {
-  if (!ai.loading && hasDocument.value) fileInput.value?.click()
-}
-
 const addFiles = (files: File[]): void => {
   if (!files.length) return
   ai.addAttachmentFiles(files).catch(() => undefined)
+}
+
+// MarkText's window dragover listener can show a fixed import overlay before
+// a Panel target receives a bubbling event, so this boundary must stay at the
+// window capture phase and use coordinates instead of event.target.
+const hasFilePayload = (event: DragEvent): boolean => {
+  const dataTransfer = event.dataTransfer
+  if (!dataTransfer) return false
+  if (Array.from(dataTransfer.types).includes('Files')) return true
+  if (dataTransfer.files.length > 0) return true
+  return Array.from(dataTransfer.items).some(item => item.kind === 'file')
+}
+
+const isInsidePanel = (event: DragEvent): boolean => {
+  const panel = panelElement.value
+  if (!panel) return false
+  const rect = panel.getBoundingClientRect()
+  return event.clientX >= rect.left && event.clientX <= rect.right &&
+    event.clientY >= rect.top && event.clientY <= rect.bottom
+}
+
+const stopPanelFileDrag = (event: DragEvent): boolean => {
+  if (!hasFilePayload(event) || !isInsidePanel(event)) return false
+  event.preventDefault()
+  event.stopImmediatePropagation()
+  return true
+}
+
+const handleWindowDragOver = (event: DragEvent): void => {
+  if (!hasFilePayload(event)) return
+  if (!isInsidePanel(event)) {
+    dragOver.value = false
+    return
+  }
+  stopPanelFileDrag(event)
+  bus.emit('importDialog', false)
+  if (event.dataTransfer) event.dataTransfer.dropEffect = ai.loading || !hasDocument.value ? 'none' : 'copy'
+  dragOver.value = true
+}
+
+const handleWindowDrop = (event: DragEvent): void => {
+  if (!stopPanelFileDrag(event)) return
+  dragOver.value = false
+  if (ai.loading || !hasDocument.value || !event.dataTransfer) return
+  addFiles(Array.from(event.dataTransfer.files))
 }
 
 const selectFiles = (event: Event): void => {
   const input = event.target as HTMLInputElement
   addFiles(input.files ? Array.from(input.files) : [])
   input.value = ''
-}
-
-const dropFiles = (event: DragEvent): void => {
-  dragOver.value = false
-  if (event.dataTransfer) addFiles(Array.from(event.dataTransfer.files))
 }
 
 const pasteFiles = (event: ClipboardEvent): void => {
@@ -715,6 +748,8 @@ onMounted(() => {
     ai.setSettings(value)
   })
   window.electron.ipcRenderer.on('mt::ai-toggle-panel', ai.togglePanel)
+  window.addEventListener('dragover', handleWindowDragOver, true)
+  window.addEventListener('drop', handleWindowDrop, true)
 })
 
 watch(currentDocumentId, (value) => {
@@ -728,6 +763,8 @@ onUnmounted(() => {
   window.electron.ipcRenderer.removeAllListeners('mt::ai-settings-changed')
   ai.clearPendingAttachments()
   stopResize()
+  window.removeEventListener('dragover', handleWindowDragOver, true)
+  window.removeEventListener('drop', handleWindowDrop, true)
 })
 </script>
 
@@ -809,8 +846,10 @@ onUnmounted(() => {
 @keyframes ai-spinner-rotation { to { transform: rotate(360deg); } }
 .ai-composer { padding: 10px 12px; border-top: 1px solid var(--itemBgColor); }
 .ai-file-input { display: none; }
-.ai-attachment-dropzone { margin-bottom: 7px; padding: 6px 8px; border: 1px dashed var(--editorColor30); border-radius: 4px; color: var(--editorColor60); cursor: pointer; font-size: 11px; text-align: center; }
+.ai-attachment-dropzone { display: block; margin-bottom: 7px; padding: 6px 8px; border: 1px dashed var(--editorColor30); border-radius: 4px; color: var(--editorColor60); cursor: pointer; font-size: 11px; text-align: center; -webkit-app-region: no-drag; app-region: no-drag; }
 .ai-attachment-dropzone:hover, .ai-attachment-dropzone.active { border-color: var(--themeColor); color: var(--themeColor); background: var(--buttonBgColorActive); }
+.ai-attachment-dropzone.disabled { cursor: default; opacity: .55; }
+.ai-attachment-dropzone.disabled:hover { border-color: var(--editorColor30); color: var(--editorColor60); background: transparent; }
 .ai-attachment-privacy { margin: -2px 0 6px; color: var(--editorColor50); font-size: 10px; }
 .ai-composer textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 76px; padding: 9px; border: 1px solid var(--editorColor30); border-radius: 5px; background: var(--inputBgColor); color: var(--editorColor); font: inherit; }
 .ai-composer textarea:focus { outline: none; border-color: var(--themeColor); }
