@@ -79,7 +79,7 @@ export interface DocumentEditAgentRequest {
   maxRetries?: number
   onValidationFailure?: (diagnostic: DocumentEditValidationDiagnostic) => void
   onPhase?: (phase: 'validating' | 'retrying' | 'fallback', attempt: number) => void
-  onAgentStep?: (step: number, maxSteps: number, description: string, version: number, beforeMarkdown: string, markdown: string, addedLines: number, removedLines: number) => void
+  onAgentStep?: (step: number, maxSteps: number, description: string, version: number, beforeMarkdown: string, markdown: string, addedLines: number, removedLines: number, removedText: string, addedText: string) => void
 }
 
 export interface DocumentEditAgentResult {
@@ -865,7 +865,9 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
               beforeStep,
               current,
               located.summary.addedLines,
-              located.summary.removedLines
+              located.summary.removedLines,
+              located.search,
+              located.replace
             )
             const result = makeAgentToolResult(call, current, version, {
               ok: true,

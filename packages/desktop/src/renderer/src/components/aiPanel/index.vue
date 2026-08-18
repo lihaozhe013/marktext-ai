@@ -103,7 +103,24 @@
         :class="[message.role, { 'ai-status-message': message.kind === 'status' }]"
       >
         <div
-          v-if="message.kind === 'status'"
+          v-if="message.kind === 'status' && message.progress?.phase === 'agent-step' && hasStepDiff(message.progress)"
+          class="ai-step-diff"
+          role="status"
+        >
+          <div class="ai-step-diff-title">
+            {{ progressLabel(message) }}
+          </div>
+          <div class="ai-step-diff-row removed">
+            <span class="ai-step-diff-label">{{ labels.stepDeleted }}</span>
+            <pre>{{ message.progress.stepRemovedText || labels.emptyDiff }}</pre>
+          </div>
+          <div class="ai-step-diff-row added">
+            <span class="ai-step-diff-label">{{ labels.stepAdded }}</span>
+            <pre>{{ message.progress.stepAddedText || labels.emptyDiff }}</pre>
+          </div>
+        </div>
+        <div
+          v-else-if="message.kind === 'status'"
           class="ai-status-content"
           role="status"
         >
@@ -469,6 +486,9 @@ const labels = computed(() => chinese.value
       undo: '撤销 AI 修改',
       unconfigured: '未配置连接',
       editApplied: (count: number, added: number, removed: number) => `已应用 ${count} 处修改（新增 ${added} 行，删除 ${removed} 行）`,
+      stepDeleted: '删除',
+      stepAdded: '新增',
+      emptyDiff: '（空）',
       noChanges: '文档无需修改',
       rewriteApplied: '已重写全文',
       recoveryWarning: '模型未能生成可靠的局部编辑，以下是整篇替代结果，请确认差异后应用。',
@@ -522,6 +542,9 @@ const labels = computed(() => chinese.value
       undo: 'Undo AI edit',
       unconfigured: 'Connection not configured',
       editApplied: (count: number, added: number, removed: number) => `Applied ${count} edit${count === 1 ? '' : 's'} (+${added}/-${removed} lines)`,
+      stepDeleted: 'Deleted',
+      stepAdded: 'Added',
+      emptyDiff: '(empty)',
       noChanges: 'No document changes were needed.',
       rewriteApplied: 'The document was rewritten.',
       recoveryWarning: 'The model could not produce a reliable local edit. Review the complete-document fallback before applying it.',
@@ -594,6 +617,9 @@ const stepDeltaLabel = (progress: AiProgressInfo | AiProgressEvent | undefined):
   return chinese.value ? `+${added}行-${removed}行` : `+${added} lines -${removed} lines`
 }
 
+const hasStepDiff = (progress: AiProgressInfo | undefined): boolean =>
+  progress?.stepRemovedText !== undefined || progress?.stepAddedText !== undefined
+
 const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const current = progress?.current
   const total = progress?.total
@@ -633,7 +659,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
       case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
-      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
+      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
       case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
       case 'fallback': return `正在生成安全替代结果… · ${attempt}`
@@ -654,7 +680,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
     case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
-    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
+    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
     case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
     case 'fallback': return `Generating safe fallback… · ${attempt}`
@@ -1010,6 +1036,15 @@ onUnmounted(() => {
 .ai-status-message { margin: 4px 0; padding: 2px 0; border-bottom: 0; }
 .ai-status-content { display: flex; align-items: center; gap: 6px; color: var(--editorColor50); font-size: 10px; line-height: 1.35; }
 .ai-status-dot { width: 4px; height: 4px; flex: 0 0 auto; border-radius: 50%; background: var(--editorColor40); }
+.ai-step-diff { margin: 5px 0 8px; font-size: 10px; }
+.ai-step-diff-title { margin-bottom: 4px; color: var(--editorColor60); }
+.ai-step-diff-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 5px; align-items: start; margin-top: 3px; }
+.ai-step-diff-label { padding: 4px 0; font-weight: 600; }
+.ai-step-diff-row pre { min-width: 0; max-height: 180px; margin: 0; padding: 5px 7px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.4 monospace; }
+.ai-step-diff-row.removed .ai-step-diff-label { color: var(--errorColor, #d33); }
+.ai-step-diff-row.removed pre { color: var(--errorColor, #d33); background: color-mix(in srgb, var(--errorColor, #d33) 12%, transparent); border-left: 2px solid var(--errorColor, #d33); }
+.ai-step-diff-row.added .ai-step-diff-label { color: #218739; }
+.ai-step-diff-row.added pre { color: #218739; background: color-mix(in srgb, #218739 12%, transparent); border-left: 2px solid #218739; }
 .ai-message-role { margin-bottom: 5px; color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-message-model { margin: -2px 0 6px; color: var(--editorColor50); font-size: 10px; }
 .ai-edit-summary { color: var(--editorColor80); font-size: 13px; line-height: 1.4; }

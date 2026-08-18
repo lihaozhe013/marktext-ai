@@ -595,6 +595,8 @@ export const useAiStore = defineStore('ai', () => {
       stepDescription: event.stepDescription,
       stepAddedLines: event.stepAddedLines,
       stepRemovedLines: event.stepRemovedLines,
+      stepRemovedText: event.stepRemovedText,
+      stepAddedText: event.stepAddedText,
       cachedInputTokens: event.cachedInputTokens,
       cacheWriteInputTokens: event.cacheWriteInputTokens
     }
@@ -605,7 +607,7 @@ export const useAiStore = defineStore('ai', () => {
 
   const appendProgress = async(
     phase: AiProgressPhase,
-    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'cachedInputTokens' | 'cacheWriteInputTokens'>> = {}
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens'>> = {}
   ): Promise<void> => {
     const progress: AiProgressInfo = { phase, ...details }
     currentProgress.value = progress
@@ -631,6 +633,8 @@ export const useAiStore = defineStore('ai', () => {
       stepDescription: progress.stepDescription,
       stepAddedLines: progress.stepAddedLines,
       stepRemovedLines: progress.stepRemovedLines,
+      stepRemovedText: progress.stepRemovedText,
+      stepAddedText: progress.stepAddedText,
       cachedInputTokens: progress.cachedInputTokens,
       cacheWriteInputTokens: progress.cacheWriteInputTokens,
       failureCount: progress.failureCount,

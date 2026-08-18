@@ -202,6 +202,8 @@ export interface AiProgressInfo {
   stepDescription?: string
   stepAddedLines?: number
   stepRemovedLines?: number
+  stepRemovedText?: string
+  stepAddedText?: string
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
 }
@@ -233,6 +235,8 @@ export interface AiProgressEvent {
   stepDescription?: string
   stepAddedLines?: number
   stepRemovedLines?: number
+  stepRemovedText?: string
+  stepAddedText?: string
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
   /** The validated agent step snapshot to apply immediately in the renderer. */

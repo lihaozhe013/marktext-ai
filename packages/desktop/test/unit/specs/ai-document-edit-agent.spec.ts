@@ -44,7 +44,7 @@ describe('document edit agent', () => {
       { version: 2, summary: 'Updated the requested text.' }
     ]
     let turn = 0
-    const appliedSteps: Array<{ addedLines: number; removedLines: number }> = []
+    const appliedSteps: Array<{ addedLines: number; removedLines: number; removedText: string; addedText: string }> = []
     const generateAgent = vi.fn(async(_input: DocumentAgentGenerateRequest) => {
       const step = steps[turn]
       turn += 1
@@ -65,13 +65,16 @@ describe('document edit agent', () => {
       signal: new AbortController().signal,
       generateAgent,
       maxSteps: 4,
-      onAgentStep: (_step, _maxSteps, _description, _version, _before, _after, addedLines, removedLines) => {
-        appliedSteps.push({ addedLines, removedLines })
+      onAgentStep: (_step, _maxSteps, _description, _version, _before, _after, addedLines, removedLines, removedText, addedText) => {
+        appliedSteps.push({ addedLines, removedLines, removedText, addedText })
       }
     })
     expect(result.markdown).toBe('gamma')
     expect(result.summary.operationCount).toBe(2)
-    expect(appliedSteps).toEqual([{ addedLines: 1, removedLines: 1 }, { addedLines: 1, removedLines: 1 }])
+    expect(appliedSteps).toEqual([
+      { addedLines: 1, removedLines: 1, removedText: 'alpha', addedText: 'beta' },
+      { addedLines: 1, removedLines: 1, removedText: 'beta', addedText: 'gamma' }
+    ])
     expect(generateAgent).toHaveBeenCalledTimes(3)
     expect(generateAgent.mock.calls[1][0].messages.some(message => message.toolResults?.[0]?.content.includes('"version":1'))).toBe(true)
   })

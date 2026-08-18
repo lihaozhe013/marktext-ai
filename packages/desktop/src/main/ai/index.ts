@@ -72,6 +72,7 @@ const MAX_EDIT_AGENT_MAX_STEPS = 128
 const DEFAULT_FAILURE_OUTPUT_AFTER = 1
 const MAX_FAILURE_OUTPUT_AFTER = 3
 const MAX_FAILURE_OUTPUT_CHARS = 200_000
+const MAX_AGENT_DIFF_CHARS = 16_000
 const MAX_STORED_CHAT_MESSAGES = 100
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
@@ -519,6 +520,8 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     stepDescription: typeof value.stepDescription === 'string' ? value.stepDescription.slice(0, 160) : undefined,
     stepAddedLines: typeof value.stepAddedLines === 'number' ? value.stepAddedLines : undefined,
     stepRemovedLines: typeof value.stepRemovedLines === 'number' ? value.stepRemovedLines : undefined,
+    stepRemovedText: typeof value.stepRemovedText === 'string' ? value.stepRemovedText.slice(0, 16000) : undefined,
+    stepAddedText: typeof value.stepAddedText === 'string' ? value.stepAddedText.slice(0, 16000) : undefined,
     cachedInputTokens: typeof value.cachedInputTokens === 'number' ? value.cachedInputTokens : undefined,
     cacheWriteInputTokens: typeof value.cacheWriteInputTokens === 'number' ? value.cacheWriteInputTokens : undefined,
     failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'capability' || value.failureReason === 'unknown'
@@ -1479,7 +1482,7 @@ export class AiService {
     const emitProgress = (
       phase: AiProgressEvent['phase'],
       attempt: number,
-      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown'>> = {}
+      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown'>> = {}
     ): void => {
       lastAttempt = Math.max(lastAttempt, attempt)
       const {
@@ -1490,6 +1493,8 @@ export class AiService {
         documentId,
         stepBaseMarkdown,
         stepMarkdown,
+        stepRemovedText,
+        stepAddedText,
         ...stats
       } = details
       if (failureReason) lastFailureReason = failureReason
@@ -1507,7 +1512,9 @@ export class AiService {
         ...(failureOutputTruncated !== undefined ? { failureOutputTruncated } : {}),
         ...(documentId !== undefined ? { documentId } : {}),
         ...(stepBaseMarkdown !== undefined ? { stepBaseMarkdown } : {}),
-        ...(stepMarkdown !== undefined ? { stepMarkdown } : {})
+        ...(stepMarkdown !== undefined ? { stepMarkdown } : {}),
+        ...(stepRemovedText !== undefined ? { stepRemovedText } : {}),
+        ...(stepAddedText !== undefined ? { stepAddedText } : {})
       })
     }
     const rememberProviderResponse = (response: ProviderResponse): void => {
@@ -1717,7 +1724,7 @@ export class AiService {
             streaming: false
           })
         },
-        onAgentStep: (step, maxSteps, description, version, beforeMarkdown, markdown, addedLines, removedLines) => {
+        onAgentStep: (step, maxSteps, description, version, beforeMarkdown, markdown, addedLines, removedLines, removedText, addedText) => {
           emitProgress('agent-step', step, {
             step,
             maxSteps,
@@ -1726,6 +1733,8 @@ export class AiService {
             stepDescription: description,
             stepAddedLines: addedLines,
             stepRemovedLines: removedLines,
+            stepRemovedText: removedText.slice(0, MAX_AGENT_DIFF_CHARS),
+            stepAddedText: addedText.slice(0, MAX_AGENT_DIFF_CHARS),
             documentId: request.documentId,
             stepBaseMarkdown: beforeMarkdown,
             stepMarkdown: markdown,
