@@ -5,6 +5,17 @@
       {{ labels.description }}
     </p>
 
+    <section class="ai-setting-group retry-setting">
+      <label>{{ labels.editAutoRetryCount }}</label>
+      <select v-model.number="editAutoRetryCount" @change="saveEditAutoRetryCount">
+        <option :value="0">0</option>
+        <option :value="1">1</option>
+        <option :value="2">2</option>
+        <option :value="3">3</option>
+      </select>
+      <small>{{ labels.editAutoRetryHint }}</small>
+    </section>
+
     <div class="connection-toolbar">
       <button class="primary-button" @click="createConnection">
         {{ labels.addConnection }}
@@ -168,6 +179,7 @@ const status = ref('')
 const statusOk = ref(true)
 const discoveredModels = ref<AiDiscoveredModel[]>([])
 const defaultModelId = ref('')
+const editAutoRetryCount = ref(1)
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
 const connectionLog = (message: string, ...args: unknown[]): void => {
   log.info(`[ai-connection] ${message}`, ...args)
@@ -207,7 +219,9 @@ const labels = computed(() => chinese.value
       testing: '测试中…',
       defaultModel: '选择默认模型',
       setDefault: '保存默认模型',
-      deleteKey: '删除密钥'
+      deleteKey: '删除密钥',
+      editAutoRetryCount: '编辑模式自动修复重试次数',
+      editAutoRetryHint: '不包含首次生成。设为 0 时，格式错误会立即显示失败结果，不再自动请求下一次。'
     }
   : {
       title: 'AI Connections & Models',
@@ -243,7 +257,9 @@ const labels = computed(() => chinese.value
       testing: 'Testing…',
       defaultModel: 'Choose default model',
       setDefault: 'Save default model',
-      deleteKey: 'Delete key'
+      deleteKey: 'Delete key',
+      editAutoRetryCount: 'Automatic repair retries for edit mode',
+      editAutoRetryHint: 'Additional attempts after the first generation. Set to 0 to show the failure without another automatic request.'
     })
 
 const selectedConnection = computed<AiConnectionProfile | undefined>(() =>
@@ -323,10 +339,23 @@ const logInput = (action: string, value: AiConnectionInput): void => {
 
 const applySettings = (value: AiConnectionSettings): void => {
   settings.value = value
+  editAutoRetryCount.value = value.editAutoRetryCount ?? 1
   ai.setSettings(value)
   if (value.connections.some(connection => connection.id === form.id)) selectConnection(form.id as string)
   else if (value.connections[0]) selectConnection(value.connections[0].id)
   else resetForm()
+}
+
+const saveEditAutoRetryCount = async (): Promise<void> => {
+  try {
+    const value = await window.electron.ipcRenderer.invoke('mt::ai::set-edit-retry-count', editAutoRetryCount.value)
+    applySettings(value)
+    statusOk.value = true
+    status.value = chinese.value ? '自动重试设置已保存。' : 'Automatic retry setting saved.'
+  } catch (err) {
+    statusOk.value = false
+    status.value = err instanceof Error ? err.message : String(err)
+  }
 }
 
 const save = async (): Promise<void> => {

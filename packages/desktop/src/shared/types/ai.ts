@@ -107,6 +107,8 @@ export interface AiModelRef {
 export interface AiSettings {
   connections: AiConnectionProfile[]
   defaultModel?: AiModelRef
+  /** Number of protocol repair attempts after the initial edit generation. */
+  editAutoRetryCount?: number
 }
 
 /** Compatibility alias for renderer code that refers to the AI settings object. */
@@ -157,7 +159,12 @@ export type AiProgressPhase =
   | 'sending'
   | 'sent'
   | 'waiting'
+  | 'streaming'
   | 'responded'
+  | 'validating'
+  | 'attempt-failed'
+  | 'retrying'
+  | 'fallback'
   | 'local-processing'
   | 'completed'
   | 'failed'
@@ -167,6 +174,31 @@ export interface AiProgressInfo {
   phase: AiProgressPhase
   current?: number
   total?: number
+  attempt?: number
+  elapsedMs?: number
+  outputTokens?: number
+  outputTokensEstimated?: boolean
+  inputTokens?: number
+  inputTokensEstimated?: boolean
+  failureReason?: AiFailureReason
+}
+
+export type AiFailureReason = 'format' | 'exact-match' | 'truncated' | 'provider' | 'unknown'
+
+export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'validating' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
+
+export interface AiProgressEvent {
+  requestId: string
+  mode: AiInteractionMode
+  phase: AiLiveProgressPhase
+  attempt: number
+  elapsedMs: number
+  outputTokens: number
+  outputTokensEstimated: boolean
+  inputTokens?: number
+  inputTokensEstimated?: boolean
+  streaming: boolean
+  failureReason?: AiFailureReason
 }
 
 export interface AiChatMessage {

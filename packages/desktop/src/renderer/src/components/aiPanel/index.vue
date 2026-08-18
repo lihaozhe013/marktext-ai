@@ -379,7 +379,7 @@ import { storeToRefs } from 'pinia'
 import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
 import bus from '@/bus'
-import type { AiChatMessage, AiModelRef, AiProgressInfo } from '@shared/types/ai'
+import type { AiChatMessage, AiModelRef, AiProgressEvent, AiProgressInfo } from '@shared/types/ai'
 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
@@ -389,6 +389,7 @@ const dragOver = ref(false)
 const resizing = ref(false)
 const resizeStartX = ref(0)
 const resizeStartWidth = ref(380)
+let stopProgressListener: (() => void) | undefined
 
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
 const labels = computed(() => chinese.value
@@ -550,6 +551,19 @@ const editSummaryLabel = (message: AiChatMessage): string => {
 const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const current = progress?.current
   const total = progress?.total
+  const tokenUsage = progress?.outputTokens === undefined
+    ? ''
+    : progress.inputTokens !== undefined
+      ? `${progress.outputTokensEstimated ? '约 ' : ''}${progress.inputTokens + progress.outputTokens} tokens（输入 ${progress.inputTokens} / 输出 ${progress.outputTokens}）`
+      : `${progress.outputTokensEstimated ? '约 ' : ''}输出 ${progress.outputTokens} tokens`
+  const attempt = progress?.attempt ? `第 ${progress.attempt} 次尝试` : ''
+  const failureReason = progress?.failureReason === 'exact-match'
+    ? 'SEARCH 未精确匹配'
+    : progress?.failureReason === 'truncated'
+      ? '输出被截断'
+      : progress?.failureReason === 'provider'
+        ? '模型请求失败'
+        : '格式不符合要求'
   if (chinese.value) {
     switch (progress?.phase) {
       case 'pdf-rendering':
@@ -558,11 +572,16 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'sending': return '正在发送给模型…'
       case 'sent': return '已发送给模型'
       case 'waiting': return '正在等待模型响应…'
+      case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
+      case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
+      case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
+      case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
+      case 'fallback': return `正在生成安全替代结果… · ${attempt}`
       case 'local-processing': return '正在本地解析和编辑…'
-      case 'completed': return '本地解析和编辑完成'
+      case 'completed': return tokenUsage ? `处理完成 · ${tokenUsage}` : '本地解析和编辑完成'
       case 'cancelled': return '请求已停止'
-      case 'failed': return '请求未完成'
+      case 'failed': return `请求失败${attempt ? ` · ${attempt}` : ''}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       default: return '正在处理…'
     }
   }
@@ -573,17 +592,62 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'sending': return 'Sending to model…'
     case 'sent': return 'Sent to model'
     case 'waiting': return 'Waiting for model response…'
+    case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
+    case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
+    case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
+    case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
+    case 'fallback': return `Generating safe fallback… · ${attempt}`
     case 'local-processing': return 'Parsing and editing locally…'
-    case 'completed': return 'Local parsing and editing completed'
+    case 'completed': return tokenUsage ? `Completed · ${tokenUsage}` : 'Local parsing and editing completed'
     case 'cancelled': return 'Request stopped'
-    case 'failed': return 'Request did not complete'
+    case 'failed': return `Request failed${attempt ? ` · ${attempt}` : ''}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     default: return 'Working…'
   }
 }
 
 const progressLabel = (message: AiChatMessage): string => progressLabelFor(message.progress)
-const currentProgressLabel = computed(() => progressLabelFor(ai.currentProgress))
+
+const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: number): string => {
+  if (!progress) return ''
+  const elapsed = `${Math.max(0, Math.floor(elapsedMs / 1000))} 秒`
+  const tokens = progress.outputTokensEstimated
+    ? `输出约 ${progress.outputTokens} tokens`
+    : `输出 ${progress.outputTokens} tokens`
+  const usage = progress.inputTokens !== undefined
+    ? `输入 ${progress.inputTokens} / ${tokens}`
+    : tokens
+  if (chinese.value) {
+    switch (progress.phase) {
+      case 'waiting': return `正在等待模型响应… · ${elapsed}`
+      case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
+      case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'attempt-failed': return `第 ${progress.attempt} 次尝试失败 · ${usage} · ${elapsed}`
+      case 'retrying': return `格式不符合要求，正在重试… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'fallback': return `正在生成安全替代结果… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'completed': return `处理完成 · ${elapsed}`
+      case 'failed': return `请求失败 · 第 ${progress.attempt} 次尝试 · ${usage} · ${elapsed}`
+      case 'cancelled': return `请求已停止 · ${elapsed}`
+      default: return `${tokens} · ${elapsed}`
+    }
+  }
+  switch (progress.phase) {
+    case 'waiting': return `Waiting for model response… · ${elapsed}`
+    case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
+    case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
+    case 'attempt-failed': return `Attempt ${progress.attempt} failed · ${usage} · ${elapsed}`
+    case 'retrying': return `Format validation failed; retrying… · attempt ${progress.attempt} · ${elapsed}`
+    case 'fallback': return `Generating safe fallback… · attempt ${progress.attempt} · ${elapsed}`
+    case 'completed': return `Completed · ${elapsed}`
+    case 'failed': return `Request failed · attempt ${progress.attempt} · ${usage} · ${elapsed}`
+    case 'cancelled': return `Request stopped · ${elapsed}`
+    default: return `${tokens} · ${elapsed}`
+  }
+}
+
+const currentProgressLabel = computed(() => ai.loading && ai.liveProgress
+  ? liveProgressLabel(ai.liveProgress, ai.liveProgressElapsedMs)
+  : progressLabelFor(ai.currentProgress))
 
 const send = (): void => {
   const value = draft.value.trim()
@@ -744,6 +808,7 @@ const stopResize = (): void => {
 onMounted(() => {
   ai.loadSettings().catch(() => undefined)
   ai.loadChat().catch(() => undefined)
+  stopProgressListener = ai.listenForProgress()
   window.electron.ipcRenderer.on('mt::ai-settings-changed', (_event, value) => {
     ai.setSettings(value)
   })
@@ -759,6 +824,8 @@ watch(currentDocumentId, (value) => {
 })
 
 onUnmounted(() => {
+  stopProgressListener?.()
+  stopProgressListener = undefined
   window.electron.ipcRenderer.removeAllListeners('mt::ai-toggle-panel')
   window.electron.ipcRenderer.removeAllListeners('mt::ai-settings-changed')
   ai.clearPendingAttachments()

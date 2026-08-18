@@ -11,7 +11,7 @@ import type { AiImageAttachment } from '@shared/types/ai'
 const request = (
   markdown: string,
   generate: (input: DocumentEditGenerateRequest) => Promise<{ content: string; truncated?: boolean }>,
-  options: Pick<DocumentEditAgentRequest, 'onValidationFailure'> = {}
+  options: Pick<DocumentEditAgentRequest, 'onValidationFailure' | 'maxRetries'> = {}
 ) =>
   runDocumentEditAgent({
     markdown,
@@ -110,6 +110,27 @@ describe('document edit agent', () => {
     })
 
     await expect(request('old', generate)).rejects.toThrow('after 2 attempts')
+  })
+
+  it('can disable automatic repair retries and fallback generation', async() => {
+    const generate = vi.fn(async(input: DocumentEditGenerateRequest) => ({
+      content: `${responseWith(input.system, 'missing', 'new')}\nUnexpected explanation`
+    }))
+    const generateWhole = vi.fn(async() => ({ content: '# new title' }))
+
+    await expect(runDocumentEditAgent({
+      markdown: '# old title',
+      instruction: 'Update the title.',
+      contextMessages: [],
+      requestId: 'test-request',
+      signal: new AbortController().signal,
+      generate,
+      generateWhole,
+      maxRetries: 0
+    })).rejects.toThrow('after 1 attempts')
+
+    expect(generate).toHaveBeenCalledTimes(1)
+    expect(generateWhole).not.toHaveBeenCalled()
   })
 
   it('repairs an un-tokenized divider only when the search is uniquely determined', async() => {

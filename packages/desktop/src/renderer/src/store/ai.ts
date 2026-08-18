@@ -26,6 +26,7 @@ import type {
   AiMessageModel,
   AiPreparedRevision,
   AiModelRef,
+  AiProgressEvent,
   AiProgressInfo,
   AiProgressPhase,
   AiResponse,
@@ -472,15 +473,81 @@ export const useAiStore = defineStore('ai', () => {
   }
 
   const currentProgress = ref<AiProgressInfo | undefined>()
+  const liveProgress = ref<AiProgressEvent | undefined>()
+  const liveProgressElapsedMs = ref(0)
+  let liveProgressStartedAt = 0
+  let liveProgressTimer: ReturnType<typeof setInterval> | undefined
+  let progressPersistSequence: Promise<void> = Promise.resolve()
+
+  const stopLiveProgress = (): void => {
+    if (liveProgressTimer) clearInterval(liveProgressTimer)
+    liveProgressTimer = undefined
+    liveProgressStartedAt = 0
+    liveProgressElapsedMs.value = 0
+    liveProgress.value = undefined
+  }
+
+  const startLiveProgress = (requestId: string, requestMode: AiInteractionMode): void => {
+    stopLiveProgress()
+    liveProgressStartedAt = Date.now()
+    liveProgress.value = {
+      requestId,
+      mode: requestMode,
+      phase: 'waiting',
+      attempt: 1,
+      elapsedMs: 0,
+      outputTokens: 0,
+      outputTokensEstimated: true,
+      streaming: false
+    }
+    liveProgressTimer = setInterval(() => {
+      if (!liveProgressStartedAt || !liveProgress.value) return
+      liveProgressElapsedMs.value = Date.now() - liveProgressStartedAt
+    }, 1000)
+  }
+
+  const listenForProgress = (): (() => void) => window.electron.ipcRenderer.on('mt::ai::progress', (_event, event) => {
+    if (!activeRequestId.value || event.requestId !== activeRequestId.value) return
+    if (!liveProgressStartedAt) liveProgressStartedAt = Date.now() - event.elapsedMs
+    liveProgress.value = event
+    liveProgressElapsedMs.value = Math.max(event.elapsedMs, Date.now() - liveProgressStartedAt)
+    if (!['attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
+    const progress: AiProgressInfo = {
+      phase: event.phase,
+      attempt: event.attempt,
+      elapsedMs: event.elapsedMs,
+      outputTokens: event.outputTokens,
+      outputTokensEstimated: event.outputTokensEstimated,
+      inputTokens: event.inputTokens,
+      inputTokensEstimated: event.inputTokensEstimated,
+      failureReason: event.failureReason
+    }
+    progressPersistSequence = progressPersistSequence
+      .then(() => appendProgress(event.phase, progress))
+      .catch(() => undefined)
+  })
 
   const appendProgress = async(
     phase: AiProgressPhase,
-    details: Pick<AiProgressInfo, 'current' | 'total'> = {}
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason'>> = {}
   ): Promise<void> => {
     const progress: AiProgressInfo = { phase, ...details }
     currentProgress.value = progress
     appendMessage('assistant', '', 'answer', { kind: 'status', progress })
     await saveChat()
+  }
+
+  const finalProgressDetails = (): Partial<AiProgressInfo> => {
+    const progress = liveProgress.value
+    if (!progress) return {}
+    return {
+      attempt: progress.attempt,
+      elapsedMs: progress.elapsedMs,
+      outputTokens: progress.outputTokens,
+      outputTokensEstimated: progress.outputTokensEstimated,
+      inputTokens: progress.inputTokens,
+      inputTokensEstimated: progress.inputTokensEstimated
+    }
   }
 
   const preparePendingPdfSelections = async(pending: PendingAiAttachment[]): Promise<void> => {
@@ -614,6 +681,7 @@ export const useAiStore = defineStore('ai', () => {
       const contextMessages = messages.value.slice()
       loading.value = true
       activeRequestId.value = requestId
+      startLiveProgress(requestId, requestMode)
       currentProgress.value = undefined
       renderingPdf.value = pending.some(item => item.attachment.mimeType === 'application/pdf')
       await preparePendingPdfSelections(pending)
@@ -664,6 +732,7 @@ export const useAiStore = defineStore('ai', () => {
         appendMessage('assistant', response.content, requestMode, { model: response.model })
         lastAnswer.value = response.content
         await saveChat()
+        await appendProgress('completed', finalProgressDetails())
       } else if (response.markdown !== undefined) {
         if (response.recovery?.requiresConfirmation) {
           if (!setAiEditSessionStatus(requestId, 'awaiting-confirmation')) {
@@ -681,7 +750,7 @@ export const useAiStore = defineStore('ai', () => {
         } else {
           await appendProgress('local-processing')
           const applied = await applyEdit(response, requestId, requestTabId, baseMarkdown)
-          if (applied) await appendProgress('completed')
+          if (applied) await appendProgress('completed', finalProgressDetails())
         }
       }
     } catch (err) {
@@ -692,13 +761,14 @@ export const useAiStore = defineStore('ai', () => {
           attachmentError.value = 'pdf-render-failed'
         }
         error.value = err instanceof Error ? err.message : String(err)
-        await appendProgress('failed').catch(() => undefined)
+        if (liveProgress.value?.phase !== 'failed') await appendProgress('failed', finalProgressDetails()).catch(() => undefined)
       }
     } finally {
       renderingPdf.value = false
       if (requestId === activeRequestId.value) {
         loading.value = false
         activeRequestId.value = null
+        stopLiveProgress()
       }
       if (!keepEditSession) endAiEditSession(requestId)
     }
@@ -869,10 +939,24 @@ export const useAiStore = defineStore('ai', () => {
   const stop = (): void => {
     if (!activeRequestId.value) return
     const requestId = activeRequestId.value
+    const progress = liveProgress.value
     window.electron.ipcRenderer.send('mt::ai::cancel', requestId)
     activeRequestId.value = null
     loading.value = false
-    appendProgress('cancelled').catch(() => undefined)
+    stopLiveProgress()
+    appendProgress(
+      'cancelled',
+      progress
+        ? {
+          attempt: progress.attempt,
+          elapsedMs: progress.elapsedMs,
+          outputTokens: progress.outputTokens,
+          outputTokensEstimated: progress.outputTokensEstimated,
+          inputTokens: progress.inputTokens,
+          inputTokensEstimated: progress.inputTokensEstimated
+        }
+        : {}
+    ).catch(() => undefined)
   }
 
   const undoAiEdit = async(): Promise<void> => {
@@ -953,6 +1037,8 @@ export const useAiStore = defineStore('ai', () => {
     loading,
     renderingPdf,
     currentProgress,
+    liveProgress,
+    liveProgressElapsedMs,
     error,
     lastAnswer,
     currentChangeMarker,
@@ -977,6 +1063,7 @@ export const useAiStore = defineStore('ai', () => {
     acceptPendingRecovery,
     discardPendingRecovery,
     stop,
-    undoAiEdit
+    undoAiEdit,
+    listenForProgress
   }
 })

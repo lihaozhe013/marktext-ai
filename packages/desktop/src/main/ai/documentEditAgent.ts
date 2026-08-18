@@ -47,6 +47,7 @@ export interface DocumentEditGenerateRequest {
   requestId: string
   signal: AbortSignal
   format?: 'tool' | 'protocol' | 'whole'
+  attempt?: number
 }
 
 export interface DocumentEditAgentRequest {
@@ -59,7 +60,10 @@ export interface DocumentEditAgentRequest {
   generate: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>
   generateTool?: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>
   generateWhole?: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>
+  /** Number of protocol repair attempts after the first protocol generation. */
+  maxRetries?: number
   onValidationFailure?: (diagnostic: DocumentEditValidationDiagnostic) => void
+  onPhase?: (phase: 'validating' | 'retrying' | 'fallback', attempt: number) => void
 }
 
 export interface DocumentEditAgentResult {
@@ -87,7 +91,8 @@ interface LocatedEdit extends ParsedEdit {
   summary: AiEditOperationSummary
 }
 
-const MAX_ATTEMPTS = 2
+const DEFAULT_MAX_RETRIES = 1
+const MAX_RETRIES = 3
 const MAX_OPERATIONS = 32
 const MAX_MESSAGE_LENGTH = 240
 
@@ -410,6 +415,10 @@ const summarize = (markdown: string, edits: LocatedEdit[]): AiEditSummary => ({
 })
 
 export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Promise<DocumentEditAgentResult> => {
+  const maxRetries = typeof request.maxRetries === 'number' && Number.isFinite(request.maxRetries)
+    ? Math.min(MAX_RETRIES, Math.max(0, Math.floor(request.maxRetries)))
+    : DEFAULT_MAX_RETRIES
+  const maxAttempts = maxRetries + 1
   const delimiter = makeDelimiter()
   const system = buildPreciseEditSystemPrompt(delimiter)
   const documentPrompt = buildDocumentPrompt(request.instruction, request.markdown, delimiter)
@@ -426,10 +435,12 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
       ],
       requestId: request.requestId,
       signal: request.signal,
-      format: 'tool'
+      format: 'tool',
+      attempt: 1
     })
     if (!generated.toolUnsupported) {
       toolAttempted = true
+      request.onPhase?.('validating', 1)
       try {
         if (generated.truncated) throw new Error('The structured edit response was truncated.')
         const toolCall = generated.toolCalls?.find(call => call.name === 'submit_markdown_edits')
@@ -467,7 +478,9 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
     }
   }
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+  const attemptOffset = toolAttempted ? 1 : 0
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const logicalAttempt = attempt + attemptOffset
     const messages: DocumentEditMessage[] = [
       ...request.contextMessages,
       { role: 'user', content: documentPrompt, attachments: request.attachments }
@@ -484,9 +497,11 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
       messages,
       requestId: request.requestId,
       signal: request.signal,
-      format: 'protocol'
+      format: 'protocol',
+      attempt: logicalAttempt
     })
     previousResponse = generated.content
+    request.onPhase?.('validating', logicalAttempt)
     try {
       const parsed = generated.truncated
         ? (() => { throw new Error('The model response was truncated before a complete edit was returned.') })()
@@ -497,14 +512,14 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
         markdown: applyEdits(request.markdown, located),
         summary: summarize(request.markdown, located),
         message: parsed.message,
-        attempts: attempt + (toolAttempted ? 1 : 0),
+        attempts: logicalAttempt,
         recovery: {
           strategy: locatedResult.changes.length
             ? 'local-normalization'
             : wasRepair
               ? 'model-repair'
               : 'direct',
-          attempts: attempt + (toolAttempted ? 1 : 0),
+          attempts: logicalAttempt,
           changes: locatedResult.changes.length ? locatedResult.changes : undefined
         }
       }
@@ -516,7 +531,7 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
       const divider = countMarkerLines(responseLines, markers.divider)
       const replace = countMarkerLines(responseLines, markers.replace)
       request.onValidationFailure?.({
-        attempt,
+        attempt: logicalAttempt,
         code: classifyEditFailure(failure),
         error: failure,
         responseChars: generated.content.length,
@@ -526,9 +541,10 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
         dividerMarkers: divider,
         replaceMarkers: replace
       })
-      if (attempt === MAX_ATTEMPTS) {
-        if (request.generateWhole) {
-          const fallbackAttempt = MAX_ATTEMPTS + 1
+      if (attempt === maxAttempts) {
+        if (request.generateWhole && maxRetries > 0) {
+          const fallbackAttempt = maxAttempts + attemptOffset + 1
+          request.onPhase?.('fallback', fallbackAttempt)
           const fallback = await request.generateWhole({
             system: buildPreciseEditWholeFallbackPrompt(delimiter),
             messages: [
@@ -537,9 +553,11 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
             ],
             requestId: request.requestId,
             signal: request.signal,
-            format: 'whole'
+            format: 'whole',
+            attempt: fallbackAttempt
           })
           try {
+            request.onPhase?.('validating', fallbackAttempt)
             if (fallback.truncated) throw new Error('The model response was truncated before a complete document was returned.')
             const normalized = normalizeGeneratedMarkdown(fallback.content, { stripOuterFence: true })
             assertMarkdownCompatibility(normalized.content)
@@ -574,8 +592,9 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
             throw new Error(`The AI edit could not be validated after ${fallbackAttempt} attempts. ${fallbackFailure}`)
           }
         }
-        throw new Error(`The AI edit could not be validated after ${MAX_ATTEMPTS} attempts. ${failure}`)
+        throw new Error(`The AI edit could not be validated after ${logicalAttempt} attempts. ${failure}`)
       }
+      request.onPhase?.('retrying', logicalAttempt + 1)
     }
   }
 
@@ -583,6 +602,8 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
 }
 
 export const documentEditAgentLimits = {
-  maxAttempts: MAX_ATTEMPTS,
+  defaultMaxRetries: DEFAULT_MAX_RETRIES,
+  maxRetries: MAX_RETRIES,
+  maxAttempts: DEFAULT_MAX_RETRIES + 1,
   maxOperations: MAX_OPERATIONS
 }
