@@ -587,16 +587,22 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const tokenUsage = progress?.outputTokens === undefined
     ? ''
     : progress.inputTokens !== undefined
-      ? `${progress.outputTokensEstimated ? '约 ' : ''}${progress.inputTokens + progress.outputTokens} tokens（输入 ${progress.inputTokens} / 输出 ${progress.outputTokens}）`
-      : `${progress.outputTokensEstimated ? '约 ' : ''}输出 ${progress.outputTokens} tokens`
-  const attempt = progress?.attempt ? `第 ${progress.attempt} 次尝试` : ''
+      ? chinese.value
+        ? `${progress.outputTokensEstimated ? '约 ' : ''}${progress.inputTokens + progress.outputTokens} tokens（输入 ${progress.inputTokens} / 输出 ${progress.outputTokens}）`
+        : `${progress.outputTokensEstimated ? 'about ' : ''}${progress.inputTokens + progress.outputTokens} tokens (input ${progress.inputTokens} / output ${progress.outputTokens})`
+      : chinese.value
+        ? `${progress.outputTokensEstimated ? '约 ' : ''}输出 ${progress.outputTokens} tokens`
+        : `${progress.outputTokensEstimated ? 'about ' : ''}${progress.outputTokens} output tokens`
+  const attempt = progress?.attempt
+    ? chinese.value ? `第 ${progress.attempt} 次尝试` : `attempt ${progress.attempt}`
+    : ''
   const failureReason = progress?.failureReason === 'exact-match'
-    ? 'SEARCH 未精确匹配'
+    ? chinese.value ? 'SEARCH 未精确匹配' : 'SEARCH did not match exactly'
     : progress?.failureReason === 'truncated'
-      ? '输出被截断'
+      ? chinese.value ? '输出被截断' : 'Output was truncated'
       : progress?.failureReason === 'provider'
-        ? '模型请求失败'
-        : '格式不符合要求'
+        ? chinese.value ? '模型请求失败' : 'Model request failed'
+        : chinese.value ? '格式不符合要求' : 'Format validation failed'
   if (chinese.value) {
     switch (progress?.phase) {
       case 'pdf-rendering':
@@ -643,12 +649,14 @@ const progressLabel = (message: AiChatMessage): string => progressLabelFor(messa
 
 const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: number): string => {
   if (!progress) return ''
-  const elapsed = `${Math.max(0, Math.floor(elapsedMs / 1000))} 秒`
+  const elapsed = chinese.value
+    ? `${Math.max(0, Math.floor(elapsedMs / 1000))} 秒`
+    : `${Math.max(0, Math.floor(elapsedMs / 1000))} seconds`
   const tokens = progress.outputTokensEstimated
-    ? `输出约 ${progress.outputTokens} tokens`
-    : `输出 ${progress.outputTokens} tokens`
+    ? chinese.value ? `输出约 ${progress.outputTokens} tokens` : `about ${progress.outputTokens} output tokens`
+    : chinese.value ? `输出 ${progress.outputTokens} tokens` : `${progress.outputTokens} output tokens`
   const usage = progress.inputTokens !== undefined
-    ? `输入 ${progress.inputTokens} / ${tokens}`
+    ? chinese.value ? `输入 ${progress.inputTokens} / ${tokens}` : `input ${progress.inputTokens} / ${tokens}`
     : tokens
   if (chinese.value) {
     switch (progress.phase) {
