@@ -59,6 +59,13 @@ renderer AI panel/store, and `packages/desktop/src/shared/types/ai.ts`:
   and 30 MB total. Images are stored under Electron `userData`, while chat
   history keeps metadata and the panel displays an icon plus filename (not a
   thumbnail). PDF uploads are rendered locally into PNG page images before being sent to image-capable models; PDF text extraction and OCR are not performed.
+- AI Panel file drag-and-drop is isolated in `components/aiPanel/index.vue` at
+  the window capture phase. Keep the coordinate-based boundary and
+  `stopImmediatePropagation()`: MarkText's window-level `dragover` handler can
+  open a fixed import overlay before a Panel target receives a bubbling event,
+  so replacing this with a root `.stop` handler or an `event.target` check
+  reintroduces the global import hijack. Panel-outside file drops must remain
+  available to MarkText's existing import flow.
 - `prompts.ts` contains the shared MarkText/CommonMark/GFM rules. New math uses
   `$...$` inline and standalone `$$` block delimiters. The incompatible
   `\(...\)`, `\[...\]`, same-line `$$...$$`, and math code fences are rejected

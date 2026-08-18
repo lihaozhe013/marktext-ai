@@ -653,6 +653,9 @@ const addFiles = (files: File[]): void => {
   ai.addAttachmentFiles(files).catch(() => undefined)
 }
 
+// MarkText's window dragover listener can show a fixed import overlay before
+// a Panel target receives a bubbling event, so this boundary must stay at the
+// window capture phase and use coordinates instead of event.target.
 const hasFilePayload = (event: DragEvent): boolean => {
   const dataTransfer = event.dataTransfer
   if (!dataTransfer) return false
