@@ -96,6 +96,29 @@
       >
         {{ labels.empty }}
       </div>
+      <section
+        v-if="ai.loading && ai.liveProgress?.planStepCount !== undefined"
+        class="ai-plan-card"
+        role="status"
+      >
+        <div class="ai-plan-title">
+          {{ labels.editPlan }}
+        </div>
+        <div class="ai-plan-summary">
+          {{ ai.liveProgress.planSummary }}
+        </div>
+        <div class="ai-plan-count">
+          {{ labels.planSteps(ai.liveProgress.planStepCount) }}
+        </div>
+        <ol>
+          <li
+            v-for="(description, index) in ai.liveProgress.planStepDescriptions || []"
+            :key="`${index}-${description}`"
+          >
+            {{ description }}
+          </li>
+        </ol>
+      </section>
       <article
         v-for="message in ai.messages"
         :key="message.id"
@@ -486,6 +509,8 @@ const labels = computed(() => chinese.value
       undo: '撤销 AI 修改',
       unconfigured: '未配置连接',
       editApplied: (count: number, added: number, removed: number) => `已应用 ${count} 处修改（新增 ${added} 行，删除 ${removed} 行）`,
+      editPlan: '编辑计划',
+      planSteps: (count: number) => `共 ${count} 个步骤`,
       stepDeleted: '删除',
       stepAdded: '新增',
       emptyDiff: '（空）',
@@ -542,6 +567,8 @@ const labels = computed(() => chinese.value
       undo: 'Undo AI edit',
       unconfigured: 'Connection not configured',
       editApplied: (count: number, added: number, removed: number) => `Applied ${count} edit${count === 1 ? '' : 's'} (+${added}/-${removed} lines)`,
+      editPlan: 'Edit plan',
+      planSteps: (count: number) => `${count} step${count === 1 ? '' : 's'}`,
       stepDeleted: 'Deleted',
       stepAdded: 'Added',
       emptyDiff: '(empty)',
@@ -641,13 +668,15 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     : ''
   const failureReason = progress?.failureReason === 'exact-match'
     ? chinese.value ? 'SEARCH 未精确匹配' : 'SEARCH did not match exactly'
-    : progress?.failureReason === 'truncated'
-      ? chinese.value ? '输出被截断' : 'Output was truncated'
-      : progress?.failureReason === 'provider'
-        ? chinese.value ? '模型请求失败' : 'Model request failed'
-        : progress?.failureReason === 'capability'
-          ? chinese.value ? '模型不支持工具调用' : 'Model does not support tool calling'
-          : chinese.value ? '格式不符合要求' : 'Format validation failed'
+    : progress?.failureReason === 'scope'
+      ? chinese.value ? '编辑计划定位失败，正在重新规划' : 'Edit plan target failed; replanning'
+      : progress?.failureReason === 'truncated'
+        ? chinese.value ? '输出被截断' : 'Output was truncated'
+        : progress?.failureReason === 'provider'
+          ? chinese.value ? '模型请求失败' : 'Model request failed'
+          : progress?.failureReason === 'capability'
+            ? chinese.value ? '模型不支持工具调用' : 'Model does not support tool calling'
+            : chinese.value ? '格式不符合要求' : 'Format validation failed'
   if (chinese.value) {
     switch (progress?.phase) {
       case 'pdf-rendering':
@@ -659,6 +688,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
       case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
+      case 'agent-plan': return `${progress?.planRevisionCount ? '正在修订剩余编辑计划' : '正在制定编辑计划'}${progress?.planStepCount !== undefined ? ` · ${progress.planStepCount} 步` : ''}`
       case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
       case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
@@ -680,6 +710,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
     case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
+    case 'agent-plan': return `${progress?.planRevisionCount ? 'Revising remaining edit plan' : 'Creating edit plan'}${progress?.planStepCount !== undefined ? ` · ${progress.planStepCount} steps` : ''}`
     case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
     case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
@@ -713,6 +744,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
       case 'waiting': return `正在等待模型响应… · ${elapsed}`
       case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
       case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'agent-plan': return `${progress.planRevisionCount ? '正在修订剩余编辑计划' : '正在制定编辑计划'}… · ${elapsed}`
       case 'agent-step': return `第 ${progress.step ?? 0}/${progress.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}，继续执行… · ${elapsed}`
       case 'attempt-failed': return `第 ${progress.attempt} 次尝试失败 · ${usage} · ${elapsed}`
       case 'retrying': return `格式不符合要求，正在重试… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
@@ -727,6 +759,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
     case 'waiting': return `Waiting for model response… · ${elapsed}`
     case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
     case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
+    case 'agent-plan': return `${progress.planRevisionCount ? 'Revising remaining edit plan' : 'Creating edit plan'}… · ${elapsed}`
     case 'agent-step': return `Applied agent step ${progress.step ?? 0}/${progress.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}; continuing… · ${elapsed}`
     case 'attempt-failed': return `Attempt ${progress.attempt} failed · ${usage} · ${elapsed}`
     case 'retrying': return `Format validation failed; retrying… · attempt ${progress.attempt} · ${elapsed}`
@@ -1030,6 +1063,11 @@ onUnmounted(() => {
 .ai-model-select small { color: var(--editorColor50); font-size: 10px; }
 .ai-mode-help { margin: 8px 14px; color: var(--editorColor60); font-size: 12px; line-height: 1.4; }
 .ai-messages { flex: 1; overflow: auto; padding: 0 12px 12px; }
+.ai-plan-card { margin: 6px 0 10px; padding: 8px 9px; border: 1px solid var(--editorColor20); border-radius: 5px; color: var(--editorColor70); background: var(--editorColor05, transparent); font-size: 11px; line-height: 1.4; }
+.ai-plan-title { color: var(--themeColor); font-weight: 600; }
+.ai-plan-summary { margin-top: 3px; }
+.ai-plan-count { margin-top: 4px; color: var(--editorColor50); }
+.ai-plan-card ol { margin: 5px 0 0 18px; padding: 0; }
 .ai-empty { padding: 30px 8px; color: var(--editorColor60); text-align: center; font-size: 13px; }
 .ai-message { margin: 10px 0; padding: 9px 0; border-bottom: 1px solid var(--editorColor10); }
 .ai-message.user { padding-left: 9px; border-left: 2px solid var(--themeColor); }

@@ -79,7 +79,17 @@ export interface DocumentEditAgentRequest {
   maxRetries?: number
   onValidationFailure?: (diagnostic: DocumentEditValidationDiagnostic) => void
   onPhase?: (phase: 'validating' | 'retrying' | 'fallback', attempt: number) => void
+  onAgentPlan?: (summary: string, steps: AgentPlanStep[], revision: number, successfulSteps: number) => void
   onAgentStep?: (step: number, maxSteps: number, description: string, version: number, beforeMarkdown: string, markdown: string, addedLines: number, removedLines: number, removedText: string, addedText: string) => void
+}
+
+export interface AgentPlanStep {
+  id: string
+  description: string
+  intent: string
+  startAnchor: string
+  endAnchor?: string
+  dependsOn: string[]
 }
 
 export interface DocumentEditAgentResult {
@@ -680,6 +690,71 @@ const makeAgentToolResult = (call: ProviderToolCall, current: string, version: n
   ...(isError ? { isError: true } : {})
 })
 
+const parsePlanSteps = (value: unknown, maxSteps: number, knownDependencies = new Set<string>()): AgentPlanStep[] => {
+  if (!Array.isArray(value) || value.length > maxSteps) throw new Error(`The edit plan must contain at most ${maxSteps} steps.`)
+  const ids = new Set<string>()
+  const steps: AgentPlanStep[] = []
+  for (const raw of value) {
+    const record = asAgentRecord(raw)
+    const id = record?.id
+    const description = record?.description
+    const intent = record?.intent
+    const startAnchor = record?.startAnchor
+    const endAnchor = record?.endAnchor
+    const dependsOn = record?.dependsOn
+    if (typeof id !== 'string' || !id.trim() || id.length > 80 || ids.has(id)) throw new Error('Every plan step must have a unique non-empty id.')
+    if (typeof description !== 'string' || !description.trim() || description.length > MAX_STEP_DESCRIPTION) throw new Error(`Plan step ${id} has an invalid description.`)
+    if (typeof intent !== 'string' || !intent.trim() || intent.length > 400) throw new Error(`Plan step ${id} has an invalid intent.`)
+    if (typeof startAnchor !== 'string') throw new Error(`Plan step ${id} must have a string startAnchor.`)
+    if (endAnchor !== undefined && (typeof endAnchor !== 'string' || !endAnchor)) throw new Error(`Plan step ${id} has an invalid endAnchor.`)
+    if (!Array.isArray(dependsOn) || dependsOn.some(item => typeof item !== 'string')) throw new Error(`Plan step ${id} has invalid dependencies.`)
+    ids.add(id)
+    steps.push({ id, description: cleanStepDescription(description), intent: intent.trim(), startAnchor, endAnchor, dependsOn: dependsOn as string[] })
+  }
+  for (const [index, step] of steps.entries()) {
+    for (const dependency of step.dependsOn) {
+      const dependencyIndex = steps.findIndex(candidate => candidate.id === dependency)
+      if (dependencyIndex < 0 && !knownDependencies.has(dependency)) throw new Error(`Plan step ${step.id} depends on a missing or later step.`)
+      if (dependencyIndex >= index && dependencyIndex >= 0) throw new Error(`Plan step ${step.id} depends on a missing or later step.`)
+    }
+  }
+  return steps
+}
+
+const locateUniqueAnchor = (markdown: string, anchor: string, label: string, from = 0): number => {
+  if (!anchor && !markdown) return 0
+  const first = markdown.indexOf(anchor, from)
+  if (first < 0) throw new Error(`${label} was not found in the current document.`)
+  if (markdown.indexOf(anchor, first + anchor.length) >= 0) throw new Error(`${label} is not unique in the current document.`)
+  return first
+}
+
+const assertPlanScope = (markdown: string, step: AgentPlanStep, edit: LocatedEdit): void => {
+  if (!step.startAnchor && markdown) throw new Error(`Plan step ${step.id} must provide a non-empty startAnchor.`)
+  const scopeStart = locateUniqueAnchor(markdown, step.startAnchor, `Plan step ${step.id} startAnchor`)
+  let scopeEnd = markdown.length
+  if (step.endAnchor) {
+    const end = locateUniqueAnchor(markdown, step.endAnchor, `Plan step ${step.id} endAnchor`, scopeStart + step.startAnchor.length)
+    if (end < scopeStart + step.startAnchor.length) throw new Error(`Plan step ${step.id} has an invalid scope.`)
+    scopeEnd = end + step.endAnchor.length
+  }
+  if (edit.start < scopeStart || edit.end > scopeEnd) throw new Error(`The edit is outside the scope of plan step ${step.id}.`)
+}
+
+const validateInitialPlan = (markdown: string, steps: AgentPlanStep[]): void => {
+  const first = steps[0]
+  if (!first) return
+  if (!markdown) {
+    if (first.startAnchor) throw new Error('The first plan step for an empty document must use an empty startAnchor and an empty SEARCH insertion.')
+    return
+  }
+  try {
+    locateUniqueAnchor(markdown, first.startAnchor, `Plan step ${first.id} startAnchor`)
+  } catch (error) {
+    throw new Error(`The first plan step cannot target the current document: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 const summarizeAgentSteps = (original: string, current: string, ranges: AgentStepRange[]): AiEditSummary => {
   const operations = ranges.map(range => {
     const lines = lineRangeAt(current, range.start, range.end)
@@ -747,10 +822,19 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
   let version = 0
   let successfulSteps = 0
   let failures = 0
+  let planRevisionCount = 0
+  let planSummary = ''
+  let planSteps: AgentPlanStep[] | undefined
+  const completedPlanStepIds = new Set<string>()
+  let consecutiveLocationFailures = 0
+  let planRevisionRequired = false
   let lastReasoning: string | undefined
   const ranges: AgentStepRange[] = []
+  const validatePlanAnchors = (steps: AgentPlanStep[]): void => {
+    if (current && steps.some(step => !step.startAnchor)) throw new Error('Non-empty documents require a startAnchor for every plan step.')
+  }
 
-  for (let turn = 1; turn <= maxSteps + AGENT_MAX_FAILURES + 2; turn += 1) {
+  for (let turn = 1; turn <= maxSteps + (AGENT_MAX_FAILURES * 2) + 4; turn += 1) {
     if (Date.now() - startedAt > AGENT_MAX_RUNTIME_MS) throw new Error('The AI edit agent exceeded its time limit.')
     const generated = await request.generateAgent({
       system,
@@ -774,15 +858,22 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
 
     const failTurn = (call: ProviderToolCall | undefined, error: string): void => {
       failures += 1
+      const locationFailure = /SEARCH|anchor|scope|match|unique|plan/i.test(error)
+      if (locationFailure) consecutiveLocationFailures += 1
+      else consecutiveLocationFailures = 0
+      if (consecutiveLocationFailures >= 2 && planSteps) planRevisionRequired = true
+      const effectiveError = planRevisionRequired && planSteps
+        ? `${error} The current plan is invalid after repeated target failures. Call revise_markdown_edit_plan before trying another apply_markdown_edit.`
+        : error
       const fallbackCall: ProviderToolCall = call ?? { id: `mt-agent-tool-${turn}`, name: 'agent_response', input: {} }
-      const result = makeAgentToolResult(fallbackCall, current, version, { ok: false, error }, true)
+      const result = makeAgentToolResult(fallbackCall, current, version, { ok: false, error: effectiveError }, true)
       messages.push({ role: 'user', content: '', toolResults: [result] })
       request.onValidationFailure?.({
         attempt: turn,
         code: calls.length === 0
           ? 'capability'
-          : /SEARCH|version|match|unique/i.test(error) ? 'exact-match' : 'contract',
-        error,
+          : /anchor|scope/i.test(error) ? 'scope' : /SEARCH|version|match|unique/i.test(error) ? 'exact-match' : 'contract',
+        error: effectiveError,
         responseChars: (generated.rawContent || generated.content).length,
         responseLines: (generated.rawContent || generated.content).replaceAll('\r\n', '\n').split('\n').length,
         summaryMarkers: 0,
@@ -807,6 +898,69 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
       const call = calls[0]
       if (call.parseError || call.input === undefined) {
         failTurn(call, call.parseError ?? 'The tool arguments were invalid.')
+      } else if (call.name === 'create_markdown_edit_plan') {
+        const input = asAgentRecord(call.input)
+        const requestedVersion = input?.version
+        const summary = cleanMessage(typeof input?.summary === 'string' ? input.summary : '')
+        if (planSteps) {
+          failTurn(call, 'An edit plan already exists. Revise only unfinished steps with revise_markdown_edit_plan.')
+        } else if (!input || !Number.isInteger(requestedVersion) || requestedVersion !== version) {
+          failTurn(call, 'The plan version does not match the current document version.')
+        } else if (!summary) {
+          failTurn(call, 'The edit plan summary must be a concise non-empty string.')
+        } else {
+          try {
+            const parsedPlan = parsePlanSteps(input.steps, maxSteps)
+            validatePlanAnchors(parsedPlan)
+            validateInitialPlan(current, parsedPlan)
+            planSteps = parsedPlan
+            consecutiveLocationFailures = 0
+            planRevisionRequired = false
+            planSummary = summary
+            request.onAgentPlan?.(planSummary, planSteps, planRevisionCount, successfulSteps)
+            const result = makeAgentToolResult(call, current, version, {
+              ok: true,
+              action: 'planned',
+              summary: planSummary,
+              steps: planSteps.map(step => ({ id: step.id, description: step.description, dependsOn: step.dependsOn })),
+              planRevisionCount
+            })
+            messages.push({ role: 'user', content: '', toolResults: [result] })
+          } catch (error) {
+            failTurn(call, error instanceof Error ? error.message : String(error))
+          }
+        }
+      } else if (call.name === 'revise_markdown_edit_plan') {
+        const input = asAgentRecord(call.input)
+        const requestedVersion = input?.version
+        if (!planSteps) {
+          failTurn(call, 'There is no edit plan to revise. Create a plan first.')
+        } else if (!input || !Number.isInteger(requestedVersion) || requestedVersion !== version) {
+          failTurn(call, 'The revised plan version does not match the current document version.')
+        } else if (typeof input.reason !== 'string' || !input.reason.trim()) {
+          failTurn(call, 'The plan revision reason must be a concise non-empty string.')
+        } else {
+          try {
+            const revised = parsePlanSteps(input.remainingSteps, maxSteps - successfulSteps, completedPlanStepIds)
+            validatePlanAnchors(revised)
+            if (revised.some(step => completedPlanStepIds.has(step.id))) throw new Error('Completed plan steps are immutable and cannot appear in a revised plan.')
+            planSteps = revised
+            planRevisionCount += 1
+            if (planRevisionCount > AGENT_MAX_FAILURES) throw new Error(`The AI edit agent exceeded ${AGENT_MAX_FAILURES} plan revisions.`)
+            consecutiveLocationFailures = 0
+            planRevisionRequired = false
+            request.onAgentPlan?.(planSummary, planSteps, planRevisionCount, successfulSteps)
+            const result = makeAgentToolResult(call, current, version, {
+              ok: true,
+              action: 'plan-revised',
+              planRevisionCount,
+              remainingSteps: planSteps.map(step => ({ id: step.id, description: step.description, dependsOn: step.dependsOn }))
+            })
+            messages.push({ role: 'user', content: '', toolResults: [result] })
+          } catch (error) {
+            failTurn(call, error instanceof Error ? error.message : String(error))
+          }
+        }
       } else if (call.name === 'finish_markdown_edit') {
         const input = asAgentRecord(call.input)
         const requestedVersion = input?.version
@@ -815,6 +969,10 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
           failTurn(call, 'The finish version does not match the current document version.')
         } else if (!summary) {
           failTurn(call, 'The finish summary must be a concise non-empty string.')
+        } else if (!planSteps) {
+          failTurn(call, 'Create an edit plan before finishing.')
+        } else if (planSteps.some(step => !completedPlanStepIds.has(step.id))) {
+          failTurn(call, 'The edit plan still has unfinished steps. Apply the next plan step before finishing.')
         } else {
           return {
             markdown: current,
@@ -828,10 +986,21 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
       } else if (call.name === 'apply_markdown_edit') {
         const input = asAgentRecord(call.input)
         const requestedVersion = input?.version
+        const planStepId = input?.planStepId
         const search = input?.search
         const replace = input?.replace
         if (!input || !Number.isInteger(requestedVersion) || requestedVersion !== version) {
           failTurn(call, 'The edit version does not match the current document version.')
+        } else if (!planSteps) {
+          failTurn(call, 'Create an edit plan before applying an edit.')
+        } else if (typeof planStepId !== 'string' || !planStepId) {
+          failTurn(call, 'The edit requires a planStepId.')
+        } else if (completedPlanStepIds.has(planStepId)) {
+          failTurn(call, `Plan step ${planStepId} is already complete.`)
+        } else if (planRevisionRequired) {
+          failTurn(call, 'The current plan scope requires revision before another edit can be applied. Call revise_markdown_edit_plan with the unfinished steps.')
+        } else if (planSteps.find(step => !completedPlanStepIds.has(step.id))?.id !== planStepId) {
+          failTurn(call, 'Only the first unfinished plan step may be applied.')
         } else if (typeof search !== 'string' || typeof replace !== 'string') {
           failTurn(call, 'The edit requires string SEARCH and REPLACE values.')
         } else if (search === replace) {
@@ -840,6 +1009,9 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
           try {
             const locatedResult = normalizeLocatedEdits(locateEdits([{ search, replace }], current))
             const located = locatedResult.edits[0]
+            const planStep = planSteps.find(step => step.id === planStepId)
+            if (!planStep) throw new Error(`Unknown plan step ${planStepId}.`)
+            assertPlanScope(current, planStep, located)
             const next = applyEdits(current, locatedResult.edits)
             assertNoNewMarkdownIssues(current, next)
             const span = changedSpan(located.search, located.replace)
@@ -856,11 +1028,14 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
             current = next
             version += 1
             successfulSteps += 1
+            completedPlanStepIds.add(planStepId)
+            consecutiveLocationFailures = 0
+            planRevisionRequired = false
             ranges.splice(0, ranges.length, ...rebased)
             request.onAgentStep?.(
               successfulSteps,
               maxSteps,
-              cleanStepDescription(input.description),
+              cleanStepDescription(input.description || planStep.description),
               version,
               beforeStep,
               current,
@@ -872,7 +1047,9 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
             const result = makeAgentToolResult(call, current, version, {
               ok: true,
               action: 'applied',
-              description: cleanStepDescription(input.description)
+              planStepId,
+              description: cleanStepDescription(input.description || planStep.description),
+              completedPlanStepIds: Array.from(completedPlanStepIds)
             })
             messages.push({ role: 'user', content: '', toolResults: [result] })
           } catch (error) {
@@ -885,6 +1062,9 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
       } else {
         failTurn(call, `Unknown editing tool: ${call.name}.`)
       }
+    }
+    if (consecutiveLocationFailures >= 3 && !planSteps) {
+      throw new Error('The AI edit agent could not create a valid initial plan for the current document. The document was left unchanged.')
     }
     if (failures >= AGENT_MAX_FAILURES) throw new Error(`The AI edit agent exceeded ${AGENT_MAX_FAILURES} invalid tool turns.`)
   }

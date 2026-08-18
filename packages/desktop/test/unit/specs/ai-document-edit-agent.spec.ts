@@ -39,8 +39,16 @@ const responseWith = (system: string, search: string, replace: string): string =
 describe('document edit agent', () => {
   it('executes dependent edits against the evolving virtual document', async() => {
     const steps: Array<Record<string, unknown>> = [
-      { version: 0, search: 'alpha', replace: 'beta', description: 'Updated the first word.' },
-      { version: 1, search: 'beta', replace: 'gamma', description: 'Refined the updated word.' },
+      {
+        version: 0,
+        summary: 'Update the text in two dependent steps.',
+        steps: [
+          { id: 'first', description: 'Update the first word.', intent: 'Change alpha to beta.', startAnchor: 'alpha', dependsOn: [] },
+          { id: 'second', description: 'Refine the updated word.', intent: 'Change beta to gamma.', startAnchor: 'beta', dependsOn: ['first'] }
+        ]
+      },
+      { version: 0, planStepId: 'first', search: 'alpha', replace: 'beta', description: 'Updated the first word.' },
+      { version: 1, planStepId: 'second', search: 'beta', replace: 'gamma', description: 'Refined the updated word.' },
       { version: 2, summary: 'Updated the requested text.' }
     ]
     let turn = 0
@@ -52,7 +60,7 @@ describe('document edit agent', () => {
         content: '',
         toolCalls: [{
           id: `call-${turn}`,
-          name: step.summary ? 'finish_markdown_edit' : 'apply_markdown_edit',
+          name: step.steps ? 'create_markdown_edit_plan' : step.summary ? 'finish_markdown_edit' : 'apply_markdown_edit',
           input: step
         }]
       }
@@ -75,7 +83,7 @@ describe('document edit agent', () => {
       { addedLines: 1, removedLines: 1, removedText: 'alpha', addedText: 'beta' },
       { addedLines: 1, removedLines: 1, removedText: 'beta', addedText: 'gamma' }
     ])
-    expect(generateAgent).toHaveBeenCalledTimes(3)
+    expect(generateAgent).toHaveBeenCalledTimes(4)
     expect(generateAgent.mock.calls[1][0].messages.some(message => message.toolResults?.[0]?.content.includes('"version":1'))).toBe(true)
   })
 
@@ -84,8 +92,9 @@ describe('document edit agent', () => {
     const diagnostics: DocumentEditValidationDiagnostic[] = []
     const generateAgent = vi.fn(async() => {
       turn += 1
-      if (turn === 1) return { content: '', toolCalls: [{ id: 'bad', name: 'apply_markdown_edit', input: { version: 0, search: 'missing', replace: 'new', description: 'Bad anchor' } }] }
-      if (turn === 2) return { content: '', toolCalls: [{ id: 'good', name: 'apply_markdown_edit', input: { version: 0, search: 'old', replace: 'new', description: 'Changed the anchor.' } }] }
+      if (turn === 1) return { content: '', toolCalls: [{ id: 'plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Change the anchor.', steps: [{ id: 'change', description: 'Change the anchor.', intent: 'Change old to new.', startAnchor: 'old', dependsOn: [] }] } }] }
+      if (turn === 2) return { content: '', toolCalls: [{ id: 'bad', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'change', search: 'missing', replace: 'new', description: 'Bad anchor' } }] }
+      if (turn === 3) return { content: '', toolCalls: [{ id: 'good', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'change', search: 'old', replace: 'new', description: 'Changed the anchor.' } }] }
       return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 1, summary: 'Changed the anchor.' } }] }
     })
     const result = await runDocumentEditAgent({
@@ -100,7 +109,123 @@ describe('document edit agent', () => {
     expect(result.markdown).toBe('new')
     expect(result.summary.operationCount).toBe(1)
     expect(diagnostics[0].code).toBe('exact-match')
-    expect(generateAgent).toHaveBeenCalledTimes(3)
+    expect(generateAgent).toHaveBeenCalledTimes(4)
+  })
+
+  it('requires a plan before applying edits', async() => {
+    const generateAgent = vi.fn(async() => ({
+      content: '',
+      toolCalls: [{ id: 'apply', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'missing-plan', search: 'old', replace: 'new', description: 'Change it.' } }]
+    }))
+    await expect(runDocumentEditAgent({
+      markdown: 'old',
+      instruction: 'Change it.',
+      contextMessages: [],
+      requestId: 'plan-required-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })).rejects.toThrow('could not create a valid initial plan')
+  })
+
+  it('accepts a large coherent code block when it stays inside its plan scope', async() => {
+    const before = '```ts\n' + Array.from({ length: 60 }, (_, index) => `const value${index} = ${index}`).join('\n') + '\n```'
+    const after = before.replace('const value0 = 0', 'const value0 = 1')
+    const generateAgent = vi.fn(async(_input: DocumentAgentGenerateRequest) => {
+      const turn = generateAgent.mock.calls.length
+      if (turn === 1) return { content: '', toolCalls: [{ id: 'plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Update the code block.', steps: [{ id: 'code', description: 'Update the code block.', intent: 'Change the first constant.', startAnchor: '```ts', endAnchor: '```', dependsOn: [] }] } }] }
+      if (turn === 2) return { content: '', toolCalls: [{ id: 'apply', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'code', search: before, replace: after, description: 'Updated the code block.' } }] }
+      return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 1, summary: 'Updated the code block.' } }] }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: before,
+      instruction: 'Update the code block.',
+      contextMessages: [],
+      requestId: 'large-code-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })
+    expect(result.markdown).toBe(after)
+  })
+
+  it('supports inserting into an empty document with an empty plan anchor', async() => {
+    let turn = 0
+    const generateAgent = vi.fn(async() => {
+      turn += 1
+      if (turn === 1) return { content: '', toolCalls: [{ id: 'plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Create the document.', steps: [{ id: 'create', description: 'Create the document.', intent: 'Insert the requested heading.', startAnchor: '', dependsOn: [] }] } }] }
+      if (turn === 2) return { content: '', toolCalls: [{ id: 'apply', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'create', search: '', replace: '# Title', description: 'Created the document.' } }] }
+      return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 1, summary: 'Created the document.' } }] }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: '',
+      instruction: 'Create the document.',
+      contextMessages: [],
+      requestId: 'empty-document-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })
+    expect(result.markdown).toBe('# Title')
+  })
+
+  it('rejects an invented first anchor in an empty document and accepts a corrected plan', async() => {
+    let turn = 0
+    const diagnostics: DocumentEditValidationDiagnostic[] = []
+    const generateAgent = vi.fn(async() => {
+      turn += 1
+      if (turn === 1) return { content: '', toolCalls: [{ id: 'bad-plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Create a guide.', steps: [{ id: 'first', description: 'Create the guide.', intent: 'Insert the guide.', startAnchor: '<!DOCTYPE html>', dependsOn: [] }] } }] }
+      if (turn === 2) return { content: '', toolCalls: [{ id: 'good-plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Create a guide.', steps: [{ id: 'first', description: 'Create the guide.', intent: 'Insert the guide.', startAnchor: '', dependsOn: [] }] } }] }
+      if (turn === 3) return { content: '', toolCalls: [{ id: 'apply', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'first', search: '', replace: '# HTML Guide', description: 'Created the guide.' } }] }
+      return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 1, summary: 'Created the guide.' } }] }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: '',
+      instruction: 'Create an HTML guide.',
+      contextMessages: [],
+      requestId: 'empty-plan-repair-request',
+      signal: new AbortController().signal,
+      generateAgent,
+      onValidationFailure: diagnostic => diagnostics.push(diagnostic)
+    })
+    expect(result.markdown).toBe('# HTML Guide')
+    expect(diagnostics[0]).toMatchObject({ code: 'scope' })
+    expect(generateAgent).toHaveBeenCalledTimes(4)
+  })
+
+  it('revises only unfinished plan steps after a scope failure', async() => {
+    let turn = 0
+    const generateAgent = vi.fn(async() => {
+      turn += 1
+      if (turn === 1) {
+        return {
+          content: '',
+          toolCalls: [{
+            id: 'plan',
+            name: 'create_markdown_edit_plan',
+            input: {
+              version: 0,
+              summary: 'Update both words.',
+              steps: [
+                { id: 'first', description: 'Update first.', intent: 'Change first.', startAnchor: 'first', dependsOn: [] },
+                { id: 'second', description: 'Update second.', intent: 'Change second.', startAnchor: 'missing', dependsOn: ['first'] }
+              ]
+            }
+          }]
+        }
+      }
+      if (turn === 2) return { content: '', toolCalls: [{ id: 'apply-1', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'first', search: 'first', replace: 'done', description: 'Updated first.' } }] }
+      if (turn === 3) return { content: '', toolCalls: [{ id: 'revise', name: 'revise_markdown_edit_plan', input: { version: 1, reason: 'The second anchor moved.', remainingSteps: [{ id: 'second', description: 'Update second.', intent: 'Change second.', startAnchor: 'second', dependsOn: ['first'] }] } }] }
+      if (turn === 4) return { content: '', toolCalls: [{ id: 'apply-2', name: 'apply_markdown_edit', input: { version: 1, planStepId: 'second', search: 'second', replace: 'done2', description: 'Updated second.' } }] }
+      return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 2, summary: 'Updated both words.' } }] }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: 'first second',
+      instruction: 'Update both words.',
+      contextMessages: [],
+      requestId: 'plan-revision-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })
+    expect(result.markdown).toBe('done done2')
+    expect(generateAgent).toHaveBeenCalledTimes(5)
   })
 
   it('applies one exact local replacement and reports changed lines', async() => {
