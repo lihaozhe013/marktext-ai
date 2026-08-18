@@ -79,4 +79,16 @@ describe('AI provider image message serialization', () => {
       content: [{ type: 'image' }, { type: 'text', text: 'Read these PDF pages.' }]
     }])
   })
+
+  it('places rendered PDF context before the user text', () => {
+    const result = serializeProviderMessages('openai-chat-completions', [{
+      role: 'user',
+      content: 'Summarize the document.',
+      attachmentContext: 'These images are rendered pages from report.pdf. Selected pages, in order: 1, 3.'
+    }])
+    expect(result).toEqual([{
+      role: 'user',
+      content: 'These images are rendered pages from report.pdf. Selected pages, in order: 1, 3.\n\nSummarize the document.'
+    }])
+  })
 })

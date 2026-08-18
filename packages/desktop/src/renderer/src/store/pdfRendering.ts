@@ -45,7 +45,8 @@ export const getPdfPageCount = async(data: Uint8Array): Promise<number> => {
 export const renderPdfPages = async(
   data: Uint8Array,
   pageNumbers: readonly number[],
-  filename: string
+  filename: string,
+  onPageRendered?: (pageNumber: number) => void | Promise<void>
 ): Promise<{ pageCount: number; pages: AiImageUpload[] }> => {
   const pdfDocument = await loadPdf(data)
   try {
@@ -85,6 +86,7 @@ export const renderPdfPages = async(
         byteSize: pageData.byteLength,
         data: pageData
       })
+      await onPageRendered?.(pageNumber)
       canvas.width = 0
       canvas.height = 0
       page.cleanup()

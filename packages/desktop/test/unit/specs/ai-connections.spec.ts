@@ -204,6 +204,8 @@ describe('AI connection profiles and model routing', () => {
     })
 
     const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.messages[0].content).toContain('rendered pages from a PDF attachment')
+    expect(body.messages[1].content[1].text).toContain('Selected pages, in order: 1')
     expect(body.messages[1].content).toEqual([
       expect.objectContaining({ type: 'image_url', image_url: expect.objectContaining({ url: `data:image/png;base64,${Buffer.from(pageData).toString('base64')}` }) }),
       expect.objectContaining({ type: 'text' })
@@ -232,6 +234,55 @@ describe('AI connection profiles and model routing', () => {
       mimeType: 'application/pdf',
       pages: [1]
     })
+  })
+
+  it('persists progress entries without sending them to the model', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-progress-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'progress-model', 'openai-key'))
+    const fetchMock = vi.fn().mockResolvedValue(response({ choices: [{ message: { content: 'Done' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await service.request({
+      requestId: 'progress-request',
+      documentId: 'tab:progress',
+      mode: 'answer',
+      prompt: 'Read the document.',
+      markdown: '# Document',
+      messages: [{
+        id: 'progress-status',
+        role: 'assistant',
+        mode: 'answer',
+        content: '',
+        createdAt: 1,
+        kind: 'status',
+        progress: { phase: 'waiting' }
+      }, {
+        id: 'prior-user',
+        role: 'user',
+        mode: 'answer',
+        content: 'Earlier question',
+        createdAt: 2
+      }],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.messages).toHaveLength(3)
+    expect(JSON.stringify(body)).not.toContain('progress-status')
+    await service.saveChat('tab:progress', {
+      messages: [{
+        id: 'progress-status',
+        role: 'assistant',
+        mode: 'answer',
+        content: '',
+        createdAt: 1,
+        kind: 'status',
+        progress: { phase: 'waiting' }
+      }]
+    })
+    expect((await service.loadChat('tab:progress')).messages[0].progress).toEqual({ phase: 'waiting' })
   })
 
   it('sends rendered PDF pages to Anthropic as images', async() => {
@@ -281,6 +332,7 @@ describe('AI connection profiles and model routing', () => {
       }]
     })
     const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.system).toContain('rendered pages from a PDF attachment')
     expect(body.messages[0].content).toEqual([
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: Buffer.from(pageData).toString('base64') } },
       expect.objectContaining({ type: 'text' })

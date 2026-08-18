@@ -151,6 +151,24 @@ export interface AiMessageModel {
   protocol: AiProtocol
 }
 
+export type AiProgressPhase =
+  | 'pdf-rendering'
+  | 'pdf-rendered'
+  | 'sending'
+  | 'sent'
+  | 'waiting'
+  | 'responded'
+  | 'local-processing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
+export interface AiProgressInfo {
+  phase: AiProgressPhase
+  current?: number
+  total?: number
+}
+
 export interface AiChatMessage {
   id: string
   role: 'user' | 'assistant'
@@ -161,6 +179,8 @@ export interface AiChatMessage {
   editSummary?: AiEditSummary
   attachments?: AiAttachment[]
   model?: AiMessageModel
+  kind?: 'message' | 'status'
+  progress?: AiProgressInfo
 }
 
 export interface AiChatSession {

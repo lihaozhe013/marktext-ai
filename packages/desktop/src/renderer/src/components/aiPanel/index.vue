@@ -95,79 +95,92 @@
         v-for="message in ai.messages"
         :key="message.id"
         class="ai-message"
-        :class="message.role"
+        :class="[message.role, { 'ai-status-message': message.kind === 'status' }]"
       >
-        <div class="ai-message-role">
-          {{ message.role === 'user' ? labels.you : labels.ai }}
-        </div>
         <div
-          v-if="message.model"
-          class="ai-message-model"
+          v-if="message.kind === 'status'"
+          class="ai-status-content"
+          role="status"
         >
-          {{ message.model.connectionName }} / {{ message.model.model }}
+          <span
+            class="ai-status-dot"
+            aria-hidden="true"
+          />
+          {{ progressLabel(message) }}
         </div>
-        <div
-          v-if="message.content"
-          class="ai-message-content"
-        >
-          {{ message.content }}
-        </div>
-        <div
-          v-if="message.attachments?.length"
-          class="ai-message-attachments"
-        >
-          <div
-            v-for="attachment in message.attachments"
-            :key="attachment.id"
-            class="ai-attachment-chip"
-            :title="attachment.name"
-          >
-            <span
-              v-if="attachment.mimeType === 'application/pdf'"
-              class="ai-attachment-icon ai-pdf-icon"
-              aria-hidden="true"
-            >
-              PDF
-            </span>
-            <span
-              v-else
-              class="ai-attachment-icon"
-              aria-hidden="true"
-            >
-              <svg
-                viewBox="0 0 16 16"
-                focusable="false"
-              >
-                <rect
-                  x="1.5"
-                  y="2"
-                  width="13"
-                  height="12"
-                  rx="1.5"
-                />
-                <circle
-                  cx="5"
-                  cy="5.5"
-                  r="1.25"
-                />
-                <path d="m3 12 3.2-3.2 2.3 2.1 1.6-1.6L13 12" />
-              </svg>
-            </span>
-            <span class="ai-attachment-name">{{ attachment.name }}</span>
-            <span
-              v-if="attachment.mimeType === 'application/pdf' && attachment.pages?.length"
-              class="ai-attachment-pages"
-            >
-              {{ formatPages(attachment.pages) }}
-            </span>
+        <template v-else>
+          <div class="ai-message-role">
+            {{ message.role === 'user' ? labels.you : labels.ai }}
           </div>
-        </div>
-        <div
-          v-if="message.editSummary || message.mode === 'rewrite'"
-          class="ai-edit-summary"
-        >
-          {{ editSummaryLabel(message) }}
-        </div>
+          <div
+            v-if="message.model"
+            class="ai-message-model"
+          >
+            {{ message.model.connectionName }} / {{ message.model.model }}
+          </div>
+          <div
+            v-if="message.content"
+            class="ai-message-content"
+          >
+            {{ message.content }}
+          </div>
+          <div
+            v-if="message.attachments?.length"
+            class="ai-message-attachments"
+          >
+            <div
+              v-for="attachment in message.attachments"
+              :key="attachment.id"
+              class="ai-attachment-chip"
+              :title="attachment.name"
+            >
+              <span
+                v-if="attachment.mimeType === 'application/pdf'"
+                class="ai-attachment-icon ai-pdf-icon"
+                aria-hidden="true"
+              >
+                PDF
+              </span>
+              <span
+                v-else
+                class="ai-attachment-icon"
+                aria-hidden="true"
+              >
+                <svg
+                  viewBox="0 0 16 16"
+                  focusable="false"
+                >
+                  <rect
+                    x="1.5"
+                    y="2"
+                    width="13"
+                    height="12"
+                    rx="1.5"
+                  />
+                  <circle
+                    cx="5"
+                    cy="5.5"
+                    r="1.25"
+                  />
+                  <path d="m3 12 3.2-3.2 2.3 2.1 1.6-1.6L13 12" />
+                </svg>
+              </span>
+              <span class="ai-attachment-name">{{ attachment.name }}</span>
+              <span
+                v-if="attachment.mimeType === 'application/pdf' && attachment.pages?.length"
+                class="ai-attachment-pages"
+              >
+                {{ formatPages(attachment.pages) }}
+              </span>
+            </div>
+          </div>
+          <div
+            v-if="message.editSummary || message.mode === 'rewrite'"
+            class="ai-edit-summary"
+          >
+            {{ editSummaryLabel(message) }}
+          </div>
+        </template>
       </article>
     </div>
 
@@ -210,7 +223,7 @@
         class="ai-spinner"
         aria-hidden="true"
       />
-      <span>{{ ai.renderingPdf ? labels.preparingPdf : labels.working }}</span>
+      <span>{{ currentProgressLabel || (ai.renderingPdf ? labels.preparingPdf : labels.working) }}</span>
     </div>
 
     <div
@@ -369,7 +382,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
-import type { AiChatMessage, AiModelRef } from '@shared/types/ai'
+import type { AiChatMessage, AiModelRef, AiProgressInfo } from '@shared/types/ai'
 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
@@ -536,6 +549,44 @@ const editSummaryLabel = (message: AiChatMessage): string => {
     message.editSummary.removedLines
   )
 }
+
+const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
+  const current = progress?.current
+  const total = progress?.total
+  if (chinese.value) {
+    switch (progress?.phase) {
+      case 'pdf-rendering':
+        return current && total ? `正在将 PDF 转换为图片（第 ${current}/${total} 张）` : '正在将 PDF 转换为图片…'
+      case 'pdf-rendered': return `PDF 已转换为 ${total ?? current ?? 0} 张图片`
+      case 'sending': return '正在发送给模型…'
+      case 'sent': return '已发送给模型'
+      case 'waiting': return '正在等待模型响应…'
+      case 'responded': return '模型已响应'
+      case 'local-processing': return '正在本地解析和编辑…'
+      case 'completed': return '本地解析和编辑完成'
+      case 'cancelled': return '请求已停止'
+      case 'failed': return '请求未完成'
+      default: return '正在处理…'
+    }
+  }
+  switch (progress?.phase) {
+    case 'pdf-rendering':
+      return current && total ? `Rendering PDF pages (${current}/${total})…` : 'Rendering PDF pages…'
+    case 'pdf-rendered': return `PDF converted to ${total ?? current ?? 0} images`
+    case 'sending': return 'Sending to model…'
+    case 'sent': return 'Sent to model'
+    case 'waiting': return 'Waiting for model response…'
+    case 'responded': return 'Model responded'
+    case 'local-processing': return 'Parsing and editing locally…'
+    case 'completed': return 'Local parsing and editing completed'
+    case 'cancelled': return 'Request stopped'
+    case 'failed': return 'Request did not complete'
+    default: return 'Working…'
+  }
+}
+
+const progressLabel = (message: AiChatMessage): string => progressLabelFor(message.progress)
+const currentProgressLabel = computed(() => progressLabelFor(ai.currentProgress))
 
 const send = (): void => {
   const value = draft.value.trim()
@@ -728,6 +779,9 @@ onUnmounted(() => {
 .ai-empty { padding: 30px 8px; color: var(--editorColor60); text-align: center; font-size: 13px; }
 .ai-message { margin: 10px 0; padding: 9px 0; border-bottom: 1px solid var(--editorColor10); }
 .ai-message.user { padding-left: 9px; border-left: 2px solid var(--themeColor); }
+.ai-status-message { margin: 4px 0; padding: 2px 0; border-bottom: 0; }
+.ai-status-content { display: flex; align-items: center; gap: 6px; color: var(--editorColor50); font-size: 10px; line-height: 1.35; }
+.ai-status-dot { width: 4px; height: 4px; flex: 0 0 auto; border-radius: 50%; background: var(--editorColor40); }
 .ai-message-role { margin-bottom: 5px; color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-message-model { margin: -2px 0 6px; color: var(--editorColor50); font-size: 10px; }
 .ai-edit-summary { color: var(--editorColor80); font-size: 13px; line-height: 1.4; }

@@ -9,6 +9,7 @@ export interface ProviderMessage {
   role: 'user' | 'assistant'
   content: string
   images?: ProviderImage[]
+  attachmentContext?: string
 }
 
 export interface ProviderToolDefinition {
@@ -56,7 +57,10 @@ export const serializeProviderMessages = (
   messages: ProviderMessage[]
 ): Array<Record<string, unknown>> => messages.map(message => {
   const images = message.images ?? []
-  if (!images.length) return { role: message.role, content: message.content }
+  const content = message.attachmentContext
+    ? `${message.attachmentContext}\n\n${message.content}`
+    : message.content
+  if (!images.length) return { role: message.role, content }
   if (protocol === 'anthropic-messages') {
     return {
       role: message.role,
@@ -69,7 +73,7 @@ export const serializeProviderMessages = (
             data: image.data
           }
         })),
-        { type: 'text', text: message.content }
+        { type: 'text', text: content }
       ]
     }
   }
@@ -80,7 +84,7 @@ export const serializeProviderMessages = (
         type: 'image_url',
         image_url: { url: toImageDataUrl(image), detail: 'auto' }
       })),
-      { type: 'text', text: message.content }
+      { type: 'text', text: content }
     ]
   }
 })

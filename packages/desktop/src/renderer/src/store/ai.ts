@@ -26,6 +26,8 @@ import type {
   AiMessageModel,
   AiPreparedRevision,
   AiModelRef,
+  AiProgressInfo,
+  AiProgressPhase,
   AiResponse,
   AiRenderedPdfPages
 } from '@shared/types/ai'
@@ -108,6 +110,8 @@ const MIME_BY_EXTENSION: Record<string, AiAttachment['mimeType']> = {
   '.pdf': 'application/pdf'
 }
 
+const MAX_STORED_CHAT_MESSAGES = 100
+
 const resolveAttachmentMimeType = (file: File): AiAttachment['mimeType'] | undefined => {
   if (AI_IMAGE_MIME_TYPES.includes(file.type as AiImageMimeType)) return file.type as AiImageMimeType
   if (AI_PDF_MIME_TYPES.includes(file.type as AiPdfMimeType)) return file.type as AiPdfMimeType
@@ -125,6 +129,8 @@ const toIpcChatMessage = (message: AiChatMessage): AiChatMessage => ({
   content: message.content,
   createdAt: message.createdAt,
   revisionId: message.revisionId,
+  kind: message.kind,
+  progress: message.progress ? { ...message.progress } : undefined,
   attachments: message.attachments?.map(attachment => ({
     ...attachment,
     ...(attachment.mimeType === 'application/pdf' && attachment.pages ? { pages: [...attachment.pages] } : {})
@@ -417,7 +423,7 @@ export const useAiStore = defineStore('ai', () => {
         'mt::ai::chat-save',
         activeDocumentId.value,
         {
-          messages: toIpcChatMessages(messages.value.slice(-10)),
+          messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
           selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined
         }
       )
@@ -429,6 +435,7 @@ export const useAiStore = defineStore('ai', () => {
     messages.value = []
     selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
+    currentProgress.value = undefined
     attachmentError.value = ''
     if (pendingRecovery.value) {
       endAiEditSession(pendingRecovery.value.requestId)
@@ -443,7 +450,14 @@ export const useAiStore = defineStore('ai', () => {
     role: 'user' | 'assistant',
     content: string,
     messageMode: AiInteractionMode,
-    options: { revisionId?: string; editSummary?: AiEditSummary; attachments?: AiAttachment[]; model?: AiMessageModel } = {}
+    options: {
+      revisionId?: string
+      editSummary?: AiEditSummary
+      attachments?: AiAttachment[]
+      model?: AiMessageModel
+      kind?: AiChatMessage['kind']
+      progress?: AiProgressInfo
+    } = {}
   ): void => {
     messages.value.push({
       id: createId(),
@@ -453,8 +467,20 @@ export const useAiStore = defineStore('ai', () => {
       createdAt: Date.now(),
       ...options
     })
-    const retainedMessages = messages.value.slice(-10)
+    const retainedMessages = messages.value.slice(-MAX_STORED_CHAT_MESSAGES)
     messages.value = retainedMessages
+  }
+
+  const currentProgress = ref<AiProgressInfo | undefined>()
+
+  const appendProgress = async(
+    phase: AiProgressPhase,
+    details: Pick<AiProgressInfo, 'current' | 'total'> = {}
+  ): Promise<void> => {
+    const progress: AiProgressInfo = { phase, ...details }
+    currentProgress.value = progress
+    appendMessage('assistant', '', 'answer', { kind: 'status', progress })
+    await saveChat()
   }
 
   const preparePendingPdfSelections = async(pending: PendingAiAttachment[]): Promise<void> => {
@@ -475,7 +501,8 @@ export const useAiStore = defineStore('ai', () => {
   const prepareRenderedPdfPages = async(
     documentId: string,
     contextMessages: readonly AiChatMessage[],
-    pending: PendingAiAttachment[]
+    pending: PendingAiAttachment[],
+    onPageRendered?: (current: number, total: number) => Promise<void>
   ): Promise<AiRenderedPdfPages[]> => {
     const currentById = new Map(pending.map(item => [item.attachment.id, item]))
     const ordered: AiAttachment[] = pending.map(item => item.attachment)
@@ -486,6 +513,15 @@ export const useAiStore = defineStore('ai', () => {
     const rendered: AiRenderedPdfPages[] = []
     let mediaCount = 0
     let renderedBytes = 0
+    const pdfPageTotal = ordered.reduce((total, attachment) => {
+      if (attachment.mimeType !== 'application/pdf') return total
+      const pendingItem = currentById.get(attachment.id)
+      const pendingPages = pendingItem?.attachment.mimeType === 'application/pdf'
+        ? pendingItem.attachment.pages?.length
+        : undefined
+      return total + (attachment.pages?.length ?? pendingPages ?? 0)
+    }, 0)
+    let renderedPdfPageCount = 0
     for (const attachment of ordered) {
       if (seen.has(attachment.id)) continue
       seen.add(attachment.id)
@@ -516,7 +552,10 @@ export const useAiStore = defineStore('ai', () => {
         if (pendingItem) throw new PdfPageSelectionError(`The request can contain at most ${AI_MAX_IMAGE_COUNT} images, including PDF pages.`)
         continue
       }
-      const result = await renderPdfPages(data, pages, attachment.name)
+      const result = await renderPdfPages(data, pages, attachment.name, async() => {
+        renderedPdfPageCount += 1
+        await onPageRendered?.(renderedPdfPageCount, pdfPageTotal)
+      })
       const pageBytes = result.pages.reduce((total, page) => total + page.byteSize, 0)
       if (renderedBytes + pageBytes > AI_MAX_IMAGE_TOTAL_BYTES) {
         if (pendingItem) throw new Error('Rendered PDF pages exceed the 30 MB request limit.')
@@ -575,24 +614,39 @@ export const useAiStore = defineStore('ai', () => {
       const contextMessages = messages.value.slice()
       loading.value = true
       activeRequestId.value = requestId
+      currentProgress.value = undefined
       renderingPdf.value = pending.some(item => item.attachment.mimeType === 'application/pdf')
       await preparePendingPdfSelections(pending)
-      const renderedPdfPages = await prepareRenderedPdfPages(requestDocumentId, contextMessages, pending)
       const attachments = pending.map(item => item.attachment)
       const uploads: AiAttachmentUpload[] = pending.map(item => ({ ...item.attachment, data: new Uint8Array(item.data) }))
+      appendMessage('user', value, requestMode, { attachments })
+      await saveChat()
+      if (renderingPdf.value) await appendProgress('pdf-rendering')
+      const renderedPdfPages = await prepareRenderedPdfPages(
+        requestDocumentId,
+        contextMessages,
+        pending,
+        async(current, total) => appendProgress('pdf-rendering', { current, total })
+      )
+      if (renderingPdf.value) {
+        const renderedPageCount = renderedPdfPages.reduce((total, item) => total + item.pages.length, 0)
+        await appendProgress('pdf-rendered', { current: renderedPageCount, total: renderedPageCount })
+      }
       pendingAttachments.value = []
       attachmentError.value = ''
-      appendMessage('user', value, requestMode, { attachments })
       featureLog(
         'request snapshot mode=%s documentKind=%s markdownChars=%s contextMessages=%s requestId=%s',
         requestMode,
         documentIdentityKind(documentId),
         baseMarkdown.length,
-        messages.value.length - 1,
+        contextMessages.length,
         requestId
       )
       error.value = ''
       renderingPdf.value = false
+      await appendProgress('sending')
+      await appendProgress('sent')
+      await appendProgress('waiting')
       const response: AiResponse = await window.electron.ipcRenderer.invoke('mt::ai::request', {
         requestId,
         documentId,
@@ -605,6 +659,7 @@ export const useAiStore = defineStore('ai', () => {
         renderedPdfPages
       })
       if (requestId !== activeRequestId.value || documentId !== currentDocumentId.value) return
+      await appendProgress('responded')
       if (requestMode === 'answer') {
         appendMessage('assistant', response.content, requestMode, { model: response.model })
         lastAnswer.value = response.content
@@ -624,7 +679,9 @@ export const useAiStore = defineStore('ai', () => {
           }
           keepEditSession = true
         } else {
-          await applyEdit(response, requestId, requestTabId, baseMarkdown)
+          await appendProgress('local-processing')
+          const applied = await applyEdit(response, requestId, requestTabId, baseMarkdown)
+          if (applied) await appendProgress('completed')
         }
       }
     } catch (err) {
@@ -635,6 +692,7 @@ export const useAiStore = defineStore('ai', () => {
           attachmentError.value = 'pdf-render-failed'
         }
         error.value = err instanceof Error ? err.message : String(err)
+        await appendProgress('failed').catch(() => undefined)
       }
     } finally {
       renderingPdf.value = false
@@ -659,7 +717,8 @@ export const useAiStore = defineStore('ai', () => {
     requestId: string,
     tabId: string,
     beforeMarkdown: string
-  ): Promise<void> => {
+  ): Promise<boolean> => {
+    let applied = false
     editorStore.flushActiveEditor()
     const currentFile = editorStore.currentFile
     const nextMarkdown = response.markdown
@@ -678,16 +737,16 @@ export const useAiStore = defineStore('ai', () => {
       nextMarkdown === undefined
     ) {
       error.value = 'The document changed while the AI was working. The edit was discarded.'
-      return
+      return false
     }
     if (nextMarkdown === beforeMarkdown) {
       appendMessage('assistant', response.summary ?? '', response.mode, { editSummary: response.editSummary })
       await saveChat()
-      return
+      return true
     }
     if (!setAiEditSessionStatus(requestId, 'applying')) {
       error.value = 'The document changed while the AI was working. The edit was discarded.'
-      return
+      return false
     }
     const revision = await window.electron.ipcRenderer.invoke('mt::ai::revision-prepare', {
       documentId: response.documentId,
@@ -708,7 +767,7 @@ export const useAiStore = defineStore('ai', () => {
       await discardPreparedRevision(revisionId)
       pendingRevision.value = null
       error.value = 'The document changed while the AI was working. The edit was discarded.'
-      return
+      return false
     }
     const applySaveSequence = saveSequence
     await new Promise<void>((resolve) => {
@@ -764,6 +823,7 @@ export const useAiStore = defineStore('ai', () => {
                 model: response.model
               })
               await saveChat()
+              applied = true
             } catch (err) {
               error.value = err instanceof Error ? err.message : String(err)
               if (!committed) await discardPreparedRevision(revisionId)
@@ -790,6 +850,7 @@ export const useAiStore = defineStore('ai', () => {
         })
       })
     })
+    return applied
   }
 
   const acceptPendingRecovery = async(): Promise<void> => {
@@ -811,6 +872,7 @@ export const useAiStore = defineStore('ai', () => {
     window.electron.ipcRenderer.send('mt::ai::cancel', requestId)
     activeRequestId.value = null
     loading.value = false
+    appendProgress('cancelled').catch(() => undefined)
   }
 
   const undoAiEdit = async(): Promise<void> => {
@@ -890,6 +952,7 @@ export const useAiStore = defineStore('ai', () => {
     attachmentError,
     loading,
     renderingPdf,
+    currentProgress,
     error,
     lastAnswer,
     currentChangeMarker,

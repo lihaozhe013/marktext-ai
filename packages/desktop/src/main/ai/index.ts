@@ -16,6 +16,7 @@ import type {
   AiModelProfile,
   AiModelRef,
   AiProtocol,
+  AiProgressPhase,
   AiRecoveryInfo,
   AiPreparedRevision,
   AiRequest,
@@ -43,7 +44,8 @@ import {
   connectionTestUserPrompt,
   makePromptToken,
   previousPreciseEditContextMessage,
-  previousRewriteContextMessage
+  previousRewriteContextMessage,
+  renderedPdfImageRules
 } from './prompts'
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
 
@@ -55,6 +57,7 @@ const CHAT_FILE = 'ai-chat.json'
 const REVISION_FILE = 'ai-revisions.json'
 const ANTHROPIC_VERSION = '2023-06-01'
 const MAX_CONTEXT_MESSAGES = 10
+const MAX_STORED_CHAT_MESSAGES = 100
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
 
@@ -393,6 +396,28 @@ const normalizeMessageModel = (value: unknown): AiMessageModel | undefined => {
   }
 }
 
+const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefined => {
+  if (!isRecord(value)) return undefined
+  const phases: AiProgressPhase[] = [
+    'pdf-rendering',
+    'pdf-rendered',
+    'sending',
+    'sent',
+    'waiting',
+    'responded',
+    'local-processing',
+    'completed',
+    'failed',
+    'cancelled'
+  ]
+  if (!phases.includes(value.phase as AiProgressPhase)) return undefined
+  return {
+    phase: value.phase as AiProgressPhase,
+    current: typeof value.current === 'number' ? value.current : undefined,
+    total: typeof value.total === 'number' ? value.total : undefined
+  }
+}
+
 const normalizeMessages = (messages: unknown): AiChatMessage[] => {
   if (!Array.isArray(messages)) return []
   return messages
@@ -444,13 +469,15 @@ const normalizeMessages = (messages: unknown): AiChatMessage[] => {
         : undefined
       return {
         ...item,
+        kind: item.kind === 'status' ? 'status' as const : undefined,
+        progress: item.kind === 'status' ? normalizeProgress(item.progress) : undefined,
         revisionId: typeof item.revisionId === 'string' ? item.revisionId : undefined,
         editSummary,
         attachments: normalizeAttachmentList(item.attachments),
         model: normalizeMessageModel(item.model)
       }
     })
-    .slice(-MAX_CONTEXT_MESSAGES)
+    .slice(-MAX_STORED_CHAT_MESSAGES)
 }
 
 const normalizeChatSession = (value: unknown): AiChatSession => {
@@ -781,11 +808,14 @@ export class AiService {
         'content-type': 'application/json'
       }
       let body: Record<string, unknown>
+      const effectiveSystem = messages.some(message => !!message.attachmentContext)
+        ? `${system}\n${renderedPdfImageRules}`
+        : system
       if (settings.protocol === 'anthropic-messages') {
         headers['x-api-key'] = apiKey
         headers['api-key'] = apiKey
         headers['anthropic-version'] = ANTHROPIC_VERSION
-        body = { model, max_tokens: 4096, system, messages: serializeProviderMessages(settings.protocol, messages) }
+        body = { model, max_tokens: 4096, system: effectiveSystem, messages: serializeProviderMessages(settings.protocol, messages) }
         if (options.tool) {
           body.tools = [{ name: options.tool.name, description: options.tool.description, input_schema: options.tool.parameters }]
           body.tool_choice = { type: 'tool', name: options.tool.name }
@@ -795,7 +825,7 @@ export class AiService {
         // Some OpenAI-compatible gateways, including MiMo Token Plan, document
         // `api-key` instead of the standard Authorization header.
         headers['api-key'] = apiKey
-        body = { model, messages: [{ role: 'system', content: system }, ...serializeProviderMessages(settings.protocol, messages)] }
+        body = { model, messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(settings.protocol, messages)] }
         if (options.tool) {
           body.tools = [{ type: 'function', function: { name: options.tool.name, description: options.tool.description, parameters: options.tool.parameters } }]
           body.tool_choice = { type: 'function', function: { name: options.tool.name } }
@@ -920,6 +950,7 @@ export class AiService {
     renderedPdfPages: readonly AiRenderedPdfPages[] = []
   ): Promise<ProviderMessage[]> {
     const imagesByMessage = new Map<number, ProviderImage[]>()
+    const attachmentContextByMessage = new Map<number, string[]>()
     const renderedPdfPagesById = new Map(renderedPdfPages.map(item => [item.attachmentId, item]))
     const selected = new Set<string>()
     let attachmentCount = 0
@@ -965,6 +996,9 @@ export class AiService {
             data: Buffer.from(page.data).toString('base64')
           })))
           imagesByMessage.set(index, images)
+          const contexts = attachmentContextByMessage.get(index) ?? []
+          contexts.push(`The following images are rendered pages from the PDF attachment "${attachment.name}". Selected pages, in order: ${pageNumbers.join(', ')}. Treat these images as one document and do not infer content from unshown pages.`)
+          attachmentContextByMessage.set(index, contexts)
           return
         }
         if (
@@ -1002,7 +1036,8 @@ export class AiService {
     return messages.map((message, index) => ({
       role: message.role,
       content: message.content,
-      images: imagesByMessage.get(index)
+      images: imagesByMessage.get(index),
+      attachmentContext: attachmentContextByMessage.get(index)?.join('\n')
     }))
   }
 
@@ -1085,11 +1120,14 @@ export class AiService {
     const settings = target.connection
     const currentAttachments = await this.saveRequestAttachments(request.attachments, request.documentId)
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))
-    const recentMessages = normalizeMessages(request.messages).map(({ role, mode, content, attachments }) => ({
-      role,
-      content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
-      attachments
-    }))
+    const recentMessages = normalizeMessages(request.messages)
+      .filter(message => message.kind !== 'status')
+      .slice(-MAX_CONTEXT_MESSAGES)
+      .map(({ role, mode, content, attachments }) => ({
+        role,
+        content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
+        attachments
+      }))
     let documentKind = 'unknown'
     if (request.documentId.startsWith('path:')) documentKind = 'path'
     else if (request.documentId.startsWith('tab:')) documentKind = 'tab'
