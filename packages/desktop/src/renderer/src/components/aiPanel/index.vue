@@ -85,7 +85,11 @@
       {{ modeHelp }}
     </p>
 
-    <div class="ai-messages">
+    <div
+      ref="messagesElement"
+      class="ai-messages"
+      @scroll="handleMessagesScroll"
+    >
       <div
         v-if="!ai.messages.length"
         class="ai-empty"
@@ -396,7 +400,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
@@ -406,12 +410,14 @@ import type { AiChatMessage, AiModelRef, AiProgressEvent, AiProgressInfo } from 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
 const panelElement = ref<HTMLElement | null>(null)
+const messagesElement = ref<HTMLElement | null>(null)
 const draft = ref('')
 const dragOver = ref(false)
 const copiedFailureId = ref('')
 const resizing = ref(false)
 const resizeStartX = ref(0)
 const resizeStartWidth = ref(380)
+const followMessages = ref(true)
 let stopProgressListener: (() => void) | undefined
 
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
@@ -690,6 +696,21 @@ const currentProgressLabel = computed(() => ai.loading && ai.liveProgress
   ? liveProgressLabel(ai.liveProgress, ai.liveProgressElapsedMs)
   : progressLabelFor(ai.currentProgress))
 
+const isNearMessagesBottom = (element: HTMLElement): boolean =>
+  element.scrollHeight - element.scrollTop - element.clientHeight <= 48
+
+const handleMessagesScroll = (): void => {
+  const element = messagesElement.value
+  if (element) followMessages.value = isNearMessagesBottom(element)
+}
+
+const scrollMessagesToBottom = (): void => {
+  nextTick().then(() => {
+    const element = messagesElement.value
+    if (element && followMessages.value) element.scrollTop = element.scrollHeight
+  }).catch(() => undefined)
+}
+
 const copyFailureOutput = async (message: AiChatMessage): Promise<void> => {
   const output = message.progress?.failureOutput
   if (!output) return
@@ -869,7 +890,9 @@ const stopResize = (): void => {
 
 onMounted(() => {
   ai.loadSettings().catch(() => undefined)
-  ai.loadChat().catch(() => undefined)
+  ai.loadChat()
+    .then(() => scrollMessagesToBottom())
+    .catch(() => undefined)
   stopProgressListener = ai.listenForProgress()
   window.electron.ipcRenderer.on('mt::ai-settings-changed', (_event, value) => {
     ai.setSettings(value)
@@ -880,9 +903,28 @@ onMounted(() => {
 })
 
 watch(currentDocumentId, (value) => {
+  followMessages.value = true
   ai.discardPendingRecovery()
   ai.clearPendingAttachments()
   if (value) ai.loadChat(value).catch(() => undefined)
+})
+
+watch(() => ai.messages, () => {
+  scrollMessagesToBottom()
+}, { deep: true })
+
+watch(() => ai.loading, (loading, wasLoading) => {
+  if (loading && !wasLoading) {
+    followMessages.value = true
+    scrollMessagesToBottom()
+  }
+})
+
+watch(() => ai.visible, (visible) => {
+  if (visible) {
+    followMessages.value = true
+    scrollMessagesToBottom()
+  }
 })
 
 onUnmounted(() => {
