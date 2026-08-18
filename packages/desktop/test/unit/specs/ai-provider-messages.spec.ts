@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { preciseEditTool, serializeProviderMessages } from 'main_renderer/ai/providerMessages'
+import { preciseEditTool, preciseEditTools, serializeProviderMessages } from 'main_renderer/ai/providerMessages'
 
 describe('AI provider image message serialization', () => {
   const messages = [
@@ -15,6 +15,18 @@ describe('AI provider image message serialization', () => {
     expect(preciseEditTool.parameters).toMatchObject({
       type: 'object',
       required: ['status', 'summary', 'edits']
+    })
+  })
+
+  it('requires a structured plan before local edit tools', () => {
+    expect(preciseEditTools.map(tool => tool.name)).toEqual([
+      'create_markdown_edit_plan',
+      'apply_markdown_edit',
+      'revise_markdown_edit_plan',
+      'finish_markdown_edit'
+    ])
+    expect(preciseEditTools.find(tool => tool.name === 'apply_markdown_edit')?.parameters).toMatchObject({
+      required: ['version', 'planStepId', 'search', 'replace', 'description']
     })
   })
 

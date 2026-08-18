@@ -37,17 +37,80 @@ export interface ProviderToolResult {
 
 export const applyMarkdownEditTool: ProviderToolDefinition = {
   name: 'apply_markdown_edit',
-  description: 'Apply exactly one precise Markdown replacement to the current virtual document. SEARCH must be copied exactly and uniquely from the current document.',
+  description: 'Apply exactly one planned, precise Markdown replacement inside the current plan step. SEARCH must be copied exactly and uniquely from the current virtual document.',
   parameters: {
     type: 'object',
     additionalProperties: false,
     properties: {
       version: { type: 'integer', minimum: 0 },
+      planStepId: { type: 'string', minLength: 1, maxLength: 80 },
       search: { type: 'string' },
       replace: { type: 'string' },
       description: { type: 'string', maxLength: 160 }
     },
-    required: ['version', 'search', 'replace', 'description']
+    required: ['version', 'planStepId', 'search', 'replace', 'description']
+  }
+}
+
+export const createMarkdownEditPlanTool: ProviderToolDefinition = {
+  name: 'create_markdown_edit_plan',
+  description: 'Create an ordered plan of independently verifiable Markdown edit steps before applying any edit.',
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      version: { type: 'integer', minimum: 0 },
+      summary: { type: 'string', minLength: 1, maxLength: 240 },
+      steps: {
+        type: 'array',
+        maxItems: 128,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', minLength: 1, maxLength: 80 },
+            description: { type: 'string', minLength: 1, maxLength: 160 },
+            intent: { type: 'string', minLength: 1, maxLength: 400 },
+            startAnchor: { type: 'string', maxLength: 1000 },
+            endAnchor: { type: 'string', maxLength: 1000 },
+            dependsOn: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 80 } }
+          },
+          required: ['id', 'description', 'intent', 'startAnchor', 'dependsOn']
+        }
+      }
+    },
+    required: ['version', 'summary', 'steps']
+  }
+}
+
+export const reviseMarkdownEditPlanTool: ProviderToolDefinition = {
+  name: 'revise_markdown_edit_plan',
+  description: 'Revise only unfinished Markdown edit steps after the current target or plan becomes invalid; completed steps are immutable.',
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      version: { type: 'integer', minimum: 0 },
+      reason: { type: 'string', minLength: 1, maxLength: 240 },
+      remainingSteps: {
+        type: 'array',
+        maxItems: 128,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', minLength: 1, maxLength: 80 },
+            description: { type: 'string', minLength: 1, maxLength: 160 },
+            intent: { type: 'string', minLength: 1, maxLength: 400 },
+            startAnchor: { type: 'string', maxLength: 1000 },
+            endAnchor: { type: 'string', maxLength: 1000 },
+            dependsOn: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 80 } }
+          },
+          required: ['id', 'description', 'intent', 'startAnchor', 'dependsOn']
+        }
+      }
+    },
+    required: ['version', 'reason', 'remainingSteps']
   }
 }
 
@@ -65,7 +128,7 @@ export const finishMarkdownEditTool: ProviderToolDefinition = {
   }
 }
 
-export const preciseEditTools: ProviderToolDefinition[] = [applyMarkdownEditTool, finishMarkdownEditTool]
+export const preciseEditTools: ProviderToolDefinition[] = [createMarkdownEditPlanTool, applyMarkdownEditTool, reviseMarkdownEditPlanTool, finishMarkdownEditTool]
 
 /** @deprecated Kept for persisted/test callers; the agent uses preciseEditTools. */
 export const preciseEditTool: ProviderToolDefinition = {

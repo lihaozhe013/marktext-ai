@@ -171,6 +171,7 @@ export type AiProgressPhase =
   | 'streaming'
   | 'responded'
   | 'validating'
+  | 'agent-plan'
   | 'agent-step'
   | 'attempt-failed'
   | 'retrying'
@@ -196,6 +197,11 @@ export interface AiProgressInfo {
   failureOutputTruncated?: boolean
   step?: number
   maxSteps?: number
+  planSummary?: string
+  planStepCount?: number
+  planStepDescriptions?: string[]
+  planRevisionCount?: number
+  currentPlanStep?: string
   successfulSteps?: number
   toolFailures?: number
   documentVersion?: number
@@ -208,9 +214,9 @@ export interface AiProgressInfo {
   cacheWriteInputTokens?: number
 }
 
-export type AiFailureReason = 'format' | 'exact-match' | 'truncated' | 'provider' | 'capability' | 'unknown'
+export type AiFailureReason = 'format' | 'exact-match' | 'scope' | 'truncated' | 'provider' | 'capability' | 'unknown'
 
-export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'validating' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
+export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'validating' | 'agent-plan' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
 
 export interface AiProgressEvent {
   requestId: string
@@ -229,6 +235,11 @@ export interface AiProgressEvent {
   failureOutputTruncated?: boolean
   step?: number
   maxSteps?: number
+  planSummary?: string
+  planStepCount?: number
+  planStepDescriptions?: string[]
+  planRevisionCount?: number
+  currentPlanStep?: string
   successfulSteps?: number
   toolFailures?: number
   documentVersion?: number
