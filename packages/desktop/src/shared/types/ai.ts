@@ -200,6 +200,8 @@ export interface AiProgressInfo {
   toolFailures?: number
   documentVersion?: number
   stepDescription?: string
+  stepAddedLines?: number
+  stepRemovedLines?: number
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
 }
@@ -229,6 +231,8 @@ export interface AiProgressEvent {
   toolFailures?: number
   documentVersion?: number
   stepDescription?: string
+  stepAddedLines?: number
+  stepRemovedLines?: number
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
   /** The validated agent step snapshot to apply immediately in the renderer. */

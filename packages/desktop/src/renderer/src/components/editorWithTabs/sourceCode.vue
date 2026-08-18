@@ -10,7 +10,7 @@ import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useEditorStore } from '@/store/editor'
 import { usePreferencesStore } from '@/store/preferences'
 import { aiEditLocked, isAiEditLocked } from '@/store/aiEditSession'
-import type { AiChangeMarker } from '@/store/aiChangeTracker'
+// import type { AiChangeMarker } from '@/store/aiChangeTracker'
 import { findMarkdownHeadingLine, scrollSourceEditorToLine } from '@/util/sourceModeToc'
 import { storeToRefs } from 'pinia'
 import codeMirror, { setCursorAtFirstLine, setTextDirection } from '../../codeMirror'
@@ -48,8 +48,9 @@ let aiRawApplyInProgress = false
 
 const { theme, sourceCode } = storeToRefs(preferencesStore)
 const { currentFile: currentTab } = storeToRefs(editorStore)
-const gutterLines = new Set<number>()
-let activeChangeMarker: Pick<AiChangeMarker, 'revisionId' | 'status' | 'visible' | 'ranges'> | undefined
+// AI change gutter notes are disabled.
+// const gutterLines = new Set<number>()
+// let activeChangeMarker: Pick<AiChangeMarker, 'revisionId' | 'status' | 'visible' | 'ranges'> | undefined
 
 const applyAiSourceLock = (locked: boolean): void => {
   editor.value?.setOption('readOnly', locked)
@@ -62,46 +63,9 @@ const isValidMuyaIndexCursor = (cursor: unknown): cursor is MuyaIndexCursorLike 
   return !!(c && c.anchor && c.focus)
 }
 
-const clearGutterMarkers = (): void => {
-  if (!editor.value) return
-  for (const line of gutterLines) {
-    editor.value.setGutterMarker(line, 'ai-change-gutter', null)
-  }
-  gutterLines.clear()
-}
-
-const updateGutterMarkers = (): void => {
-  if (!editor.value) return
-  clearGutterMarkers()
-  const marker = activeChangeMarker
-  if (!marker?.visible) return
-  for (const range of marker.ranges) {
-    const start = Math.max(0, range.startLine - 1)
-    const end = Math.min(editor.value.lineCount() - 1, Math.max(start, range.endLine - 1))
-    for (let line = start; line <= end; line += 1) {
-      const element = document.createElement('span')
-      element.className = `ai-change-gutter-marker ${marker.status}`
-      element.title = `${marker.status === 'saved' ? 'Saved' : 'Unsaved'} AI change · lines ${range.startLine}-${range.endLine}`
-      editor.value.setGutterMarker(line, 'ai-change-gutter', element)
-      gutterLines.add(line)
-    }
-  }
-}
-
-watch(
-  () => sourceCode.value,
-  () => updateGutterMarkers()
-)
-
-const handleAiMarkerUpdate = (payload: unknown): void => {
-  const data = payload as {
-    tabId?: string
-    marker?: Pick<AiChangeMarker, 'revisionId' | 'status' | 'visible' | 'ranges'>
-  } | undefined
-  if (data?.tabId !== tabId.value) return
-  activeChangeMarker = data.marker
-  updateGutterMarkers()
-}
+// const clearGutterMarkers = (): void => { ... }
+// const updateGutterMarkers = (): void => { ... }
+// const handleAiMarkerUpdate = (payload: unknown): void => { ... }
 
 watch(
   () => props.textDirection,
@@ -241,7 +205,7 @@ const handleFileChange = (payload: unknown) => {
     prepareTabSwitch()
     tabId.value = id
   }
-  bus.emit('ai-request-change-marker', id)
+  // bus.emit('ai-request-change-marker', id)
 
   if (typeof newMarkdown === 'string') {
     editor.value.setValue(newMarkdown)
@@ -262,7 +226,7 @@ const handleFileChange = (payload: unknown) => {
   } else {
     setCursorAtFirstLine(editor.value)
   }
-  updateGutterMarkers()
+  // updateGutterMarkers()
 }
 
 const handleInvalidateImageCache = () => {
@@ -438,7 +402,7 @@ onMounted(() => {
   const codeMirrorConfig: Record<string, unknown> = {
     value: markdown,
     lineNumbers: true,
-    gutters: ['CodeMirror-linenumbers', 'ai-change-gutter'],
+    gutters: ['CodeMirror-linenumbers'],
     autofocus: true,
     lineWrapping: true,
     styleActiveLine: true,
@@ -470,7 +434,7 @@ onMounted(() => {
   bus.on('image-action', handleImageAction)
   bus.on('scroll-to-header', handleScrollToHeader)
   bus.on('ai-navigate-to-line', handleAiNavigate)
-  bus.on('ai-change-marker-updated', handleAiMarkerUpdate)
+  // bus.on('ai-change-marker-updated', handleAiMarkerUpdate)
 
   // For some reason, code mirror does not seem to play well with Vue's refs if we reference editor.value directly.
   // See https://github.com/codemirror/codemirror5/issues/6886 - hence, we need to use a local variable first.
@@ -498,8 +462,8 @@ onMounted(() => {
   tabId.value = id
 
   listenChange()
-  bus.emit('ai-request-change-marker', id)
-  updateGutterMarkers()
+  // bus.emit('ai-request-change-marker', id)
+  // updateGutterMarkers()
 })
 
 onBeforeUnmount(() => {
@@ -517,8 +481,8 @@ onBeforeUnmount(() => {
   bus.off('image-action', handleImageAction)
   bus.off('scroll-to-header', handleScrollToHeader)
   bus.off('ai-navigate-to-line', handleAiNavigate)
-  bus.off('ai-change-marker-updated', handleAiMarkerUpdate)
-  clearGutterMarkers()
+  // bus.off('ai-change-marker-updated', handleAiMarkerUpdate)
+  // clearGutterMarkers()
 
   if (!isAiEditLocked()) {
     const { cursor, markdown: newMarkdown } = getMarkdownAndCursor(editor.value)
@@ -548,21 +512,7 @@ onBeforeUnmount(() => {
   border-right: none;
   background-color: transparent;
 }
-.source-code .ai-change-gutter {
-  width: 6px;
-}
-.source-code .ai-change-gutter-marker {
-  display: block;
-  width: 4px;
-  height: 100%;
-  border-radius: 2px;
-}
-.source-code .ai-change-gutter-marker.unsaved {
-  background: #d6a400;
-}
-.source-code .ai-change-gutter-marker.saved {
-  background: #28a86b;
-}
+/* AI change gutter notes are disabled. */
 .source-code .CodeMirror-activeline-background,
 .source-code .CodeMirror-activeline-gutter {
   background: var(--floatHoverColor);

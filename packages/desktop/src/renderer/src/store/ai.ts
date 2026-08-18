@@ -574,7 +574,7 @@ export const useAiStore = defineStore('ai', () => {
     liveProgress.value = event
     liveProgressElapsedMs.value = Math.max(event.elapsedMs, Date.now() - liveProgressStartedAt)
     applyAgentStep(event)
-    if (!['attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
+    if (!['agent-step', 'attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
     const progress: AiProgressInfo = {
       phase: event.phase,
       attempt: event.attempt,
@@ -593,6 +593,8 @@ export const useAiStore = defineStore('ai', () => {
       toolFailures: event.toolFailures,
       documentVersion: event.documentVersion,
       stepDescription: event.stepDescription,
+      stepAddedLines: event.stepAddedLines,
+      stepRemovedLines: event.stepRemovedLines,
       cachedInputTokens: event.cachedInputTokens,
       cacheWriteInputTokens: event.cacheWriteInputTokens
     }
@@ -603,7 +605,7 @@ export const useAiStore = defineStore('ai', () => {
 
   const appendProgress = async(
     phase: AiProgressPhase,
-    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'cachedInputTokens' | 'cacheWriteInputTokens'>> = {}
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'cachedInputTokens' | 'cacheWriteInputTokens'>> = {}
   ): Promise<void> => {
     const progress: AiProgressInfo = { phase, ...details }
     currentProgress.value = progress
@@ -627,6 +629,8 @@ export const useAiStore = defineStore('ai', () => {
       toolFailures: progress.toolFailures,
       documentVersion: progress.documentVersion,
       stepDescription: progress.stepDescription,
+      stepAddedLines: progress.stepAddedLines,
+      stepRemovedLines: progress.stepRemovedLines,
       cachedInputTokens: progress.cachedInputTokens,
       cacheWriteInputTokens: progress.cacheWriteInputTokens,
       failureCount: progress.failureCount,

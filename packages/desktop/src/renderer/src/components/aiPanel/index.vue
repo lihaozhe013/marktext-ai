@@ -587,6 +587,13 @@ const editSummaryLabel = (message: AiChatMessage): string => {
   )
 }
 
+const stepDeltaLabel = (progress: AiProgressInfo | AiProgressEvent | undefined): string => {
+  if (progress?.stepAddedLines === undefined && progress?.stepRemovedLines === undefined) return ''
+  const added = progress.stepAddedLines ?? 0
+  const removed = progress.stepRemovedLines ?? 0
+  return chinese.value ? `+${added}行-${removed}行` : `+${added} lines -${removed} lines`
+}
+
 const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const current = progress?.current
   const total = progress?.total
@@ -626,7 +633,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
       case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
-      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
+      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
       case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
       case 'fallback': return `正在生成安全替代结果… · ${attempt}`
@@ -647,7 +654,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
     case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
-    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
+    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
     case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
     case 'fallback': return `Generating safe fallback… · ${attempt}`
@@ -680,7 +687,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
       case 'waiting': return `正在等待模型响应… · ${elapsed}`
       case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
       case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
-      case 'agent-step': return `第 ${progress.step ?? 0}/${progress.maxSteps ?? 0} 步已应用，继续执行… · ${elapsed}`
+      case 'agent-step': return `第 ${progress.step ?? 0}/${progress.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}，继续执行… · ${elapsed}`
       case 'attempt-failed': return `第 ${progress.attempt} 次尝试失败 · ${usage} · ${elapsed}`
       case 'retrying': return `格式不符合要求，正在重试… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
       case 'fallback': return `正在生成安全替代结果… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
@@ -694,7 +701,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
     case 'waiting': return `Waiting for model response… · ${elapsed}`
     case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
     case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
-    case 'agent-step': return `Applied agent step ${progress.step ?? 0}/${progress.maxSteps ?? 0}; continuing… · ${elapsed}`
+    case 'agent-step': return `Applied agent step ${progress.step ?? 0}/${progress.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}; continuing… · ${elapsed}`
     case 'attempt-failed': return `Attempt ${progress.attempt} failed · ${usage} · ${elapsed}`
     case 'retrying': return `Format validation failed; retrying… · attempt ${progress.attempt} · ${elapsed}`
     case 'fallback': return `Generating safe fallback… · attempt ${progress.attempt} · ${elapsed}`

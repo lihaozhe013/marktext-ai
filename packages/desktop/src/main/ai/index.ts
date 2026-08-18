@@ -517,6 +517,8 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     toolFailures: typeof value.toolFailures === 'number' ? value.toolFailures : undefined,
     documentVersion: typeof value.documentVersion === 'number' ? value.documentVersion : undefined,
     stepDescription: typeof value.stepDescription === 'string' ? value.stepDescription.slice(0, 160) : undefined,
+    stepAddedLines: typeof value.stepAddedLines === 'number' ? value.stepAddedLines : undefined,
+    stepRemovedLines: typeof value.stepRemovedLines === 'number' ? value.stepRemovedLines : undefined,
     cachedInputTokens: typeof value.cachedInputTokens === 'number' ? value.cachedInputTokens : undefined,
     cacheWriteInputTokens: typeof value.cacheWriteInputTokens === 'number' ? value.cacheWriteInputTokens : undefined,
     failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'capability' || value.failureReason === 'unknown'
@@ -1477,7 +1479,7 @@ export class AiService {
     const emitProgress = (
       phase: AiProgressEvent['phase'],
       attempt: number,
-      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown'>> = {}
+      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown'>> = {}
     ): void => {
       lastAttempt = Math.max(lastAttempt, attempt)
       const {
@@ -1715,13 +1717,15 @@ export class AiService {
             streaming: false
           })
         },
-        onAgentStep: (step, maxSteps, description, version, beforeMarkdown, markdown) => {
+        onAgentStep: (step, maxSteps, description, version, beforeMarkdown, markdown, addedLines, removedLines) => {
           emitProgress('agent-step', step, {
             step,
             maxSteps,
             successfulSteps: step,
             documentVersion: version,
             stepDescription: description,
+            stepAddedLines: addedLines,
+            stepRemovedLines: removedLines,
             documentId: request.documentId,
             stepBaseMarkdown: beforeMarkdown,
             stepMarkdown: markdown,
