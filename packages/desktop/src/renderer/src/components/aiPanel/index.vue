@@ -123,6 +123,14 @@
             :title="attachment.name"
           >
             <span
+              v-if="attachment.mimeType === 'application/pdf'"
+              class="ai-attachment-icon ai-pdf-icon"
+              aria-hidden="true"
+            >
+              PDF
+            </span>
+            <span
+              v-else
               class="ai-attachment-icon"
               aria-hidden="true"
             >
@@ -146,6 +154,12 @@
               </svg>
             </span>
             <span class="ai-attachment-name">{{ attachment.name }}</span>
+            <span
+              v-if="attachment.mimeType === 'application/pdf' && attachment.pages?.length"
+              class="ai-attachment-pages"
+            >
+              {{ formatPages(attachment.pages) }}
+            </span>
           </div>
         </div>
         <div
@@ -196,7 +210,7 @@
         class="ai-spinner"
         aria-hidden="true"
       />
-      <span>{{ labels.working }}</span>
+      <span>{{ ai.renderingPdf ? labels.preparingPdf : labels.working }}</span>
     </div>
 
     <div
@@ -210,7 +224,7 @@
         ref="fileInput"
         class="ai-file-input"
         type="file"
-        accept="image/png,image/jpeg,image/webp,image/gif"
+        accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,.pdf"
         multiple
         @change="selectFiles"
       >
@@ -235,6 +249,14 @@
           :title="pending.attachment.name"
         >
           <span
+            v-if="pending.attachment.mimeType === 'application/pdf'"
+            class="ai-attachment-icon ai-pdf-icon"
+            aria-hidden="true"
+          >
+            PDF
+          </span>
+          <span
+            v-else
             class="ai-attachment-icon"
             aria-hidden="true"
           >
@@ -258,6 +280,19 @@
             </svg>
           </span>
           <span class="ai-attachment-name">{{ pending.attachment.name }}</span>
+          <template v-if="pending.attachment.mimeType === 'application/pdf'">
+            <span class="ai-pdf-page-count">
+              {{ labels.pdfPages(pending.pdfPageCount ?? 0) }}
+            </span>
+            <input
+              class="ai-pdf-page-input"
+              type="text"
+              :value="pending.pdfPageSelection ?? ''"
+              :placeholder="pending.pdfPageCount && pending.pdfPageCount > 10 ? labels.pdfPagePlaceholder : ''"
+              :aria-label="labels.pdfPageLabel"
+              @input="updatePdfPageSelection(pending.attachment.id, ($event.target as HTMLInputElement).value)"
+            >
+          </template>
           <button
             type="button"
             :title="labels.removeAttachment"
@@ -267,6 +302,12 @@
           </button>
         </div>
       </div>
+      <p
+        v-if="pendingPdfCount"
+        class="ai-pdf-budget"
+      >
+        {{ labels.pdfBudget(pendingImageBudget) }}
+      </p>
       <p
         v-if="attachmentErrorLabel"
         class="ai-attachment-error"
@@ -358,14 +399,22 @@ const labels = computed(() => chinese.value
       you: '你',
       ai: 'AI',
       placeholder: '输入问题或编辑指令…',
-      attachHint: '粘贴或拖入图片，也可点击选择',
-      attachmentPrivacy: '图片会发送到当前配置的 AI 服务。',
-      removeAttachment: '移除图片',
-      attachmentUnsupported: '仅支持 PNG、JPEG、WebP 或 GIF 图片。',
+      attachHint: '粘贴或拖入图片或 PDF，也可点击选择',
+      attachmentPrivacy: '附件会发送到当前配置的 AI 服务。',
+      removeAttachment: '移除附件',
+      attachmentUnsupported: '仅支持 PNG、JPEG、WebP、GIF 图片或 PDF。',
       attachmentTooLarge: '单张图片不能超过 10 MB。',
-      attachmentTooMany: '一次最多添加 10 张图片。',
-      attachmentTotalTooLarge: '一次图片总大小不能超过 30 MB。',
-      attachmentReadFailed: '无法读取图片。',
+      attachmentPdfTooLarge: '单个 PDF 不能超过 20 MB。',
+      attachmentTooMany: '一次最多添加 10 个附件。',
+      attachmentTotalTooLarge: '一次附件总大小不能超过 30 MB。',
+      attachmentReadFailed: '无法读取附件。',
+      pdfPages: (count: number) => count ? `共 ${count} 页` : '正在读取页数…',
+      pdfPagePlaceholder: '例如 1,3,5-8',
+      pdfPageLabel: 'PDF 页面选择',
+      pdfPagesRequired: '超过 10 页的 PDF 必须选择页面。',
+      pdfInvalidPages: '页码格式无效，请使用如 1,3,5-8 的格式。',
+      pdfBudget: (remaining: number) => `本次请求还可发送 ${remaining} 张图片（PDF 页面共用上限）。`,
+      preparingPdf: '正在准备 PDF 页面…',
       sendHint: '点击发送按钮提交',
       working: 'AI 正在处理…',
       stop: '停止',
@@ -398,14 +447,22 @@ const labels = computed(() => chinese.value
       you: 'You',
       ai: 'AI',
       placeholder: 'Ask a question or describe an edit…',
-      attachHint: 'Paste, drop, or choose images',
-      attachmentPrivacy: 'Images are sent to the configured AI service.',
-      removeAttachment: 'Remove image',
-      attachmentUnsupported: 'Only PNG, JPEG, WebP, or GIF images are supported.',
+      attachHint: 'Paste, drop, or choose images or PDFs',
+      attachmentPrivacy: 'Attachments are sent to the configured AI service.',
+      removeAttachment: 'Remove attachment',
+      attachmentUnsupported: 'Only PNG, JPEG, WebP, GIF images, or PDF files are supported.',
       attachmentTooLarge: 'Each image must be smaller than 10 MB.',
-      attachmentTooMany: 'You can attach up to 10 images at a time.',
-      attachmentTotalTooLarge: 'Images in one request must total less than 30 MB.',
-      attachmentReadFailed: 'The image could not be read.',
+      attachmentPdfTooLarge: 'Each PDF must be smaller than 20 MB.',
+      attachmentTooMany: 'You can attach up to 10 files at a time.',
+      attachmentTotalTooLarge: 'Attachments in one request must total less than 30 MB.',
+      attachmentReadFailed: 'The attachment could not be read.',
+      pdfPages: (count: number) => count ? `${count} pages` : 'Reading page count…',
+      pdfPagePlaceholder: 'For example 1,3,5-8',
+      pdfPageLabel: 'PDF page selection',
+      pdfPagesRequired: 'Select pages for PDFs with more than 10 pages.',
+      pdfInvalidPages: 'Invalid page selection. Use a format such as 1,3,5-8.',
+      pdfBudget: (remaining: number) => `${remaining} image slots remain in this request (PDF pages share the limit).`,
+      preparingPdf: 'Preparing PDF pages…',
       sendHint: 'Click Send to submit',
       working: 'AI is working…',
       stop: 'Stop',
@@ -443,13 +500,25 @@ const modelGroups = computed(() => {
   return Array.from(groups.values())
 })
 const hasDocument = computed(() => !!currentDocumentId.value)
+const pendingPdfCount = computed(() => ai.pendingAttachments.filter(item => item.attachment.mimeType === 'application/pdf').length)
+const pendingImageBudget = computed(() => {
+  const used = ai.pendingAttachments.reduce((total, item) => {
+    if (item.attachment.mimeType !== 'application/pdf') return total + 1
+    return total + (item.attachment.pages?.length ?? 0)
+  }, 0)
+  return Math.max(0, 10 - used)
+})
 const modelOptionValue = (value: AiModelRef): string => JSON.stringify(value)
 const attachmentErrorLabel = computed(() => {
   if (ai.attachmentError === 'unsupported') return labels.value.attachmentUnsupported
   if (ai.attachmentError === 'too-large') return labels.value.attachmentTooLarge
+  if (ai.attachmentError === 'pdf-too-large') return labels.value.attachmentPdfTooLarge
   if (ai.attachmentError === 'too-many') return labels.value.attachmentTooMany
   if (ai.attachmentError === 'total-too-large') return labels.value.attachmentTotalTooLarge
   if (ai.attachmentError === 'read-failed') return labels.value.attachmentReadFailed
+  if (ai.attachmentError === 'pdf-pages-required') return labels.value.pdfPagesRequired
+  if (ai.attachmentError === 'pdf-invalid-pages') return labels.value.pdfInvalidPages
+  if (ai.attachmentError === 'pdf-render-failed') return labels.value.attachmentReadFailed
   return ''
 })
 const recoveryPreview = computed(() => {
@@ -473,6 +542,27 @@ const send = (): void => {
   if (!value) return
   draft.value = ''
   ai.submit(value).catch(() => undefined)
+}
+
+const updatePdfPageSelection = (id: string, value: string): void => {
+  ai.setPendingPdfPageSelection(id, value)
+}
+
+const formatPages = (pages: readonly number[]): string => {
+  const sorted = Array.from(new Set(pages)).sort((a, b) => a - b)
+  const parts: string[] = []
+  let start = sorted[0]
+  let end = sorted[0]
+  for (const page of sorted.slice(1)) {
+    if (page === end + 1) end = page
+    else {
+      parts.push(start === end ? `${start}` : `${start}-${end}`)
+      start = page
+      end = page
+    }
+  }
+  if (start !== undefined) parts.push(start === end ? `${start}` : `${start}-${end}`)
+  return `p. ${parts.join(',')}`
 }
 
 const selectModel = (event: Event): void => {
@@ -516,7 +606,7 @@ const openFilePicker = (): void => {
 
 const addFiles = (files: File[]): void => {
   if (!files.length) return
-  ai.addImageFiles(files).catch(() => undefined)
+  ai.addAttachmentFiles(files).catch(() => undefined)
 }
 
 const selectFiles = (event: Event): void => {
@@ -645,11 +735,15 @@ onUnmounted(() => {
 .ai-message-attachments, .ai-pending-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
 .ai-attachment-chip, .ai-pending-attachment { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; box-sizing: border-box; padding: 4px 7px; border: 1px solid var(--editorColor20); border-radius: 5px; color: var(--editorColor70); background: var(--editorColor05, transparent); font-size: 11px; overflow: hidden; }
 .ai-attachment-name { min-width: 0; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-attachment-pages, .ai-pdf-page-count { flex: 0 0 auto; color: var(--editorColor50); font-size: 10px; }
+.ai-pdf-page-input { width: 92px; min-width: 0; padding: 2px 4px; border: 1px solid var(--editorColor20); border-radius: 3px; color: var(--editorColor); background: var(--editorBgColor); font: 10px monospace; }
 .ai-attachment-icon { display: inline-flex; flex: 0 0 auto; width: 15px; height: 15px; color: var(--themeColor); }
 .ai-attachment-icon svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.35; }
 .ai-attachment-icon circle { fill: currentColor; stroke: none; }
+.ai-pdf-icon { align-items: center; justify-content: center; border: 1px solid currentColor; border-radius: 2px; font-size: 7px; font-weight: 700; line-height: 1; }
 .ai-pending-attachment button { padding: 0 2px; border: 0; color: var(--editorColor60); background: transparent; cursor: pointer; font: inherit; }
 .ai-pending-attachment button:hover { color: var(--errorColor, #d33); }
+.ai-pdf-budget { margin: 5px 0; color: var(--editorColor50); font-size: 10px; }
   .ai-error { margin: 0 12px 8px; padding: 8px; color: var(--errorColor, #d33); border: 1px solid currentColor; border-radius: 5px; font-size: 12px; }
   .ai-recovery { margin: 0 12px 8px; padding: 8px; border: 1px solid var(--themeColor); border-radius: 5px; font-size: 12px; }
   .ai-recovery p { margin: 0 0 7px; line-height: 1.4; }

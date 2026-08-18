@@ -35,7 +35,7 @@ import type { MenuTemplate, MenuPopupPosition } from './menu'
 import type {
   AiChatSession,
   AiConnectionInput,
-  AiImageData,
+  AiAttachmentData,
   AiDiscoveredModel,
   AiModelListInput,
   AiModelRef,
@@ -64,7 +64,7 @@ export interface IpcInvokeChannels {
   'mt::ai::chat-load': { args: [documentId: string]; ret: AiChatSession }
   'mt::ai::chat-save': { args: [documentId: string, session: AiChatSession]; ret: void }
   'mt::ai::chat-clear': { args: [documentId: string]; ret: void }
-  'mt::ai::attachment-read': { args: [documentId: string, attachmentId: string]; ret: AiImageData }
+  'mt::ai::attachment-read': { args: [documentId: string, attachmentId: string]; ret: AiAttachmentData }
   'mt::ai::revision-prepare': { args: [request: AiRevisionRequest]; ret: AiPreparedRevision }
   'mt::ai::revision-commit': { args: [revisionId: string, documentId: string, afterMarkdown: string]; ret: void }
   'mt::ai::revision-discard': { args: [revisionId: string]; ret: void }

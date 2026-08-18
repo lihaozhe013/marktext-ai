@@ -24,6 +24,16 @@ export const AI_IMAGE_MIME_TYPES: readonly AiImageMimeType[] = Object.freeze([
 export const AI_MAX_IMAGE_COUNT = 10
 export const AI_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 export const AI_MAX_IMAGE_TOTAL_BYTES = 30 * 1024 * 1024
+export type AiPdfMimeType = 'application/pdf'
+
+export const AI_PDF_MIME_TYPES: readonly AiPdfMimeType[] = Object.freeze([
+  'application/pdf'
+])
+
+export const AI_MAX_PDF_BYTES = 20 * 1024 * 1024
+export const AI_MAX_PDF_TOTAL_BYTES = 30 * 1024 * 1024
+export const AI_PDF_RENDER_DPI = 150
+export const AI_PDF_RENDER_MAX_EDGE = 2400
 
 export interface AiImageAttachment {
   id: string
@@ -40,6 +50,33 @@ export interface AiImageData {
   mimeType: AiImageMimeType
   data: Uint8Array
 }
+
+export interface AiPdfAttachment {
+  id: string
+  name: string
+  mimeType: AiPdfMimeType
+  byteSize: number
+  pages?: number[]
+}
+
+export interface AiPdfUpload extends AiPdfAttachment {
+  data: Uint8Array
+}
+
+export interface AiPdfData {
+  mimeType: AiPdfMimeType
+  data: Uint8Array
+}
+
+export interface AiRenderedPdfPages {
+  attachmentId: string
+  pageNumbers: number[]
+  pages: AiImageUpload[]
+}
+
+export type AiAttachment = AiImageAttachment | AiPdfAttachment
+export type AiAttachmentUpload = AiImageUpload | AiPdfUpload
+export type AiAttachmentData = AiImageData | AiPdfData
 
 export interface AiModelCapabilities {
   reasoningControl?: AiReasoningControl
@@ -122,7 +159,7 @@ export interface AiChatMessage {
   createdAt: number
   revisionId?: string
   editSummary?: AiEditSummary
-  attachments?: AiImageAttachment[]
+  attachments?: AiAttachment[]
   model?: AiMessageModel
 }
 
@@ -139,7 +176,8 @@ export interface AiRequest {
   markdown: string
   messages: AiChatMessage[]
   modelRef: AiModelRef
-  attachments?: AiImageUpload[]
+  attachments?: AiAttachmentUpload[]
+  renderedPdfPages?: AiRenderedPdfPages[]
 }
 
 export interface AiEditOperationSummary {

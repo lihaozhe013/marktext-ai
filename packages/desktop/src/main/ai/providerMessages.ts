@@ -55,12 +55,13 @@ export const serializeProviderMessages = (
   protocol: AiProtocol,
   messages: ProviderMessage[]
 ): Array<Record<string, unknown>> => messages.map(message => {
-  if (!message.images?.length) return { role: message.role, content: message.content }
+  const images = message.images ?? []
+  if (!images.length) return { role: message.role, content: message.content }
   if (protocol === 'anthropic-messages') {
     return {
       role: message.role,
       content: [
-        ...message.images.map(image => ({
+        ...images.map(image => ({
           type: 'image',
           source: {
             type: 'base64',
@@ -75,7 +76,7 @@ export const serializeProviderMessages = (
   return {
     role: message.role,
     content: [
-      ...message.images.map(image => ({
+      ...images.map(image => ({
         type: 'image_url',
         image_url: { url: toImageDataUrl(image), detail: 'auto' }
       })),

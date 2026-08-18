@@ -58,7 +58,7 @@ renderer AI panel/store, and `packages/desktop/src/shared/types/ai.ts`:
   PNG, JPEG, WebP, or GIF only: up to 10 images per request, 10 MB per image,
   and 30 MB total. Images are stored under Electron `userData`, while chat
   history keeps metadata and the panel displays an icon plus filename (not a
-  thumbnail). Direct PDF uploads are not supported.
+  thumbnail). PDF uploads are rendered locally into PNG page images before being sent to image-capable models; PDF text extraction and OCR are not performed.
 - `prompts.ts` contains the shared MarkText/CommonMark/GFM rules. New math uses
   `$...$` inline and standalone `$$` block delimiters. The incompatible
   `\(...\)`, `\[...\]`, same-line `$$...$$`, and math code fences are rejected
@@ -142,7 +142,7 @@ AI-specific files under that root are:
 | Path | Contents |
 |---|---|
 | `ai-chat.json` | Per-document conversation history and attachment metadata |
-| `ai-attachments/` | Random-ID PNG/JPEG/WebP/GIF files sent to vision models |
+| `ai-attachments/` | Random-ID source PNG/JPEG/WebP/GIF/PDF attachment files; PDF page images are rendered in memory for requests |
 | `ai-connection.json` | Provider, endpoint, and model settings |
 | `ai-connection-key.json` | The locally stored API key; main-process only |
 | `ai-revisions.json` | Prepared/committed Markdown snapshots used for undo |
