@@ -85,7 +85,11 @@
       {{ modeHelp }}
     </p>
 
-    <div class="ai-messages">
+    <div
+      ref="messagesElement"
+      class="ai-messages"
+      @scroll="handleMessagesScroll"
+    >
       <div
         v-if="!ai.messages.length"
         class="ai-empty"
@@ -99,7 +103,24 @@
         :class="[message.role, { 'ai-status-message': message.kind === 'status' }]"
       >
         <div
-          v-if="message.kind === 'status'"
+          v-if="message.kind === 'status' && message.progress?.phase === 'agent-step' && hasStepDiff(message.progress)"
+          class="ai-step-diff"
+          role="status"
+        >
+          <div class="ai-step-diff-title">
+            {{ progressLabel(message) }}
+          </div>
+          <div class="ai-step-diff-row removed">
+            <span class="ai-step-diff-label">{{ labels.stepDeleted }}</span>
+            <pre>{{ message.progress.stepRemovedText || labels.emptyDiff }}</pre>
+          </div>
+          <div class="ai-step-diff-row added">
+            <span class="ai-step-diff-label">{{ labels.stepAdded }}</span>
+            <pre>{{ message.progress.stepAddedText || labels.emptyDiff }}</pre>
+          </div>
+        </div>
+        <div
+          v-else-if="message.kind === 'status'"
           class="ai-status-content"
           role="status"
         >
@@ -396,7 +417,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
@@ -406,12 +427,14 @@ import type { AiChatMessage, AiModelRef, AiProgressEvent, AiProgressInfo } from 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
 const panelElement = ref<HTMLElement | null>(null)
+const messagesElement = ref<HTMLElement | null>(null)
 const draft = ref('')
 const dragOver = ref(false)
 const copiedFailureId = ref('')
 const resizing = ref(false)
 const resizeStartX = ref(0)
 const resizeStartWidth = ref(380)
+const followMessages = ref(true)
 let stopProgressListener: (() => void) | undefined
 
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
@@ -463,6 +486,9 @@ const labels = computed(() => chinese.value
       undo: '撤销 AI 修改',
       unconfigured: '未配置连接',
       editApplied: (count: number, added: number, removed: number) => `已应用 ${count} 处修改（新增 ${added} 行，删除 ${removed} 行）`,
+      stepDeleted: '删除',
+      stepAdded: '新增',
+      emptyDiff: '（空）',
       noChanges: '文档无需修改',
       rewriteApplied: '已重写全文',
       recoveryWarning: '模型未能生成可靠的局部编辑，以下是整篇替代结果，请确认差异后应用。',
@@ -516,6 +542,9 @@ const labels = computed(() => chinese.value
       undo: 'Undo AI edit',
       unconfigured: 'Connection not configured',
       editApplied: (count: number, added: number, removed: number) => `Applied ${count} edit${count === 1 ? '' : 's'} (+${added}/-${removed} lines)`,
+      stepDeleted: 'Deleted',
+      stepAdded: 'Added',
+      emptyDiff: '(empty)',
       noChanges: 'No document changes were needed.',
       rewriteApplied: 'The document was rewritten.',
       recoveryWarning: 'The model could not produce a reliable local edit. Review the complete-document fallback before applying it.',
@@ -581,22 +610,44 @@ const editSummaryLabel = (message: AiChatMessage): string => {
   )
 }
 
+const stepDeltaLabel = (progress: AiProgressInfo | AiProgressEvent | undefined): string => {
+  if (progress?.stepAddedLines === undefined && progress?.stepRemovedLines === undefined) return ''
+  const added = progress.stepAddedLines ?? 0
+  const removed = progress.stepRemovedLines ?? 0
+  return chinese.value ? `+${added}行-${removed}行` : `+${added} lines -${removed} lines`
+}
+
+const hasStepDiff = (progress: AiProgressInfo | undefined): boolean =>
+  progress?.stepRemovedText !== undefined || progress?.stepAddedText !== undefined
+
 const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const current = progress?.current
   const total = progress?.total
-  const tokenUsage = progress?.outputTokens === undefined
+  const baseTokenUsage = progress?.outputTokens === undefined
     ? ''
     : progress.inputTokens !== undefined
-      ? `${progress.outputTokensEstimated ? '约 ' : ''}${progress.inputTokens + progress.outputTokens} tokens（输入 ${progress.inputTokens} / 输出 ${progress.outputTokens}）`
-      : `${progress.outputTokensEstimated ? '约 ' : ''}输出 ${progress.outputTokens} tokens`
-  const attempt = progress?.attempt ? `第 ${progress.attempt} 次尝试` : ''
+      ? chinese.value
+        ? `${progress.outputTokensEstimated ? '约 ' : ''}${progress.inputTokens + progress.outputTokens} tokens（输入 ${progress.inputTokens} / 输出 ${progress.outputTokens}）`
+        : `${progress.outputTokensEstimated ? 'about ' : ''}${progress.inputTokens + progress.outputTokens} tokens (input ${progress.inputTokens} / output ${progress.outputTokens})`
+      : chinese.value
+        ? `${progress.outputTokensEstimated ? '约 ' : ''}输出 ${progress.outputTokens} tokens`
+        : `${progress.outputTokensEstimated ? 'about ' : ''}${progress.outputTokens} output tokens`
+  const cacheUsage = progress?.cachedInputTokens !== undefined
+    ? chinese.value ? `缓存输入 ${progress.cachedInputTokens}` : `cached input ${progress.cachedInputTokens}`
+    : ''
+  const tokenUsage = [baseTokenUsage, cacheUsage].filter(Boolean).join(' · ')
+  const attempt = progress?.attempt
+    ? chinese.value ? `第 ${progress.attempt} 次尝试` : `attempt ${progress.attempt}`
+    : ''
   const failureReason = progress?.failureReason === 'exact-match'
-    ? 'SEARCH 未精确匹配'
+    ? chinese.value ? 'SEARCH 未精确匹配' : 'SEARCH did not match exactly'
     : progress?.failureReason === 'truncated'
-      ? '输出被截断'
+      ? chinese.value ? '输出被截断' : 'Output was truncated'
       : progress?.failureReason === 'provider'
-        ? '模型请求失败'
-        : '格式不符合要求'
+        ? chinese.value ? '模型请求失败' : 'Model request failed'
+        : progress?.failureReason === 'capability'
+          ? chinese.value ? '模型不支持工具调用' : 'Model does not support tool calling'
+          : chinese.value ? '格式不符合要求' : 'Format validation failed'
   if (chinese.value) {
     switch (progress?.phase) {
       case 'pdf-rendering':
@@ -608,6 +659,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
       case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
+      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
       case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
       case 'fallback': return `正在生成安全替代结果… · ${attempt}`
@@ -628,6 +680,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
     case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
+    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
     case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
     case 'fallback': return `Generating safe fallback… · ${attempt}`
@@ -643,18 +696,24 @@ const progressLabel = (message: AiChatMessage): string => progressLabelFor(messa
 
 const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: number): string => {
   if (!progress) return ''
-  const elapsed = `${Math.max(0, Math.floor(elapsedMs / 1000))} 秒`
-  const tokens = progress.outputTokensEstimated
-    ? `输出约 ${progress.outputTokens} tokens`
-    : `输出 ${progress.outputTokens} tokens`
+  const elapsed = chinese.value
+    ? `${Math.max(0, Math.floor(elapsedMs / 1000))} 秒`
+    : `${Math.max(0, Math.floor(elapsedMs / 1000))} seconds`
+  const outputTokens = progress.outputTokensEstimated
+    ? chinese.value ? `输出约 ${progress.outputTokens} tokens` : `about ${progress.outputTokens} output tokens`
+    : chinese.value ? `输出 ${progress.outputTokens} tokens` : `${progress.outputTokens} output tokens`
+  const tokens = progress.cachedInputTokens !== undefined
+    ? `${outputTokens} · ${chinese.value ? `缓存输入 ${progress.cachedInputTokens}` : `cached input ${progress.cachedInputTokens}`}`
+    : outputTokens
   const usage = progress.inputTokens !== undefined
-    ? `输入 ${progress.inputTokens} / ${tokens}`
+    ? chinese.value ? `输入 ${progress.inputTokens} / ${tokens}` : `input ${progress.inputTokens} / ${tokens}`
     : tokens
   if (chinese.value) {
     switch (progress.phase) {
       case 'waiting': return `正在等待模型响应… · ${elapsed}`
       case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
       case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'agent-step': return `第 ${progress.step ?? 0}/${progress.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}，继续执行… · ${elapsed}`
       case 'attempt-failed': return `第 ${progress.attempt} 次尝试失败 · ${usage} · ${elapsed}`
       case 'retrying': return `格式不符合要求，正在重试… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
       case 'fallback': return `正在生成安全替代结果… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
@@ -668,6 +727,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
     case 'waiting': return `Waiting for model response… · ${elapsed}`
     case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
     case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
+    case 'agent-step': return `Applied agent step ${progress.step ?? 0}/${progress.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}; continuing… · ${elapsed}`
     case 'attempt-failed': return `Attempt ${progress.attempt} failed · ${usage} · ${elapsed}`
     case 'retrying': return `Format validation failed; retrying… · attempt ${progress.attempt} · ${elapsed}`
     case 'fallback': return `Generating safe fallback… · attempt ${progress.attempt} · ${elapsed}`
@@ -681,6 +741,21 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
 const currentProgressLabel = computed(() => ai.loading && ai.liveProgress
   ? liveProgressLabel(ai.liveProgress, ai.liveProgressElapsedMs)
   : progressLabelFor(ai.currentProgress))
+
+const isNearMessagesBottom = (element: HTMLElement): boolean =>
+  element.scrollHeight - element.scrollTop - element.clientHeight <= 48
+
+const handleMessagesScroll = (): void => {
+  const element = messagesElement.value
+  if (element) followMessages.value = isNearMessagesBottom(element)
+}
+
+const scrollMessagesToBottom = (): void => {
+  nextTick().then(() => {
+    const element = messagesElement.value
+    if (element && followMessages.value) element.scrollTop = element.scrollHeight
+  }).catch(() => undefined)
+}
 
 const copyFailureOutput = async (message: AiChatMessage): Promise<void> => {
   const output = message.progress?.failureOutput
@@ -861,7 +936,9 @@ const stopResize = (): void => {
 
 onMounted(() => {
   ai.loadSettings().catch(() => undefined)
-  ai.loadChat().catch(() => undefined)
+  ai.loadChat()
+    .then(() => scrollMessagesToBottom())
+    .catch(() => undefined)
   stopProgressListener = ai.listenForProgress()
   window.electron.ipcRenderer.on('mt::ai-settings-changed', (_event, value) => {
     ai.setSettings(value)
@@ -872,9 +949,28 @@ onMounted(() => {
 })
 
 watch(currentDocumentId, (value) => {
+  followMessages.value = true
   ai.discardPendingRecovery()
   ai.clearPendingAttachments()
   if (value) ai.loadChat(value).catch(() => undefined)
+})
+
+watch(() => ai.messages, () => {
+  scrollMessagesToBottom()
+}, { deep: true })
+
+watch(() => ai.loading, (loading, wasLoading) => {
+  if (loading && !wasLoading) {
+    followMessages.value = true
+    scrollMessagesToBottom()
+  }
+})
+
+watch(() => ai.visible, (visible) => {
+  if (visible) {
+    followMessages.value = true
+    scrollMessagesToBottom()
+  }
 })
 
 onUnmounted(() => {
@@ -940,6 +1036,15 @@ onUnmounted(() => {
 .ai-status-message { margin: 4px 0; padding: 2px 0; border-bottom: 0; }
 .ai-status-content { display: flex; align-items: center; gap: 6px; color: var(--editorColor50); font-size: 10px; line-height: 1.35; }
 .ai-status-dot { width: 4px; height: 4px; flex: 0 0 auto; border-radius: 50%; background: var(--editorColor40); }
+.ai-step-diff { margin: 5px 0 8px; font-size: 10px; }
+.ai-step-diff-title { margin-bottom: 4px; color: var(--editorColor60); }
+.ai-step-diff-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 5px; align-items: start; margin-top: 3px; }
+.ai-step-diff-label { padding: 4px 0; font-weight: 600; }
+.ai-step-diff-row pre { min-width: 0; max-height: 180px; margin: 0; padding: 5px 7px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.4 monospace; }
+.ai-step-diff-row.removed .ai-step-diff-label { color: var(--errorColor, #d33); }
+.ai-step-diff-row.removed pre { color: var(--errorColor, #d33); background: color-mix(in srgb, var(--errorColor, #d33) 12%, transparent); border-left: 2px solid var(--errorColor, #d33); }
+.ai-step-diff-row.added .ai-step-diff-label { color: #218739; }
+.ai-step-diff-row.added pre { color: #218739; background: color-mix(in srgb, #218739 12%, transparent); border-left: 2px solid #218739; }
 .ai-message-role { margin-bottom: 5px; color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-message-model { margin: -2px 0 6px; color: var(--editorColor50); font-size: 10px; }
 .ai-edit-summary { color: var(--editorColor80); font-size: 13px; line-height: 1.4; }

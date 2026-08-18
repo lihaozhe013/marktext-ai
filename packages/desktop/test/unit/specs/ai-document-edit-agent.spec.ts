@@ -4,7 +4,8 @@ import {
   runDocumentEditAgent,
   type DocumentEditAgentRequest,
   type DocumentEditGenerateRequest,
-  type DocumentEditValidationDiagnostic
+  type DocumentEditValidationDiagnostic,
+  type DocumentAgentGenerateRequest
 } from 'main_renderer/ai/documentEditAgent'
 import type { AiImageAttachment } from '@shared/types/ai'
 
@@ -36,6 +37,72 @@ const responseWith = (system: string, search: string, replace: string): string =
 }
 
 describe('document edit agent', () => {
+  it('executes dependent edits against the evolving virtual document', async() => {
+    const steps: Array<Record<string, unknown>> = [
+      { version: 0, search: 'alpha', replace: 'beta', description: 'Updated the first word.' },
+      { version: 1, search: 'beta', replace: 'gamma', description: 'Refined the updated word.' },
+      { version: 2, summary: 'Updated the requested text.' }
+    ]
+    let turn = 0
+    const appliedSteps: Array<{ addedLines: number; removedLines: number; removedText: string; addedText: string }> = []
+    const generateAgent = vi.fn(async(_input: DocumentAgentGenerateRequest) => {
+      const step = steps[turn]
+      turn += 1
+      return {
+        content: '',
+        toolCalls: [{
+          id: `call-${turn}`,
+          name: step.summary ? 'finish_markdown_edit' : 'apply_markdown_edit',
+          input: step
+        }]
+      }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: 'alpha',
+      instruction: 'Update the text in two dependent steps.',
+      contextMessages: [],
+      requestId: 'agent-request',
+      signal: new AbortController().signal,
+      generateAgent,
+      maxSteps: 4,
+      onAgentStep: (_step, _maxSteps, _description, _version, _before, _after, addedLines, removedLines, removedText, addedText) => {
+        appliedSteps.push({ addedLines, removedLines, removedText, addedText })
+      }
+    })
+    expect(result.markdown).toBe('gamma')
+    expect(result.summary.operationCount).toBe(2)
+    expect(appliedSteps).toEqual([
+      { addedLines: 1, removedLines: 1, removedText: 'alpha', addedText: 'beta' },
+      { addedLines: 1, removedLines: 1, removedText: 'beta', addedText: 'gamma' }
+    ])
+    expect(generateAgent).toHaveBeenCalledTimes(3)
+    expect(generateAgent.mock.calls[1][0].messages.some(message => message.toolResults?.[0]?.content.includes('"version":1'))).toBe(true)
+  })
+
+  it('returns exact-match tool errors and preserves completed steps', async() => {
+    let turn = 0
+    const diagnostics: DocumentEditValidationDiagnostic[] = []
+    const generateAgent = vi.fn(async() => {
+      turn += 1
+      if (turn === 1) return { content: '', toolCalls: [{ id: 'bad', name: 'apply_markdown_edit', input: { version: 0, search: 'missing', replace: 'new', description: 'Bad anchor' } }] }
+      if (turn === 2) return { content: '', toolCalls: [{ id: 'good', name: 'apply_markdown_edit', input: { version: 0, search: 'old', replace: 'new', description: 'Changed the anchor.' } }] }
+      return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 1, summary: 'Changed the anchor.' } }] }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: 'old',
+      instruction: 'Change old to new.',
+      contextMessages: [],
+      requestId: 'agent-repair-request',
+      signal: new AbortController().signal,
+      generateAgent,
+      onValidationFailure: diagnostic => diagnostics.push(diagnostic)
+    })
+    expect(result.markdown).toBe('new')
+    expect(result.summary.operationCount).toBe(1)
+    expect(diagnostics[0].code).toBe('exact-match')
+    expect(generateAgent).toHaveBeenCalledTimes(3)
+  })
+
   it('applies one exact local replacement and reports changed lines', async() => {
     const generate = vi.fn(async(input: DocumentEditGenerateRequest) => ({
       content: responseWith(input.system, 'old title', 'new title')

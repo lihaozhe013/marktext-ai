@@ -5,22 +5,25 @@ import type {
   AiRecoveryInfo
 } from '@shared/types/ai'
 import type { AiOutputFailureCode } from './outputRepair'
-import type { ProviderToolCall } from './providerMessages'
+import { preciseEditTools, type ProviderToolCall, type ProviderToolResult } from './providerMessages'
 import {
   buildDocumentPrompt,
+  buildDocumentAgentSystemPrompt,
   buildPreciseEditRepairPrompt,
   buildPreciseEditSystemPrompt,
   buildPreciseEditWholeFallbackPrompt,
   makePreciseEditMarkers,
   makePromptToken
 } from './prompts'
-import { assertMarkdownCompatibility, normalizeGeneratedMarkdown } from './outputRepair'
+import { assertMarkdownCompatibility, inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
 
 export interface DocumentEditMessage {
   role: 'user' | 'assistant'
   content: string
   reasoning?: string
   attachments?: AiAttachment[]
+  toolCalls?: ProviderToolCall[]
+  toolResults?: ProviderToolResult[]
 }
 
 export interface GeneratedEditResponse {
@@ -51,8 +54,13 @@ export interface DocumentEditGenerateRequest {
   messages: DocumentEditMessage[]
   requestId: string
   signal: AbortSignal
-  format?: 'tool' | 'protocol' | 'whole'
+  format?: 'tool' | 'protocol' | 'whole' | 'agent'
   attempt?: number
+}
+
+export interface DocumentAgentGenerateRequest extends DocumentEditGenerateRequest {
+  format: 'agent'
+  tools: typeof preciseEditTools
 }
 
 export interface DocumentEditAgentRequest {
@@ -62,13 +70,16 @@ export interface DocumentEditAgentRequest {
   attachments?: AiAttachment[]
   requestId: string
   signal: AbortSignal
-  generate: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>
+  generate?: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>
   generateTool?: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>
   generateWhole?: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>
+  generateAgent?: (request: DocumentAgentGenerateRequest) => Promise<GeneratedEditResponse>
+  maxSteps?: number
   /** Number of protocol repair attempts after the first protocol generation. */
   maxRetries?: number
   onValidationFailure?: (diagnostic: DocumentEditValidationDiagnostic) => void
   onPhase?: (phase: 'validating' | 'retrying' | 'fallback', attempt: number) => void
+  onAgentStep?: (step: number, maxSteps: number, description: string, version: number, beforeMarkdown: string, markdown: string, addedLines: number, removedLines: number, removedText: string, addedText: string) => void
 }
 
 export interface DocumentEditAgentResult {
@@ -420,7 +431,8 @@ const summarize = (markdown: string, edits: LocatedEdit[]): AiEditSummary => ({
   })()
 })
 
-export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Promise<DocumentEditAgentResult> => {
+const runLegacyDocumentEditAgent = async(request: DocumentEditAgentRequest): Promise<DocumentEditAgentResult> => {
+  if (!request.generate) throw new Error('The legacy edit generator is unavailable.')
   const maxRetries = typeof request.maxRetries === 'number' && Number.isFinite(request.maxRetries)
     ? Math.min(MAX_RETRIES, Math.max(0, Math.floor(request.maxRetries)))
     : DEFAULT_MAX_RETRIES
@@ -623,6 +635,263 @@ export const runDocumentEditAgent = async(request: DocumentEditAgentRequest): Pr
 
   throw new Error('The AI edit agent stopped unexpectedly.')
 }
+
+const AGENT_DEFAULT_MAX_STEPS = 64
+const AGENT_MAX_STEPS = 128
+const AGENT_MAX_FAILURES = 8
+const AGENT_MAX_RUNTIME_MS = 10 * 60 * 1000
+const MAX_STEP_DESCRIPTION = 160
+
+interface AgentStepRange {
+  start: number
+  end: number
+  addedLines: number
+  removedLines: number
+}
+
+const asAgentRecord = (value: unknown): Record<string, unknown> | undefined =>
+  !!value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+
+const cleanStepDescription = (value: unknown): string => {
+  if (typeof value !== 'string') return 'Applied a Markdown edit.'
+  const cleaned = value.replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim()
+  return cleaned.slice(0, MAX_STEP_DESCRIPTION) || 'Applied a Markdown edit.'
+}
+
+const countIssueCodes = (value: string): Map<string, number> => {
+  const counts = new Map<string, number>()
+  for (const issue of inspectMarkdown(value).issues) counts.set(issue.code, (counts.get(issue.code) ?? 0) + 1)
+  return counts
+}
+
+const assertNoNewMarkdownIssues = (before: string, after: string): void => {
+  const beforeCounts = countIssueCodes(before)
+  const afterCounts = countIssueCodes(after)
+  for (const [code, count] of afterCounts) {
+    if (count > (beforeCounts.get(code) ?? 0)) {
+      throw new Error(`The edit introduced incompatible Markdown (${code}).`)
+    }
+  }
+}
+
+const makeAgentToolResult = (call: ProviderToolCall, current: string, version: number, payload: Record<string, unknown>, isError = false): ProviderToolResult => ({
+  toolCallId: call.id || `mt-agent-tool-${version}`,
+  content: JSON.stringify({ ...payload, version, markdown: current }),
+  ...(isError ? { isError: true } : {})
+})
+
+const summarizeAgentSteps = (original: string, current: string, ranges: AgentStepRange[]): AiEditSummary => {
+  const operations = ranges.map(range => {
+    const lines = lineRangeAt(current, range.start, range.end)
+    return {
+      startLine: lines.startLine,
+      endLine: lines.endLine,
+      addedLines: range.addedLines,
+      removedLines: range.removedLines,
+      afterStartLine: lines.startLine,
+      afterEndLine: lines.endLine,
+      afterStartOffset: range.start,
+      afterEndOffset: range.end
+    }
+  })
+  if (!operations.length && original !== current) {
+    const span = changedSpan(original, current)
+    const lines = lineRangeAt(current, span.afterStart, span.afterEnd)
+    operations.push({
+      startLine: lines.startLine,
+      endLine: lines.endLine,
+      addedLines: Math.max(0, current.split('\n').length - original.split('\n').length),
+      removedLines: Math.max(0, original.split('\n').length - current.split('\n').length),
+      afterStartLine: lines.startLine,
+      afterEndLine: lines.endLine,
+      afterStartOffset: span.afterStart,
+      afterEndOffset: span.afterEnd
+    })
+  }
+  return {
+    operationCount: ranges.length,
+    addedLines: ranges.reduce((total, range) => total + range.addedLines, 0),
+    removedLines: ranges.reduce((total, range) => total + range.removedLines, 0),
+    operations
+  }
+}
+
+const rebaseAgentRanges = (ranges: AgentStepRange[], start: number, end: number, replacementLength: number): AgentStepRange[] => {
+  const delta = replacementLength - (end - start)
+  const mapOffset = (offset: number, bias: 'start' | 'end'): number => {
+    if (offset <= start) return offset
+    if (offset >= end) return offset + delta
+    return bias === 'start' ? start : start + replacementLength
+  }
+  return ranges.map(range => ({
+    ...range,
+    start: mapOffset(range.start, 'start'),
+    end: mapOffset(range.end, 'end')
+  }))
+}
+
+const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<DocumentEditAgentResult> => {
+  if (!request.generateAgent) return runLegacyDocumentEditAgent(request)
+  const maxSteps = typeof request.maxSteps === 'number' && Number.isFinite(request.maxSteps)
+    ? Math.min(AGENT_MAX_STEPS, Math.max(1, Math.floor(request.maxSteps)))
+    : AGENT_DEFAULT_MAX_STEPS
+  const delimiter = makeDelimiter()
+  const system = buildDocumentAgentSystemPrompt(delimiter)
+  const documentPrompt = buildDocumentPrompt(request.instruction, request.markdown, delimiter)
+  const messages: DocumentEditMessage[] = [
+    ...request.contextMessages,
+    { role: 'user', content: documentPrompt, attachments: request.attachments }
+  ]
+  const startedAt = Date.now()
+  let current = request.markdown
+  let version = 0
+  let successfulSteps = 0
+  let failures = 0
+  let lastReasoning: string | undefined
+  const ranges: AgentStepRange[] = []
+
+  for (let turn = 1; turn <= maxSteps + AGENT_MAX_FAILURES + 2; turn += 1) {
+    if (Date.now() - startedAt > AGENT_MAX_RUNTIME_MS) throw new Error('The AI edit agent exceeded its time limit.')
+    const generated = await request.generateAgent({
+      system,
+      messages,
+      tools: preciseEditTools,
+      requestId: request.requestId,
+      signal: request.signal,
+      format: 'agent',
+      attempt: turn
+    })
+    lastReasoning = generated.reasoning ?? lastReasoning
+    request.onPhase?.('validating', turn)
+    const calls = generated.toolCalls ?? []
+    const assistantMessage: DocumentEditMessage = {
+      role: 'assistant',
+      content: generated.content,
+      reasoning: generated.reasoning,
+      toolCalls: calls
+    }
+    messages.push(assistantMessage)
+
+    const failTurn = (call: ProviderToolCall | undefined, error: string): void => {
+      failures += 1
+      const fallbackCall: ProviderToolCall = call ?? { id: `mt-agent-tool-${turn}`, name: 'agent_response', input: {} }
+      const result = makeAgentToolResult(fallbackCall, current, version, { ok: false, error }, true)
+      messages.push({ role: 'user', content: '', toolResults: [result] })
+      request.onValidationFailure?.({
+        attempt: turn,
+        code: calls.length === 0
+          ? 'capability'
+          : /SEARCH|version|match|unique/i.test(error) ? 'exact-match' : 'contract',
+        error,
+        responseChars: (generated.rawContent || generated.content).length,
+        responseLines: (generated.rawContent || generated.content).replaceAll('\r\n', '\n').split('\n').length,
+        summaryMarkers: 0,
+        searchMarkers: 0,
+        dividerMarkers: 0,
+        replaceMarkers: 0,
+        response: generated.rawContent || generated.content,
+        reasoning: generated.reasoning
+      })
+    }
+
+    if (generated.truncated) {
+      failTurn(calls[0], 'The provider response was truncated before a complete tool call.')
+    } else if (calls.length !== 1) {
+      failTurn(calls[0], calls.length === 0
+        ? 'The provider returned no editing tool call. Call apply_markdown_edit or finish_markdown_edit.'
+        : 'Exactly one editing tool call is allowed per turn.')
+      if (calls.length === 0 && failures >= 2) {
+        throw new Error(`The selected model or gateway does not support Agent precise editing tools; the AI edit could not be validated after ${turn} attempts.`)
+      }
+    } else {
+      const call = calls[0]
+      if (call.parseError || call.input === undefined) {
+        failTurn(call, call.parseError ?? 'The tool arguments were invalid.')
+      } else if (call.name === 'finish_markdown_edit') {
+        const input = asAgentRecord(call.input)
+        const requestedVersion = input?.version
+        const summary = cleanMessage(typeof input?.summary === 'string' ? input.summary : '')
+        if (!input || !Number.isInteger(requestedVersion) || requestedVersion !== version) {
+          failTurn(call, 'The finish version does not match the current document version.')
+        } else if (!summary) {
+          failTurn(call, 'The finish summary must be a concise non-empty string.')
+        } else {
+          return {
+            markdown: current,
+            reasoning: lastReasoning,
+            summary: summarizeAgentSteps(request.markdown, current, ranges),
+            message: summary,
+            attempts: turn,
+            recovery: { strategy: 'direct', attempts: turn }
+          }
+        }
+      } else if (call.name === 'apply_markdown_edit') {
+        const input = asAgentRecord(call.input)
+        const requestedVersion = input?.version
+        const search = input?.search
+        const replace = input?.replace
+        if (!input || !Number.isInteger(requestedVersion) || requestedVersion !== version) {
+          failTurn(call, 'The edit version does not match the current document version.')
+        } else if (typeof search !== 'string' || typeof replace !== 'string') {
+          failTurn(call, 'The edit requires string SEARCH and REPLACE values.')
+        } else if (search === replace) {
+          failTurn(call, 'The edit does not change any text.')
+        } else {
+          try {
+            const locatedResult = normalizeLocatedEdits(locateEdits([{ search, replace }], current))
+            const located = locatedResult.edits[0]
+            const next = applyEdits(current, locatedResult.edits)
+            assertNoNewMarkdownIssues(current, next)
+            const span = changedSpan(located.search, located.replace)
+            const nextStart = located.start + span.afterStart
+            const nextEnd = located.start + span.afterEnd
+            const rebased = rebaseAgentRanges(ranges, located.start, located.end, located.replace.length)
+            rebased.push({
+              start: nextStart,
+              end: nextEnd,
+              addedLines: located.summary.addedLines,
+              removedLines: located.summary.removedLines
+            })
+            const beforeStep = current
+            current = next
+            version += 1
+            successfulSteps += 1
+            ranges.splice(0, ranges.length, ...rebased)
+            request.onAgentStep?.(
+              successfulSteps,
+              maxSteps,
+              cleanStepDescription(input.description),
+              version,
+              beforeStep,
+              current,
+              located.summary.addedLines,
+              located.summary.removedLines,
+              located.search,
+              located.replace
+            )
+            const result = makeAgentToolResult(call, current, version, {
+              ok: true,
+              action: 'applied',
+              description: cleanStepDescription(input.description)
+            })
+            messages.push({ role: 'user', content: '', toolResults: [result] })
+          } catch (error) {
+            failTurn(call, error instanceof Error ? error.message : String(error))
+          }
+          if (successfulSteps >= maxSteps) {
+            throw new Error(`The AI edit agent reached the maximum of ${maxSteps} successful steps without finishing.`)
+          }
+        }
+      } else {
+        failTurn(call, `Unknown editing tool: ${call.name}.`)
+      }
+    }
+    if (failures >= AGENT_MAX_FAILURES) throw new Error(`The AI edit agent exceeded ${AGENT_MAX_FAILURES} invalid tool turns.`)
+  }
+  throw new Error('The AI edit agent stopped unexpectedly.')
+}
+
+export const runDocumentEditAgent = runDocumentAgent
 
 export const documentEditAgentLimits = {
   defaultMaxRetries: DEFAULT_MAX_RETRIES,

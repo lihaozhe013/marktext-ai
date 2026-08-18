@@ -39,7 +39,7 @@ import {
 } from '@shared/types/ai'
 import { runDocumentEditAgent } from './documentEditAgent'
 import { AiAttachmentStore, normalizeAttachmentUploads, normalizeImageAttachment, normalizeImageUpload, normalizePdfAttachment, orderAttachmentLocations } from './attachments'
-import { preciseEditTool, serializeProviderMessages, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition } from './providerMessages'
+import { serializeProviderMessages, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition, type ProviderToolResult } from './providerMessages'
 import { consumeProviderStream, estimateTokenCount, type ProviderStreamProgress, type ProviderUsage } from './providerStream'
 import { extractProviderContentParts, normalizeProviderContent, readReasoningField, type ProviderReasoningCompatibility } from './providerReasoning'
 import {
@@ -67,9 +67,12 @@ const MAX_CONTEXT_MESSAGES = 10
 const MAX_EDIT_CONTEXT_MESSAGES = 4
 const DEFAULT_EDIT_AUTO_RETRY_COUNT = 1
 const MAX_EDIT_AUTO_RETRY_COUNT = 3
+const DEFAULT_EDIT_AGENT_MAX_STEPS = 64
+const MAX_EDIT_AGENT_MAX_STEPS = 128
 const DEFAULT_FAILURE_OUTPUT_AFTER = 1
 const MAX_FAILURE_OUTPUT_AFTER = 3
 const MAX_FAILURE_OUTPUT_CHARS = 200_000
+const MAX_AGENT_DIFF_CHARS = 16_000
 const MAX_STORED_CHAT_MESSAGES = 100
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
@@ -84,7 +87,8 @@ interface ProviderResponse {
 }
 
 interface ProviderRequestOptions {
-  tool?: ProviderToolDefinition
+  tools?: ProviderToolDefinition[]
+  toolChoice?: 'required' | 'auto'
   stream?: boolean
   attempt?: number
   onWaiting?: () => void
@@ -139,6 +143,7 @@ interface StoredSettings {
   connections: StoredConnection[]
   defaultModel?: AiModelRef
   editAutoRetryCount: number
+  editAgentMaxSteps: number
   failureOutputAfter: number
 }
 
@@ -320,6 +325,7 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         connections: [],
         editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
+        editAgentMaxSteps: DEFAULT_EDIT_AGENT_MAX_STEPS,
         failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
       },
       legacy: false
@@ -335,6 +341,7 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         connections,
         defaultModel: normalizeModelRef(value.defaultModel),
         editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
+        editAgentMaxSteps: normalizeEditAgentMaxSteps(value.editAgentMaxSteps),
         failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter)
       },
       legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION
@@ -360,6 +367,7 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         ? { connectionId: legacyConnection.id, modelId: legacyConnection.models[0].id }
         : undefined,
       editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
+      editAgentMaxSteps: DEFAULT_EDIT_AGENT_MAX_STEPS,
       failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
     },
     legacy: true
@@ -441,6 +449,7 @@ const resolveModelsEndpoint = (settings: Pick<StoredConnection, 'protocol' | 'en
 const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
   defaultModel: settings.defaultModel,
   editAutoRetryCount: settings.editAutoRetryCount,
+  editAgentMaxSteps: settings.editAgentMaxSteps,
   failureOutputAfter: settings.failureOutputAfter,
   connections: settings.connections.map(connection => ({
     ...connection,
@@ -480,6 +489,7 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     'streaming',
     'responded',
     'validating',
+    'agent-step',
     'attempt-failed',
     'retrying',
     'fallback',
@@ -502,7 +512,19 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     failureCount: typeof value.failureCount === 'number' ? value.failureCount : undefined,
     failureOutput: typeof value.failureOutput === 'string' ? value.failureOutput.slice(0, MAX_FAILURE_OUTPUT_CHARS) : undefined,
     failureOutputTruncated: typeof value.failureOutputTruncated === 'boolean' ? value.failureOutputTruncated : undefined,
-    failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'unknown'
+    step: typeof value.step === 'number' ? value.step : undefined,
+    maxSteps: typeof value.maxSteps === 'number' ? value.maxSteps : undefined,
+    successfulSteps: typeof value.successfulSteps === 'number' ? value.successfulSteps : undefined,
+    toolFailures: typeof value.toolFailures === 'number' ? value.toolFailures : undefined,
+    documentVersion: typeof value.documentVersion === 'number' ? value.documentVersion : undefined,
+    stepDescription: typeof value.stepDescription === 'string' ? value.stepDescription.slice(0, 160) : undefined,
+    stepAddedLines: typeof value.stepAddedLines === 'number' ? value.stepAddedLines : undefined,
+    stepRemovedLines: typeof value.stepRemovedLines === 'number' ? value.stepRemovedLines : undefined,
+    stepRemovedText: typeof value.stepRemovedText === 'string' ? value.stepRemovedText.slice(0, 16000) : undefined,
+    stepAddedText: typeof value.stepAddedText === 'string' ? value.stepAddedText.slice(0, 16000) : undefined,
+    cachedInputTokens: typeof value.cachedInputTokens === 'number' ? value.cachedInputTokens : undefined,
+    cacheWriteInputTokens: typeof value.cacheWriteInputTokens === 'number' ? value.cacheWriteInputTokens : undefined,
+    failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'capability' || value.failureReason === 'unknown'
       ? value.failureReason
       : undefined
   }
@@ -656,8 +678,22 @@ const extractUsage = (payload: unknown, protocol: AiProtocol): ProviderUsage | u
   const outputTokens = protocol === 'anthropic-messages'
     ? typeof usage.output_tokens === 'number' ? usage.output_tokens : undefined
     : typeof usage.completion_tokens === 'number' ? usage.completion_tokens : undefined
-  if (inputTokens === undefined && outputTokens === undefined) return undefined
-  return { inputTokens, outputTokens }
+  const promptDetails = protocol === 'openai-chat-completions' && isRecord(usage.prompt_tokens_details)
+    ? usage.prompt_tokens_details
+    : undefined
+  const cachedInputTokens = protocol === 'anthropic-messages'
+    ? typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : undefined
+    : typeof promptDetails?.cached_tokens === 'number' ? promptDetails.cached_tokens : undefined
+  const cacheWriteInputTokens = protocol === 'anthropic-messages'
+    ? typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : undefined
+    : undefined
+  if (inputTokens === undefined && outputTokens === undefined && cachedInputTokens === undefined && cacheWriteInputTokens === undefined) return undefined
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(cacheWriteInputTokens !== undefined ? { cacheWriteInputTokens } : {})
+  }
 }
 
 export class AiService {
@@ -834,6 +870,19 @@ export class AiService {
     })
   }
 
+  async setEditAgentMaxSteps(maxSteps: number): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        editAgentMaxSteps: normalizeEditAgentMaxSteps(maxSteps)
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('edit agent max steps updated maxSteps=%s', settings.editAgentMaxSteps)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
   async setFailureOutputAfter(failureCount: number): Promise<AiSettings> {
     return this.queueSettingsMutation(async() => {
       const current = await this.readSettingsState()
@@ -1002,9 +1051,9 @@ export class AiService {
             ),
             ...(streaming ? { stream: true } : {})
           }
-          if (options.tool) {
-            body.tools = [{ name: options.tool.name, description: options.tool.description, input_schema: options.tool.parameters }]
-            body.tool_choice = { type: 'tool', name: options.tool.name }
+          if (options.tools?.length) {
+            body.tools = options.tools.map(tool => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }))
+            body.tool_choice = options.toolChoice === 'auto' ? { type: 'auto' } : { type: 'any' }
           }
         } else {
           headers.authorization = `Bearer ${apiKey}`
@@ -1025,9 +1074,9 @@ export class AiService {
             ...(streaming ? { stream: true } : {})
           }
           if (includeStreamUsage) body.stream_options = { include_usage: true }
-          if (options.tool) {
-            body.tools = [{ type: 'function', function: { name: options.tool.name, description: options.tool.description, parameters: options.tool.parameters } }]
-            body.tool_choice = { type: 'function', function: { name: options.tool.name } }
+          if (options.tools?.length) {
+            body.tools = options.tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))
+            body.tool_choice = options.toolChoice === 'auto' ? 'auto' : 'required'
           }
         }
         featureLog(
@@ -1107,7 +1156,7 @@ export class AiService {
           const attachmentHint = messages.some(message => !!message.images?.length)
             ? ' The configured model or endpoint may not support image input.'
             : ''
-          throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`, response.status, !!options.tool)
+          throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`, response.status, !!options.tools?.length)
         }
         const extracted = extractResponseContent(payload, settings.protocol, compatibility)
         const content = extracted.content
@@ -1209,7 +1258,7 @@ export class AiService {
   }
 
   private async hydrateProviderMessages(
-    messages: Array<{ role: 'user' | 'assistant'; content: string; reasoning?: string; attachments?: AiAttachment[] }>,
+    messages: Array<{ role: 'user' | 'assistant'; content: string; reasoning?: string; attachments?: AiAttachment[]; toolCalls?: ProviderToolCall[]; toolResults?: ProviderToolResult[] }>,
     priorityAttachmentIds: ReadonlySet<string> = new Set(),
     renderedPdfPages: readonly AiRenderedPdfPages[] = []
   ): Promise<ProviderMessage[]> {
@@ -1301,6 +1350,8 @@ export class AiService {
       role: message.role,
       content: message.content,
       reasoning: message.reasoning,
+      toolCalls: message.toolCalls,
+      toolResults: message.toolResults,
       images: imagesByMessage.get(index),
       attachmentContext: attachmentContextByMessage.get(index)?.join('\n')
     }))
@@ -1419,7 +1470,11 @@ export class AiService {
     let failureCount = 0
     let lastFailureOutput: string | undefined
     let lastFailureOutputTruncated = false
-    let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming'> = {
+    let totalInputTokens = 0
+    let totalOutputTokens = 0
+    let totalCachedInputTokens = 0
+    let totalCacheWriteInputTokens = 0
+    let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'cachedInputTokens' | 'cacheWriteInputTokens'> = {
       outputTokens: 0,
       outputTokensEstimated: true,
       streaming: false
@@ -1427,10 +1482,21 @@ export class AiService {
     const emitProgress = (
       phase: AiProgressEvent['phase'],
       attempt: number,
-      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated'>> = {}
+      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown'>> = {}
     ): void => {
       lastAttempt = Math.max(lastAttempt, attempt)
-      const { failureReason, failureCount: eventFailureCount, failureOutput, failureOutputTruncated, ...stats } = details
+      const {
+        failureReason,
+        failureCount: eventFailureCount,
+        failureOutput,
+        failureOutputTruncated,
+        documentId,
+        stepBaseMarkdown,
+        stepMarkdown,
+        stepRemovedText,
+        stepAddedText,
+        ...stats
+      } = details
       if (failureReason) lastFailureReason = failureReason
       lastProgressStats = { ...lastProgressStats, ...stats }
       progressSink?.({
@@ -1443,10 +1509,28 @@ export class AiService {
         ...(failureReason ? { failureReason } : {}),
         ...(eventFailureCount !== undefined ? { failureCount: eventFailureCount } : {}),
         ...(failureOutput !== undefined ? { failureOutput } : {}),
-        ...(failureOutputTruncated !== undefined ? { failureOutputTruncated } : {})
+        ...(failureOutputTruncated !== undefined ? { failureOutputTruncated } : {}),
+        ...(documentId !== undefined ? { documentId } : {}),
+        ...(stepBaseMarkdown !== undefined ? { stepBaseMarkdown } : {}),
+        ...(stepMarkdown !== undefined ? { stepMarkdown } : {}),
+        ...(stepRemovedText !== undefined ? { stepRemovedText } : {}),
+        ...(stepAddedText !== undefined ? { stepAddedText } : {})
       })
     }
     const rememberProviderResponse = (response: ProviderResponse): void => {
+      if (response.usage?.inputTokens !== undefined) totalInputTokens += response.usage.inputTokens
+      if (response.usage?.outputTokens !== undefined) totalOutputTokens += response.usage.outputTokens
+      if (response.usage?.cachedInputTokens !== undefined) totalCachedInputTokens += response.usage.cachedInputTokens
+      if (response.usage?.cacheWriteInputTokens !== undefined) totalCacheWriteInputTokens += response.usage.cacheWriteInputTokens
+      lastProgressStats = {
+        ...lastProgressStats,
+        inputTokens: totalInputTokens || undefined,
+        outputTokens: totalOutputTokens || lastProgressStats.outputTokens,
+        outputTokensEstimated: false,
+        cachedInputTokens: totalCachedInputTokens || undefined,
+        cacheWriteInputTokens: totalCacheWriteInputTokens || undefined,
+        streaming: false
+      }
       const output = makeFailureOutput(response.rawContent, response.content, response.reasoning)
       if (output.value) {
         lastFailureOutput = output.value
@@ -1474,6 +1558,8 @@ export class AiService {
             outputTokensEstimated: usage?.outputTokens === undefined,
             inputTokens: usage?.inputTokens,
             inputTokensEstimated: usage?.inputTokens === undefined,
+            cachedInputTokens: usage?.cachedInputTokens,
+            cacheWriteInputTokens: usage?.cacheWriteInputTokens,
             streaming: true
           })
         }
@@ -1594,22 +1680,25 @@ export class AiService {
         instruction: request.prompt,
         contextMessages: recentMessages,
         attachments: currentAttachments,
-        generateTool: async(agentRequest) => {
+        generateAgent: async(agentRequest) => {
           const attachmentKinds = Array.from(new Set(agentRequest.messages.flatMap(message =>
             (message.attachments ?? []).map(() => 'image')
           ))).sort().join('+') || 'text'
           const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}|${attachmentKinds}`
-          if (this.toolCapabilities.get(capabilityKey) === false) return { content: '', toolUnsupported: true }
+          if (this.toolCapabilities.get(capabilityKey) === false) {
+            throw new Error('The selected model or gateway does not support Agent precise editing tools.')
+          }
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
           try {
             const generated = await this.requestProvider(
               target,
-              `${agentRequest.system}\nWhen the submit_markdown_edits tool is available, call it exactly once with the validated edit object instead of writing the text protocol. Do not emit prose or a text protocol outside the tool call.`,
+              `${agentRequest.system}\nCall exactly one of the supplied editing tools on every turn.`,
               messages,
               agentRequest.requestId,
               agentRequest.signal,
               {
-                tool: preciseEditTool,
+                tools: agentRequest.tools,
+                toolChoice: 'required',
                 stream: true,
                 attempt: agentRequest.attempt ?? 1,
                 ...makeProviderProgress(agentRequest.attempt ?? 1)
@@ -1621,53 +1710,37 @@ export class AiService {
           } catch (error) {
             if (error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)) {
               this.toolCapabilities.set(capabilityKey, false)
-              featureLog('output repair tool capability unavailable protocol=%s model=%s requestId=%s', settings.protocol, target.model.model, agentRequest.requestId)
-              return { content: '', toolUnsupported: true }
+              featureLog('agent tool capability unavailable protocol=%s model=%s requestId=%s', settings.protocol, target.model.model, agentRequest.requestId)
+              throw new Error('The selected model or gateway does not support Agent precise editing tools.')
             }
             throw error
           }
         },
         requestId: request.requestId,
         signal: controller.signal,
-        maxRetries: state.settings.editAutoRetryCount,
-        generate: async(agentRequest) => {
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
-          const generated = await this.requestProvider(
-            target,
-            agentRequest.system,
-            messages,
-            agentRequest.requestId,
-            agentRequest.signal,
-            {
-              stream: true,
-              attempt: agentRequest.attempt ?? 1,
-              ...makeProviderProgress(agentRequest.attempt ?? 1)
-            }
-          )
-          rememberProviderResponse(generated)
-          return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, truncated: generated.truncated }
-        },
-        generateWhole: async(agentRequest) => {
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
-          const generated = await this.requestProvider(
-            target,
-            agentRequest.system,
-            messages,
-            agentRequest.requestId,
-            agentRequest.signal,
-            {
-              stream: true,
-              attempt: agentRequest.attempt ?? 1,
-              ...makeProviderProgress(agentRequest.attempt ?? 1)
-            }
-          )
-          rememberProviderResponse(generated)
-          return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, truncated: generated.truncated }
-        },
+        maxSteps: state.settings.editAgentMaxSteps,
         onPhase: (phase, attempt) => {
           emitProgress(phase, attempt, {
             streaming: false
           })
+        },
+        onAgentStep: (step, maxSteps, description, version, beforeMarkdown, markdown, addedLines, removedLines, removedText, addedText) => {
+          emitProgress('agent-step', step, {
+            step,
+            maxSteps,
+            successfulSteps: step,
+            documentVersion: version,
+            stepDescription: description,
+            stepAddedLines: addedLines,
+            stepRemovedLines: removedLines,
+            stepRemovedText: removedText.slice(0, MAX_AGENT_DIFF_CHARS),
+            stepAddedText: addedText.slice(0, MAX_AGENT_DIFF_CHARS),
+            documentId: request.documentId,
+            stepBaseMarkdown: beforeMarkdown,
+            stepMarkdown: markdown,
+            streaming: false
+          })
+          featureLog('agent step completed step=%s maxSteps=%s version=%s descriptionChars=%s requestId=%s', step, maxSteps, version, description.length, request.requestId)
         },
         onValidationFailure: diagnostic => {
           failureCount += 1
@@ -1680,8 +1753,10 @@ export class AiService {
             ? 'exact-match'
             : diagnostic.code === 'truncated'
               ? 'truncated'
-              : 'format'
-          emitProgress('attempt-failed', diagnostic.attempt, { failureReason, streaming: false })
+              : diagnostic.code === 'capability'
+                ? 'capability'
+                : 'format'
+          emitProgress('attempt-failed', diagnostic.attempt, { failureReason, failureCount, toolFailures: failureCount, streaming: false })
           featureLog(
             'edit agent validation failure attempt=%s code=%s error=%s responseChars=%s responseLines=%s summaryMarkers=%s searchMarkers=%s dividerMarkers=%s replaceMarkers=%s requestId=%s',
             diagnostic.attempt,
@@ -1722,6 +1797,9 @@ export class AiService {
       }
     } catch (error) {
       const cancelled = error instanceof Error && /cancelled|canceled/i.test(error.message)
+      if (!cancelled && /does not support Agent precise editing tools/i.test(error instanceof Error ? error.message : String(error))) {
+        lastFailureReason = 'capability'
+      }
       const exposeFailureOutput = !cancelled &&
         state.settings.failureOutputAfter > 0 &&
         failureCount >= state.settings.failureOutputAfter &&
@@ -1901,9 +1979,18 @@ const extractToolCalls = (payload: unknown, protocol: AiProtocol): ProviderToolC
     return content
       .filter(isRecord)
       .filter(part => part.type === 'tool_use' && typeof part.name === 'string')
-      .map(part => ({ name: part.name as string, input: parseToolInput(part.input) }))
-      .filter(call => call.input !== undefined)
+      .map(part => {
+        const input = parseToolInput(part.input)
+        return {
+          id: typeof part.id === 'string' ? part.id : '',
+          name: part.name as string,
+          input,
+          rawInput: typeof part.input === 'string' ? part.input : JSON.stringify(part.input ?? {}),
+          ...(input === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
+        }
+      })
   }
+
   const choices = payload.choices
   if (!Array.isArray(choices) || !isRecord(choices[0]) || !isRecord(choices[0].message)) return []
   const toolCalls = choices[0].message.tool_calls
@@ -1913,11 +2000,19 @@ const extractToolCalls = (payload: unknown, protocol: AiProtocol): ProviderToolC
     .map(call => {
       const functionCall = isRecord(call.function) ? call.function : undefined
       return {
+        id: typeof call.id === 'string' ? call.id : '',
         name: functionCall && typeof functionCall.name === 'string' ? functionCall.name : '',
-        input: parseToolInput(functionCall?.arguments)
+        input: parseToolInput(functionCall?.arguments),
+        rawInput: typeof functionCall?.arguments === 'string' ? functionCall.arguments : undefined,
+        ...(parseToolInput(functionCall?.arguments) === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
       }
     })
-    .filter(call => !!call.name && call.input !== undefined)
+    .filter(call => !!call.name)
+}
+
+const normalizeEditAgentMaxSteps = (value: unknown): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_EDIT_AGENT_MAX_STEPS
+  return Math.min(MAX_EDIT_AGENT_MAX_STEPS, Math.max(16, Math.floor(value)))
 }
 
 export const registerAiIpcHandlers = (userDataPath: string): void => {
@@ -1930,6 +2025,11 @@ export const registerAiIpcHandlers = (userDataPath: string): void => {
   ipcMain.handle('mt::ai::get-settings', () => aiService.getSettings())
   ipcMain.handle('mt::ai::set-edit-retry-count', async(_event, retryCount: number) => {
     const saved = await aiService.setEditAutoRetryCount(retryCount)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-edit-agent-max-steps', async(_event, maxSteps: number) => {
+    const saved = await aiService.setEditAgentMaxSteps(maxSteps)
     broadcastSettings(saved)
     return saved
   })

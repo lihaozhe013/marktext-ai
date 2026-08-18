@@ -56,6 +56,7 @@ import type {
 export interface IpcInvokeChannels {
   'mt::ai::get-settings': { args: []; ret: AiSettings }
   'mt::ai::set-edit-retry-count': { args: [retryCount: number]; ret: AiSettings }
+  'mt::ai::set-edit-agent-max-steps': { args: [maxSteps: number]; ret: AiSettings }
   'mt::ai::set-failure-output-after': { args: [failureCount: number]; ret: AiSettings }
   'mt::ai::save-connection': { args: [connection: AiConnectionInput]; ret: AiSettings }
   'mt::ai::delete-connection': { args: [connectionId: string]; ret: AiSettings }

@@ -6,14 +6,14 @@
     </p>
 
     <section class="ai-setting-group retry-setting">
-      <label>{{ labels.editAutoRetryCount }}</label>
-      <select v-model.number="editAutoRetryCount" @change="saveEditAutoRetryCount">
-        <option :value="0">0</option>
-        <option :value="1">1</option>
-        <option :value="2">2</option>
-        <option :value="3">3</option>
+      <label>{{ labels.editAgentMaxSteps }}</label>
+      <select v-model.number="editAgentMaxSteps" @change="saveEditAgentMaxSteps">
+        <option :value="16">16</option>
+        <option :value="32">32</option>
+        <option :value="64">64</option>
+        <option :value="128">128</option>
       </select>
-      <small>{{ labels.editAutoRetryHint }}</small>
+      <small>{{ labels.editAgentMaxStepsHint }}</small>
     </section>
 
     <section class="ai-setting-group failure-output-setting">
@@ -190,7 +190,7 @@ const status = ref('')
 const statusOk = ref(true)
 const discoveredModels = ref<AiDiscoveredModel[]>([])
 const defaultModelId = ref('')
-const editAutoRetryCount = ref(1)
+const editAgentMaxSteps = ref(64)
 const failureOutputAfter = ref(1)
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
 const connectionLog = (message: string, ...args: unknown[]): void => {
@@ -232,8 +232,8 @@ const labels = computed(() => chinese.value
       defaultModel: '选择默认模型',
       setDefault: '保存默认模型',
       deleteKey: '删除密钥',
-      editAutoRetryCount: '编辑模式自动修复重试次数',
-      editAutoRetryHint: '不包含首次生成。设为 0 时，格式错误会立即显示失败结果，不再自动请求下一次。',
+      editAgentMaxSteps: '精准编辑 Agent 最大步骤数',
+      editAgentMaxStepsHint: '每一步只执行一个局部修改；达到上限后会放弃本次虚拟编辑。',
       failureOutputAfter: '失败后显示模型原始输出',
       failureOutputAfterHint: '达到指定失败次数且请求最终失败后，可展开并复制最后一次模型输出；0 表示关闭。'
     }
@@ -272,8 +272,8 @@ const labels = computed(() => chinese.value
       defaultModel: 'Choose default model',
       setDefault: 'Save default model',
       deleteKey: 'Delete key',
-      editAutoRetryCount: 'Automatic repair retries for edit mode',
-      editAutoRetryHint: 'Additional attempts after the first generation. Set to 0 to show the failure without another automatic request.',
+      editAgentMaxSteps: 'Maximum Agent steps for precise editing',
+      editAgentMaxStepsHint: 'Each step performs one local edit; reaching the limit discards the virtual edit.',
       failureOutputAfter: 'Show raw model output after failure',
       failureOutputAfterHint: 'After this many failures, a final failed request can show and copy the last model output; 0 disables it.'
     })
@@ -355,7 +355,7 @@ const logInput = (action: string, value: AiConnectionInput): void => {
 
 const applySettings = (value: AiConnectionSettings): void => {
   settings.value = value
-  editAutoRetryCount.value = value.editAutoRetryCount ?? 1
+  editAgentMaxSteps.value = value.editAgentMaxSteps ?? 64
   failureOutputAfter.value = value.failureOutputAfter ?? 1
   ai.setSettings(value)
   if (value.connections.some(connection => connection.id === form.id)) selectConnection(form.id as string)
@@ -363,12 +363,12 @@ const applySettings = (value: AiConnectionSettings): void => {
   else resetForm()
 }
 
-const saveEditAutoRetryCount = async (): Promise<void> => {
+const saveEditAgentMaxSteps = async (): Promise<void> => {
   try {
-    const value = await window.electron.ipcRenderer.invoke('mt::ai::set-edit-retry-count', editAutoRetryCount.value)
+    const value = await window.electron.ipcRenderer.invoke('mt::ai::set-edit-agent-max-steps', editAgentMaxSteps.value)
     applySettings(value)
     statusOk.value = true
-    status.value = chinese.value ? '自动重试设置已保存。' : 'Automatic retry setting saved.'
+    status.value = chinese.value ? 'Agent 步骤上限已保存。' : 'Agent step limit saved.'
   } catch (err) {
     statusOk.value = false
     status.value = err instanceof Error ? err.message : String(err)
