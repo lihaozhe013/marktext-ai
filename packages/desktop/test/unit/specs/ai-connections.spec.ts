@@ -96,6 +96,40 @@ describe('AI connection profiles and model routing', () => {
     expect((await service.setEditAutoRetryCount(0)).editAutoRetryCount).toBe(0)
     expect((await service.setEditAutoRetryCount(99)).editAutoRetryCount).toBe(3)
     expect((await service.getSettings()).editAutoRetryCount).toBe(3)
+    expect((await service.getSettings()).failureOutputAfter).toBe(1)
+    expect((await service.setFailureOutputAfter(0)).failureOutputAfter).toBe(0)
+    expect((await service.setFailureOutputAfter(99)).failureOutputAfter).toBe(3)
+    expect((await service.getSettings()).failureOutputAfter).toBe(3)
+  })
+
+  it('exposes the final raw edit output after the configured failure threshold', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-failure-output-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'failure-model', 'openai-key'))
+    await service.setEditAutoRetryCount(0)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: '<think>tool plan</think>raw tool output' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'raw protocol output' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const progress: Array<{ phase: string; failureCount?: number; failureOutput?: string }> = []
+
+    await expect(service.request({
+      requestId: 'failure-output-request',
+      documentId: 'tab:failure-output',
+      mode: 'edit',
+      prompt: 'Update the title.',
+      markdown: '# Original title',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    }, event => progress.push({ phase: event.phase, failureCount: event.failureCount, failureOutput: event.failureOutput }))).rejects.toThrow('after 2 attempts')
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'failed',
+      failureCount: 2,
+      failureOutput: 'raw protocol output'
+    })
   })
 
   it('discovers models without putting the key in the returned list', async() => {
@@ -218,6 +252,41 @@ describe('AI connection profiles and model routing', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
     expect(body.stream).toBe(true)
     expect(body.stream_options).toEqual({ include_usage: true })
+  })
+
+  it('filters reasoning tags from ordinary JSON responses without a repair request', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-reasoning-json-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'OpenAI-compatible',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://openai.example/v1',
+      models: [{
+        model: 'tag-model',
+        label: 'Tag model',
+        capabilities: { reasoningTag: 'think' }
+      }],
+      apiKey: 'openai-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      choices: [{ message: { content: '<think>Plan the answer.</think>\nVisible answer' }, finish_reason: 'stop' }]
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'reasoning-json-request',
+      documentId: 'tab:reasoning-json',
+      mode: 'answer',
+      prompt: 'Answer briefly.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.content).toBe('Visible answer')
+    expect(result.reasoning).toBe('Plan the answer.')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('falls back from rejected streaming options to a normal JSON response', async() => {

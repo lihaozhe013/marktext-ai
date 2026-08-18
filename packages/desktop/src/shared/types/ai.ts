@@ -3,6 +3,8 @@ export type AiInteractionMode = 'answer' | 'edit' | 'rewrite'
 export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback'
 export type AiModelSource = 'manual' | 'discovered'
 export type AiReasoningControl = 'unknown' | 'effort' | 'budget'
+export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_content' | 'reasoning_text'
+export type AiReasoningTag = 'think' | 'thinking' | 'analysis' | 'reasoning'
 
 export interface AiRecoveryInfo {
   strategy: AiRecoveryStrategy
@@ -80,6 +82,9 @@ export type AiAttachmentData = AiImageData | AiPdfData
 
 export interface AiModelCapabilities {
   reasoningControl?: AiReasoningControl
+  reasoningField?: AiReasoningField
+  reasoningTag?: AiReasoningTag
+  replayReasoning?: boolean
 }
 
 export interface AiModelProfile {
@@ -109,6 +114,8 @@ export interface AiSettings {
   defaultModel?: AiModelRef
   /** Number of protocol repair attempts after the initial edit generation. */
   editAutoRetryCount?: number
+  /** Number of failed attempts before exposing the final raw model output. */
+  failureOutputAfter?: number
 }
 
 /** Compatibility alias for renderer code that refers to the AI settings object. */
@@ -181,6 +188,9 @@ export interface AiProgressInfo {
   inputTokens?: number
   inputTokensEstimated?: boolean
   failureReason?: AiFailureReason
+  failureCount?: number
+  failureOutput?: string
+  failureOutputTruncated?: boolean
 }
 
 export type AiFailureReason = 'format' | 'exact-match' | 'truncated' | 'provider' | 'unknown'
@@ -199,6 +209,9 @@ export interface AiProgressEvent {
   inputTokensEstimated?: boolean
   streaming: boolean
   failureReason?: AiFailureReason
+  failureCount?: number
+  failureOutput?: string
+  failureOutputTruncated?: boolean
 }
 
 export interface AiChatMessage {
@@ -206,6 +219,8 @@ export interface AiChatMessage {
   role: 'user' | 'assistant'
   mode: AiInteractionMode
   content: string
+  /** Provider reasoning kept separate from the assistant's usable content. */
+  reasoning?: string
   createdAt: number
   revisionId?: string
   editSummary?: AiEditSummary
@@ -255,6 +270,7 @@ export interface AiResponse {
   requestId: string
   mode: AiInteractionMode
   content: string
+  reasoning?: string
   summary?: string
   markdown?: string
   editSummary?: AiEditSummary

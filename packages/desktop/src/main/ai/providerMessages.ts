@@ -1,4 +1,4 @@
-import type { AiProtocol } from '@shared/types/ai'
+import type { AiProtocol, AiReasoningField } from '@shared/types/ai'
 
 export interface ProviderImage {
   mimeType: string
@@ -8,6 +8,7 @@ export interface ProviderImage {
 export interface ProviderMessage {
   role: 'user' | 'assistant'
   content: string
+  reasoning?: string
   images?: ProviderImage[]
   attachmentContext?: string
 }
@@ -54,27 +55,44 @@ const toImageDataUrl = (image: ProviderImage): string => `data:${image.mimeType}
 
 export const serializeProviderMessages = (
   protocol: AiProtocol,
-  messages: ProviderMessage[]
+  messages: ProviderMessage[],
+  reasoningField?: AiReasoningField,
+  replayReasoning = false
 ): Array<Record<string, unknown>> => messages.map(message => {
   const images = message.images ?? []
   const content = message.attachmentContext
     ? `${message.attachmentContext}\n\n${message.content}`
     : message.content
-  if (!images.length) return { role: message.role, content }
-  if (protocol === 'anthropic-messages') {
+  const shouldReplayReasoning = replayReasoning && message.role === 'assistant' && !!message.reasoning
+  const reasoning = reasoningField && shouldReplayReasoning
+    ? { [reasoningField]: message.reasoning }
+    : {}
+  if (!images.length && protocol === 'anthropic-messages' && shouldReplayReasoning) {
     return {
       role: message.role,
       content: [
-        ...images.map(image => ({
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: image.mimeType,
-            data: image.data
-          }
-        })),
-        { type: 'text', text: content }
+        { type: 'thinking', thinking: message.reasoning },
+        ...(content ? [{ type: 'text', text: content }] : [])
       ]
+    }
+  }
+  if (!images.length) return { role: message.role, content, ...reasoning }
+  if (protocol === 'anthropic-messages') {
+    const anthropicContent = [
+      ...(shouldReplayReasoning ? [{ type: 'thinking', thinking: message.reasoning }] : []),
+      ...images.map(image => ({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: image.mimeType,
+          data: image.data
+        }
+      })),
+      { type: 'text', text: content }
+    ]
+    return {
+      role: message.role,
+      content: anthropicContent
     }
   }
   return {
@@ -85,6 +103,7 @@ export const serializeProviderMessages = (
         image_url: { url: toImageDataUrl(image), detail: 'auto' }
       })),
       { type: 'text', text: content }
-    ]
+    ],
+    ...reasoning
   }
 })

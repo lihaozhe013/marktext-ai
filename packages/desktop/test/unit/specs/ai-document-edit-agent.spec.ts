@@ -272,6 +272,7 @@ describe('document edit agent', () => {
       dividerMarkers: 1,
       replaceMarkers: 1
     })
+    expect(diagnostics[0].response).toContain('Unexpected explanation')
   })
 
   it('supports inserting into an empty document and no-op responses', async() => {

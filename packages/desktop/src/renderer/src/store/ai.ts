@@ -128,6 +128,7 @@ const toIpcChatMessage = (message: AiChatMessage): AiChatMessage => ({
   role: message.role,
   mode: message.mode,
   content: message.content,
+  reasoning: message.reasoning,
   createdAt: message.createdAt,
   revisionId: message.revisionId,
   kind: message.kind,
@@ -456,6 +457,7 @@ export const useAiStore = defineStore('ai', () => {
       editSummary?: AiEditSummary
       attachments?: AiAttachment[]
       model?: AiMessageModel
+      reasoning?: string
       kind?: AiChatMessage['kind']
       progress?: AiProgressInfo
     } = {}
@@ -520,6 +522,9 @@ export const useAiStore = defineStore('ai', () => {
       outputTokensEstimated: event.outputTokensEstimated,
       inputTokens: event.inputTokens,
       inputTokensEstimated: event.inputTokensEstimated,
+      failureCount: event.failureCount,
+      failureOutput: event.failureOutput,
+      failureOutputTruncated: event.failureOutputTruncated,
       failureReason: event.failureReason
     }
     progressPersistSequence = progressPersistSequence
@@ -529,7 +534,7 @@ export const useAiStore = defineStore('ai', () => {
 
   const appendProgress = async(
     phase: AiProgressPhase,
-    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason'>> = {}
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated'>> = {}
   ): Promise<void> => {
     const progress: AiProgressInfo = { phase, ...details }
     currentProgress.value = progress
@@ -546,7 +551,10 @@ export const useAiStore = defineStore('ai', () => {
       outputTokens: progress.outputTokens,
       outputTokensEstimated: progress.outputTokensEstimated,
       inputTokens: progress.inputTokens,
-      inputTokensEstimated: progress.inputTokensEstimated
+      inputTokensEstimated: progress.inputTokensEstimated,
+      failureCount: progress.failureCount,
+      failureOutput: progress.failureOutput,
+      failureOutputTruncated: progress.failureOutputTruncated
     }
   }
 
@@ -729,7 +737,7 @@ export const useAiStore = defineStore('ai', () => {
       if (requestId !== activeRequestId.value || documentId !== currentDocumentId.value) return
       await appendProgress('responded')
       if (requestMode === 'answer') {
-        appendMessage('assistant', response.content, requestMode, { model: response.model })
+        appendMessage('assistant', response.content, requestMode, { model: response.model, reasoning: response.reasoning })
         lastAnswer.value = response.content
         await saveChat()
         await appendProgress('completed', finalProgressDetails())
@@ -810,7 +818,10 @@ export const useAiStore = defineStore('ai', () => {
       return false
     }
     if (nextMarkdown === beforeMarkdown) {
-      appendMessage('assistant', response.summary ?? '', response.mode, { editSummary: response.editSummary })
+      appendMessage('assistant', response.summary ?? '', response.mode, {
+        editSummary: response.editSummary,
+        reasoning: response.reasoning
+      })
       await saveChat()
       return true
     }
@@ -890,7 +901,8 @@ export const useAiStore = defineStore('ai', () => {
               appendMessage('assistant', response.summary ?? '', response.mode, {
                 revisionId,
                 editSummary: response.editSummary,
-                model: response.model
+                model: response.model,
+                reasoning: response.reasoning
               })
               await saveChat()
               applied = true

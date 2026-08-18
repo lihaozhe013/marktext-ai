@@ -1,5 +1,11 @@
 import type { AiProtocol } from '@shared/types/ai'
 import type { ProviderToolCall } from './providerMessages'
+import {
+  extractAnthropicThinkingDelta,
+  normalizeProviderContent,
+  readReasoningField,
+  type ProviderReasoningCompatibility
+} from './providerReasoning'
 
 export interface ProviderUsage {
   inputTokens?: number
@@ -8,6 +14,7 @@ export interface ProviderUsage {
 
 export interface ProviderStreamProgress {
   outputCharacters: number
+  reasoningCharacters: number
   outputTokens: number
   usage?: ProviderUsage
   firstEvent: boolean
@@ -15,6 +22,8 @@ export interface ProviderStreamProgress {
 
 export interface ProviderStreamResult {
   content: string
+  rawContent: string
+  reasoning?: string
   toolCalls: ProviderToolCall[]
   usage?: ProviderUsage
   truncated: boolean
@@ -135,14 +144,18 @@ const parseSseEvents = async(
 const readOpenAiDelta = (
   payload: Record<string, unknown>,
   content: { value: string },
+  reasoning: { value: string },
   tools: Map<number, OpenAiToolAccumulator>,
   usage: { value?: ProviderUsage },
-  state: { truncated: boolean }
-): string => {
+  state: { truncated: boolean },
+  compatibility: ProviderReasoningCompatibility
+): { content: string; reasoning: string } => {
   const choices = Array.isArray(payload.choices) ? payload.choices : []
   const choice = isRecord(choices[0]) ? choices[0] : undefined
   const delta = choice && isRecord(choice.delta) ? choice.delta : undefined
   if (typeof delta?.content === 'string') content.value += delta.content
+  const reasoningDelta = readReasoningField(delta, compatibility.field)
+  if (reasoningDelta) reasoning.value += reasoningDelta
   if (Array.isArray(delta?.tool_calls)) {
     for (const item of delta.tool_calls) {
       if (!isRecord(item)) continue
@@ -162,17 +175,21 @@ const readOpenAiDelta = (
   if (inputTokens !== undefined || outputTokens !== undefined) {
     usage.value = { inputTokens, outputTokens }
   }
-  return typeof delta?.content === 'string' ? delta.content : ''
+  return {
+    content: typeof delta?.content === 'string' ? delta.content : '',
+    reasoning: reasoningDelta
+  }
 }
 
 const readAnthropicDelta = (
   event: SseEvent,
   payload: Record<string, unknown>,
   content: { value: string },
+  reasoning: { value: string },
   tools: Map<number, AnthropicToolAccumulator>,
   usage: { value?: ProviderUsage },
   state: { truncated: boolean }
-): string => {
+): { content: string; reasoning: string } => {
   const eventType = event.event ?? (typeof payload.type === 'string' ? payload.type : '')
   if (eventType === 'message_start') {
     const message = isRecord(payload.message) ? payload.message : undefined
@@ -193,7 +210,12 @@ const readAnthropicDelta = (
     const delta = isRecord(payload.delta) ? payload.delta : undefined
     if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
       content.value += delta.text
-      return delta.text
+      return { content: delta.text, reasoning: '' }
+    }
+    const thinking = extractAnthropicThinkingDelta(delta)
+    if (thinking) {
+      reasoning.value += thinking
+      return { content: '', reasoning: thinking }
     }
     if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
       const tool = tools.get(index) ?? { name: '', input: '' }
@@ -207,21 +229,24 @@ const readAnthropicDelta = (
     const outputTokens = asNumber(deltaUsage?.output_tokens)
     if (outputTokens !== undefined) usage.value = { ...usage.value, outputTokens }
   }
-  return ''
+  return { content: '', reasoning: '' }
 }
 
 export const consumeProviderStream = async(
   protocol: AiProtocol,
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal | undefined,
-  onProgress?: (progress: ProviderStreamProgress) => void
+  onProgress?: (progress: ProviderStreamProgress) => void,
+  compatibility: ProviderReasoningCompatibility = {}
 ): Promise<ProviderStreamResult> => {
   const content = { value: '' }
+  const reasoning = { value: '' }
   const usage: { value?: ProviderUsage } = {}
   const openAiTools = new Map<number, OpenAiToolAccumulator>()
   const anthropicTools = new Map<number, AnthropicToolAccumulator>()
   const state = { truncated: false }
   let outputCharacters = 0
+  let reasoningCharacters = 0
   let firstEvent = true
   let done = false
 
@@ -229,7 +254,8 @@ export const consumeProviderStream = async(
     const exactOutputTokens = usage.value?.outputTokens
     onProgress?.({
       outputCharacters,
-      outputTokens: exactOutputTokens ?? Math.max(estimateTokenCount(content.value), Math.ceil(outputCharacters / 4)),
+      reasoningCharacters,
+      outputTokens: exactOutputTokens ?? estimateTokenCount(`${content.value}${reasoning.value}`),
       usage: usage.value,
       firstEvent
     })
@@ -244,18 +270,20 @@ export const consumeProviderStream = async(
     const payload = parseJson(event.data)
     if (!payload) return
     const beforeContentLength = content.value.length
+    const beforeReasoningLength = reasoning.value.length
     const beforeToolLength = protocol === 'anthropic-messages'
       ? [...anthropicTools.values()].reduce((total, tool) => total + tool.input.length, 0)
       : [...openAiTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
     if (protocol === 'anthropic-messages') {
-      readAnthropicDelta(event, payload, content, anthropicTools, usage, state)
+      readAnthropicDelta(event, payload, content, reasoning, anthropicTools, usage, state)
     } else {
-      readOpenAiDelta(payload, content, openAiTools, usage, state)
+      readOpenAiDelta(payload, content, reasoning, openAiTools, usage, state, compatibility)
     }
     const afterToolLength = protocol === 'anthropic-messages'
       ? [...anthropicTools.values()].reduce((total, tool) => total + tool.input.length, 0)
       : [...openAiTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
     outputCharacters += (content.value.length - beforeContentLength) + (afterToolLength - beforeToolLength)
+    reasoningCharacters += reasoning.value.length - beforeReasoningLength
     notify()
   })
 
@@ -267,11 +295,14 @@ export const consumeProviderStream = async(
       .map(tool => ({ name: tool.name, input: parseToolInput(tool.arguments) }))
       .filter(tool => !!tool.name && tool.input !== undefined)
 
-  if (!done && !content.value && !toolCalls.length) {
+  const normalized = normalizeProviderContent(content.value, reasoning.value, compatibility, 'field')
+  if (!done && !normalized.content && !toolCalls.length) {
     throw new Error('The provider stream ended without content.')
   }
   return {
-    content: content.value,
+    content: normalized.content,
+    rawContent: content.value,
+    reasoning: normalized.reasoning,
     toolCalls,
     usage: usage.value,
     truncated: state.truncated

@@ -19,6 +19,9 @@ import type {
   AiProgressPhase,
   AiProgressEvent,
   AiFailureReason,
+  AiReasoningControl,
+  AiReasoningField,
+  AiReasoningTag,
   AiRecoveryInfo,
   AiPreparedRevision,
   AiRequest,
@@ -38,6 +41,7 @@ import { runDocumentEditAgent } from './documentEditAgent'
 import { AiAttachmentStore, normalizeAttachmentUploads, normalizeImageAttachment, normalizeImageUpload, normalizePdfAttachment, orderAttachmentLocations } from './attachments'
 import { preciseEditTool, serializeProviderMessages, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition } from './providerMessages'
 import { consumeProviderStream, estimateTokenCount, type ProviderStreamProgress, type ProviderUsage } from './providerStream'
+import { extractProviderContentParts, normalizeProviderContent, readReasoningField, type ProviderReasoningCompatibility } from './providerReasoning'
 import {
   buildAnswerSystemPrompt,
   buildDocumentPrompt,
@@ -53,7 +57,7 @@ import {
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
-const SETTINGS_SCHEMA_VERSION = 3
+const SETTINGS_SCHEMA_VERSION = 4
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
 const CHAT_FILE = 'ai-chat.json'
@@ -63,12 +67,17 @@ const MAX_CONTEXT_MESSAGES = 10
 const MAX_EDIT_CONTEXT_MESSAGES = 4
 const DEFAULT_EDIT_AUTO_RETRY_COUNT = 1
 const MAX_EDIT_AUTO_RETRY_COUNT = 3
+const DEFAULT_FAILURE_OUTPUT_AFTER = 1
+const MAX_FAILURE_OUTPUT_AFTER = 3
+const MAX_FAILURE_OUTPUT_CHARS = 200_000
 const MAX_STORED_CHAT_MESSAGES = 100
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
 
 interface ProviderResponse {
   content: string
+  rawContent: string
+  reasoning?: string
   truncated: boolean
   toolCalls?: ProviderToolCall[]
   usage?: ProviderUsage
@@ -86,6 +95,7 @@ type AiProgressSink = (event: AiProgressEvent) => void
 
 interface RepairedMarkdownResult {
   content: string
+  reasoning?: string
   recovery: AiRecoveryInfo
 }
 
@@ -103,6 +113,19 @@ class ProviderRequestError extends Error {
 
 const normalizeRevisionMarkdown = (value: string): string => value.replace(/[\r\n]+$/, '')
 
+const makeFailureOutput = (rawContent: string, content: string, reasoning?: string): { value?: string; truncated: boolean } => {
+  const visible = rawContent || content
+  const reasoningSuffix = reasoning && !visible.includes(reasoning)
+    ? `\n\n[provider reasoning]\n${reasoning}`
+    : ''
+  const combined = `${visible}${reasoningSuffix}`
+  if (!combined) return { truncated: false }
+  return {
+    value: combined.slice(0, MAX_FAILURE_OUTPUT_CHARS),
+    truncated: combined.length > MAX_FAILURE_OUTPUT_CHARS
+  }
+}
+
 interface StoredConnection {
   id: string
   name: string
@@ -116,6 +139,7 @@ interface StoredSettings {
   connections: StoredConnection[]
   defaultModel?: AiModelRef
   editAutoRetryCount: number
+  failureOutputAfter: number
 }
 
 type StoredKeys = Record<string, string>
@@ -233,11 +257,30 @@ const normalizeEditAutoRetryCount = (value: unknown): number => {
   return Math.min(MAX_EDIT_AUTO_RETRY_COUNT, Math.max(0, Math.floor(value)))
 }
 
+const normalizeFailureOutputAfter = (value: unknown): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_FAILURE_OUTPUT_AFTER
+  return Math.min(MAX_FAILURE_OUTPUT_AFTER, Math.max(0, Math.floor(value)))
+}
+
 const normalizeModelCapabilities = (value: unknown): AiModelProfile['capabilities'] => {
   if (!isRecord(value)) return undefined
   const reasoningControl = value.reasoningControl
-  if (reasoningControl !== 'unknown' && reasoningControl !== 'effort' && reasoningControl !== 'budget') return undefined
-  return { reasoningControl }
+  const reasoningField = value.reasoningField
+  const reasoningTag = value.reasoningTag
+  const replayReasoning = value.replayReasoning
+  if (
+    (reasoningControl !== undefined && reasoningControl !== 'unknown' && reasoningControl !== 'effort' && reasoningControl !== 'budget') ||
+    (reasoningField !== undefined && reasoningField !== 'reasoning' && reasoningField !== 'reasoning_content' && reasoningField !== 'reason_content' && reasoningField !== 'reasoning_text') ||
+    (reasoningTag !== undefined && reasoningTag !== 'think' && reasoningTag !== 'thinking' && reasoningTag !== 'analysis' && reasoningTag !== 'reasoning') ||
+    (replayReasoning !== undefined && typeof replayReasoning !== 'boolean')
+  ) return undefined
+  if (reasoningControl === undefined && reasoningField === undefined && reasoningTag === undefined && replayReasoning === undefined) return undefined
+  return {
+    ...(reasoningControl !== undefined ? { reasoningControl: reasoningControl as AiReasoningControl } : {}),
+    ...(reasoningField !== undefined ? { reasoningField: reasoningField as AiReasoningField } : {}),
+    ...(reasoningTag !== undefined ? { reasoningTag: reasoningTag as AiReasoningTag } : {}),
+    ...(replayReasoning !== undefined ? { replayReasoning } : {})
+  }
 }
 
 const normalizeModelProfile = (value: unknown): AiModelProfile | undefined => {
@@ -276,7 +319,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
       settings: {
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         connections: [],
-        editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT
+        editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
+        failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
       },
       legacy: false
     }
@@ -290,7 +334,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         connections,
         defaultModel: normalizeModelRef(value.defaultModel),
-        editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount)
+        editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
+        failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter)
       },
       legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION
     }
@@ -314,7 +359,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
       defaultModel: legacyModel
         ? { connectionId: legacyConnection.id, modelId: legacyConnection.models[0].id }
         : undefined,
-      editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT
+      editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
+      failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
     },
     legacy: true
   }
@@ -395,6 +441,7 @@ const resolveModelsEndpoint = (settings: Pick<StoredConnection, 'protocol' | 'en
 const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
   defaultModel: settings.defaultModel,
   editAutoRetryCount: settings.editAutoRetryCount,
+  failureOutputAfter: settings.failureOutputAfter,
   connections: settings.connections.map(connection => ({
     ...connection,
     models: connection.models.map(model => ({ ...model })),
@@ -452,6 +499,9 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     outputTokensEstimated: typeof value.outputTokensEstimated === 'boolean' ? value.outputTokensEstimated : undefined,
     inputTokens: typeof value.inputTokens === 'number' ? value.inputTokens : undefined,
     inputTokensEstimated: typeof value.inputTokensEstimated === 'boolean' ? value.inputTokensEstimated : undefined,
+    failureCount: typeof value.failureCount === 'number' ? value.failureCount : undefined,
+    failureOutput: typeof value.failureOutput === 'string' ? value.failureOutput.slice(0, MAX_FAILURE_OUTPUT_CHARS) : undefined,
+    failureOutputTruncated: typeof value.failureOutputTruncated === 'boolean' ? value.failureOutputTruncated : undefined,
     failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'unknown'
       ? value.failureReason
       : undefined
@@ -509,6 +559,7 @@ const normalizeMessages = (messages: unknown): AiChatMessage[] => {
         : undefined
       return {
         ...item,
+        reasoning: typeof item.reasoning === 'string' ? item.reasoning : undefined,
         kind: item.kind === 'status' ? 'status' as const : undefined,
         progress: item.kind === 'status' ? normalizeProgress(item.progress) : undefined,
         revisionId: typeof item.revisionId === 'string' ? item.revisionId : undefined,
@@ -529,30 +580,58 @@ const normalizeChatSession = (value: unknown): AiChatSession => {
   }
 }
 
-const extractText = (payload: unknown): string => {
-  if (!isRecord(payload)) return ''
+const extractResponseContent = (
+  payload: unknown,
+  protocol: AiProtocol,
+  compatibility: ProviderReasoningCompatibility
+): { content: string; rawContent?: string; reasoning?: string } => {
+  if (!isRecord(payload)) return { content: '' }
+  if (protocol === 'anthropic-messages') {
+    const native = extractProviderContentParts(payload, protocol, compatibility)
+    if (native.content || native.reasoning) return native
+  }
   const choices = payload.choices
   if (Array.isArray(choices)) {
     const message = choices[0]
     if (isRecord(message) && isRecord(message.message)) {
       const content = message.message.content
-      if (typeof content === 'string') return content
+      const fieldReasoning = readReasoningField(message.message, compatibility.field)
+      if (typeof content === 'string') {
+        return normalizeProviderContent(content, fieldReasoning, compatibility)
+      }
       if (Array.isArray(content)) {
-        return content
-          .filter(isRecord)
-          .map((part) => (typeof part.text === 'string' ? part.text : ''))
-          .join('')
+        const visible: string[] = []
+        const reasoning: string[] = [fieldReasoning]
+        for (const part of content) {
+          if (!isRecord(part)) continue
+          if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'thinking') {
+            const text = typeof part.text === 'string' ? part.text : typeof part.content === 'string' ? part.content : ''
+            if (text) reasoning.push(text)
+          } else if (typeof part.text === 'string') {
+            visible.push(part.text)
+          }
+        }
+        return normalizeProviderContent(visible.join(''), reasoning.filter(Boolean).join('\n\n'), compatibility, 'native')
       }
     }
   }
   const content = payload.content
+  if (typeof content === 'string') return normalizeProviderContent(content, readReasoningField(payload, compatibility.field), compatibility)
   if (Array.isArray(content)) {
-    return content
-      .filter(isRecord)
-      .map((part) => (typeof part.text === 'string' ? part.text : ''))
-      .join('')
+    const visible: string[] = []
+    const reasoning: string[] = [readReasoningField(payload, compatibility.field)]
+    for (const part of content) {
+      if (!isRecord(part)) continue
+      if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'thinking') {
+        const text = typeof part.text === 'string' ? part.text : typeof part.content === 'string' ? part.content : ''
+        if (text) reasoning.push(text)
+      } else if (typeof part.text === 'string') {
+        visible.push(part.text)
+      }
+    }
+    return normalizeProviderContent(visible.join(''), reasoning.filter(Boolean).join('\n\n'), compatibility, 'native')
   }
-  return ''
+  return { content: '' }
 }
 
 const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean => {
@@ -755,6 +834,19 @@ export class AiService {
     })
   }
 
+  async setFailureOutputAfter(failureCount: number): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        failureOutputAfter: normalizeFailureOutputAfter(failureCount)
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('failure output threshold updated count=%s', settings.failureOutputAfter)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
   async testConnection(input: AiConnectionInput): Promise<AiTestResult> {
     connectionLog(
       'test start connectionId=%s protocol=%s endpoint=%s modelCount=%s',
@@ -855,6 +947,11 @@ export class AiService {
       throw new Error('Configure an AI endpoint and model first.')
     }
     const requestEndpoint = resolveRequestEndpoint(settings)
+    const compatibility: ProviderReasoningCompatibility = {
+      field: target.model.capabilities?.reasoningField,
+      tag: target.model.capabilities?.reasoningTag,
+      replay: target.model.capabilities?.replayReasoning
+    }
     const controller = new AbortController()
     const abortFromParent = () => controller.abort()
     if (signal) {
@@ -897,7 +994,12 @@ export class AiService {
             model,
             max_tokens: 4096,
             system: effectiveSystem,
-            messages: serializeProviderMessages(settings.protocol, messages),
+            messages: serializeProviderMessages(
+              settings.protocol,
+              messages,
+              undefined,
+              compatibility.replay
+            ),
             ...(streaming ? { stream: true } : {})
           }
           if (options.tool) {
@@ -912,7 +1014,14 @@ export class AiService {
           body = {
             model,
             max_tokens: 8192,
-            messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(settings.protocol, messages)],
+            messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(
+              settings.protocol,
+              messages,
+              compatibility.replay
+                ? compatibility.field ?? 'reasoning_content'
+                : undefined,
+              compatibility.replay
+            )],
             ...(streaming ? { stream: true } : {})
           }
           if (includeStreamUsage) body.stream_options = { include_usage: true }
@@ -951,7 +1060,7 @@ export class AiService {
         )
         if (response.ok && streaming && contentType.toLowerCase().includes('text/event-stream')) {
           if (!response.body) throw new Error('The provider returned an empty event stream.')
-          const streamed = await consumeProviderStream(settings.protocol, response.body, controller.signal, options.onProgress)
+          const streamed = await consumeProviderStream(settings.protocol, response.body, controller.signal, options.onProgress, compatibility)
           featureLog(
             'request body complete protocol=%s stream=true contentChars=%s outputTokens=%s outputTokensEstimated=%s elapsedMs=%s requestId=%s',
             settings.protocol,
@@ -1000,17 +1109,26 @@ export class AiService {
             : ''
           throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`, response.status, !!options.tool)
         }
-        const content = extractText(payload)
+        const extracted = extractResponseContent(payload, settings.protocol, compatibility)
+        const content = extracted.content
         const toolCalls = extractToolCalls(payload, settings.protocol)
         if (!content && !toolCalls.length) throw new Error('The provider returned no text content.')
         const usage = extractUsage(payload, settings.protocol)
         options.onProgress?.({
-          outputCharacters: content.length,
-          outputTokens: usage?.outputTokens ?? estimateTokenCount(content),
+          outputCharacters: content.length + (extracted.reasoning?.length ?? 0),
+          reasoningCharacters: extracted.reasoning?.length ?? 0,
+          outputTokens: usage?.outputTokens ?? estimateTokenCount(`${content}${extracted.reasoning ?? ''}`),
           usage,
           firstEvent: true
         })
-        return { content, toolCalls, usage, truncated: isTruncatedResponse(payload, settings.protocol) }
+        return {
+          content,
+          rawContent: extracted.rawContent ?? content,
+          reasoning: extracted.reasoning,
+          toolCalls,
+          usage,
+          truncated: isTruncatedResponse(payload, settings.protocol)
+        }
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
@@ -1091,7 +1209,7 @@ export class AiService {
   }
 
   private async hydrateProviderMessages(
-    messages: Array<{ role: 'user' | 'assistant'; content: string; attachments?: AiAttachment[] }>,
+    messages: Array<{ role: 'user' | 'assistant'; content: string; reasoning?: string; attachments?: AiAttachment[] }>,
     priorityAttachmentIds: ReadonlySet<string> = new Set(),
     renderedPdfPages: readonly AiRenderedPdfPages[] = []
   ): Promise<ProviderMessage[]> {
@@ -1182,6 +1300,7 @@ export class AiService {
     return messages.map((message, index) => ({
       role: message.role,
       content: message.content,
+      reasoning: message.reasoning,
       images: imagesByMessage.get(index),
       attachmentContext: attachmentContextByMessage.get(index)?.join('\n')
     }))
@@ -1204,6 +1323,7 @@ export class AiService {
     if (!inspection.issues.length) {
       return {
         content: normalized.content.trim(),
+        reasoning: generated.reasoning,
         recovery: {
           strategy: normalized.changes.length ? 'local-normalization' : 'direct',
           attempts: 1,
@@ -1218,7 +1338,7 @@ export class AiService {
         system,
         [
           ...messages,
-          { role: 'assistant', content: generated.content },
+          { role: 'assistant', content: generated.content, reasoning: generated.reasoning },
           { role: 'user', content: buildMarkdownFormatRepairPrompt(failure) }
         ],
         requestId,
@@ -1230,6 +1350,7 @@ export class AiService {
       if (repairedInspection.issues.length) throw new Error(repairedInspection.issues.map(issue => issue.message).join(' '))
       return {
         content: repairedNormalized.content.trim(),
+        reasoning: repaired.reasoning ?? generated.reasoning,
         recovery: {
           strategy: 'model-repair',
           attempts: 2,
@@ -1240,6 +1361,7 @@ export class AiService {
       if (!strict) {
         return {
           content: normalized.content.trim(),
+          reasoning: generated.reasoning,
           recovery: {
             strategy: normalized.changes.length ? 'local-normalization' : 'direct',
             attempts: 2,
@@ -1271,9 +1393,10 @@ export class AiService {
     const recentMessages = normalizeMessages(request.messages)
       .filter(message => message.kind !== 'status')
       .slice(-(request.mode === 'edit' ? MAX_EDIT_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES))
-      .map(({ role, mode, content, attachments }) => ({
+      .map(({ role, mode, content, reasoning, attachments }) => ({
         role,
         content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
+        reasoning,
         attachments
       }))
     let documentKind = 'unknown'
@@ -1293,6 +1416,9 @@ export class AiService {
     const requestStartedAt = Date.now()
     let lastAttempt = 1
     let lastFailureReason: AiFailureReason | undefined
+    let failureCount = 0
+    let lastFailureOutput: string | undefined
+    let lastFailureOutputTruncated = false
     let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming'> = {
       outputTokens: 0,
       outputTokensEstimated: true,
@@ -1301,10 +1427,10 @@ export class AiService {
     const emitProgress = (
       phase: AiProgressEvent['phase'],
       attempt: number,
-      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason'>> = {}
+      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated'>> = {}
     ): void => {
       lastAttempt = Math.max(lastAttempt, attempt)
-      const { failureReason, ...stats } = details
+      const { failureReason, failureCount: eventFailureCount, failureOutput, failureOutputTruncated, ...stats } = details
       if (failureReason) lastFailureReason = failureReason
       lastProgressStats = { ...lastProgressStats, ...stats }
       progressSink?.({
@@ -1314,8 +1440,18 @@ export class AiService {
         attempt,
         elapsedMs: Date.now() - requestStartedAt,
         ...lastProgressStats,
-        ...(failureReason ? { failureReason } : {})
+        ...(failureReason ? { failureReason } : {}),
+        ...(eventFailureCount !== undefined ? { failureCount: eventFailureCount } : {}),
+        ...(failureOutput !== undefined ? { failureOutput } : {}),
+        ...(failureOutputTruncated !== undefined ? { failureOutputTruncated } : {})
       })
+    }
+    const rememberProviderResponse = (response: ProviderResponse): void => {
+      const output = makeFailureOutput(response.rawContent, response.content, response.reasoning)
+      if (output.value) {
+        lastFailureOutput = output.value
+        lastFailureOutputTruncated = output.truncated
+      }
     }
     const makeProviderProgress = (attempt: number) => {
       let lastProgressAt = 0
@@ -1357,6 +1493,7 @@ export class AiService {
         undefined,
         { stream: true, attempt: 1, ...makeProviderProgress(1) }
       )
+      rememberProviderResponse(result)
       emitProgress('validating', 1, {
         outputTokens: result.usage?.outputTokens ?? estimateTokenCount(result.content),
         outputTokensEstimated: result.usage?.outputTokens === undefined,
@@ -1386,6 +1523,7 @@ export class AiService {
         requestId: request.requestId,
         mode: request.mode,
         content: repaired.content,
+        reasoning: repaired.reasoning,
         recovery: repaired.recovery,
         documentId: request.documentId,
         baseMarkdown: request.markdown,
@@ -1410,6 +1548,7 @@ export class AiService {
           controller.signal,
           { stream: true, attempt: 1, ...makeProviderProgress(1) }
         )
+        rememberProviderResponse(result)
         if (result.truncated) throw new Error('The model response was truncated before a complete document was returned.')
         emitProgress('validating', 1, {
           outputTokens: result.usage?.outputTokens ?? estimateTokenCount(result.content),
@@ -1441,6 +1580,7 @@ export class AiService {
           requestId: request.requestId,
           mode: request.mode,
           content: '',
+          reasoning: repaired.reasoning,
           markdown,
           recovery: repaired.recovery,
           documentId: request.documentId,
@@ -1475,8 +1615,9 @@ export class AiService {
                 ...makeProviderProgress(agentRequest.attempt ?? 1)
               }
             )
+            rememberProviderResponse(generated)
             this.toolCapabilities.set(capabilityKey, true)
-            return { content: generated.content, toolCalls: generated.toolCalls, truncated: generated.truncated }
+            return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, toolCalls: generated.toolCalls, truncated: generated.truncated }
           } catch (error) {
             if (error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)) {
               this.toolCapabilities.set(capabilityKey, false)
@@ -1503,7 +1644,8 @@ export class AiService {
               ...makeProviderProgress(agentRequest.attempt ?? 1)
             }
           )
-          return { content: generated.content, truncated: generated.truncated }
+          rememberProviderResponse(generated)
+          return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, truncated: generated.truncated }
         },
         generateWhole: async(agentRequest) => {
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
@@ -1519,7 +1661,8 @@ export class AiService {
               ...makeProviderProgress(agentRequest.attempt ?? 1)
             }
           )
-          return { content: generated.content, truncated: generated.truncated }
+          rememberProviderResponse(generated)
+          return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, truncated: generated.truncated }
         },
         onPhase: (phase, attempt) => {
           emitProgress(phase, attempt, {
@@ -1527,6 +1670,12 @@ export class AiService {
           })
         },
         onValidationFailure: diagnostic => {
+          failureCount += 1
+          const output = makeFailureOutput(diagnostic.response ?? '', diagnostic.response ?? '', diagnostic.reasoning)
+          if (output.value) {
+            lastFailureOutput = output.value
+            lastFailureOutputTruncated = output.truncated
+          }
           const failureReason: AiFailureReason = diagnostic.code === 'exact-match'
             ? 'exact-match'
             : diagnostic.code === 'truncated'
@@ -1562,6 +1711,7 @@ export class AiService {
         requestId: request.requestId,
         mode: request.mode,
         content: '',
+        reasoning: result.reasoning,
         summary: result.message,
         markdown: result.markdown,
         editSummary: result.summary,
@@ -1572,9 +1722,21 @@ export class AiService {
       }
     } catch (error) {
       const cancelled = error instanceof Error && /cancelled|canceled/i.test(error.message)
+      const exposeFailureOutput = !cancelled &&
+        state.settings.failureOutputAfter > 0 &&
+        failureCount >= state.settings.failureOutputAfter &&
+        !!lastFailureOutput
       emitProgress(cancelled ? 'cancelled' : 'failed', lastAttempt, {
         streaming: false,
-        ...(cancelled ? {} : { failureReason: lastFailureReason ?? 'provider' })
+        ...(cancelled
+          ? {}
+          : {
+            failureReason: lastFailureReason ?? 'provider',
+            failureCount,
+            ...(exposeFailureOutput
+              ? { failureOutput: lastFailureOutput, failureOutputTruncated: lastFailureOutputTruncated }
+              : {})
+          })
       })
       throw error
     } finally {
@@ -1768,6 +1930,11 @@ export const registerAiIpcHandlers = (userDataPath: string): void => {
   ipcMain.handle('mt::ai::get-settings', () => aiService.getSettings())
   ipcMain.handle('mt::ai::set-edit-retry-count', async(_event, retryCount: number) => {
     const saved = await aiService.setEditAutoRetryCount(retryCount)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-failure-output-after', async(_event, failureCount: number) => {
+    const saved = await aiService.setFailureOutputAfter(failureCount)
     broadcastSettings(saved)
     return saved
   })

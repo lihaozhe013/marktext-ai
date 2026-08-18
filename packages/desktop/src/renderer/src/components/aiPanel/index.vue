@@ -109,7 +109,22 @@
           />
           {{ progressLabel(message) }}
         </div>
-        <template v-else>
+        <details
+          v-if="message.kind === 'status' && message.progress?.failureOutput"
+          class="ai-failure-output"
+        >
+          <summary>{{ labels.failureOutputTitle }}</summary>
+          <pre>{{ message.progress.failureOutput }}</pre>
+          <small v-if="message.progress.failureOutputTruncated">{{ labels.failureOutputTruncated }}</small>
+          <button
+            class="secondary-button ai-copy-failure"
+            type="button"
+            @click="copyFailureOutput(message)"
+          >
+            {{ copiedFailureId === message.id ? labels.copied : labels.copyFailureOutput }}
+          </button>
+        </details>
+        <template v-else-if="message.kind !== 'status'">
           <div class="ai-message-role">
             {{ message.role === 'user' ? labels.you : labels.ai }}
           </div>
@@ -125,6 +140,13 @@
           >
             {{ message.content }}
           </div>
+          <details
+            v-if="message.reasoning"
+            class="ai-message-reasoning"
+          >
+            <summary>{{ labels.modelReasoning }}</summary>
+            <div>{{ message.reasoning }}</div>
+          </details>
           <div
             v-if="message.attachments?.length"
             class="ai-message-attachments"
@@ -386,6 +408,7 @@ const { currentDocumentId } = storeToRefs(ai)
 const panelElement = ref<HTMLElement | null>(null)
 const draft = ref('')
 const dragOver = ref(false)
+const copiedFailureId = ref('')
 const resizing = ref(false)
 const resizeStartX = ref(0)
 const resizeStartWidth = ref(380)
@@ -409,6 +432,11 @@ const labels = computed(() => chinese.value
       empty: '在这里开始与当前文档对话。',
       you: '你',
       ai: 'AI',
+      failureOutputTitle: '查看模型原始输出（调试）',
+      copyFailureOutput: '复制原始输出',
+      copied: '已复制',
+      failureOutputTruncated: '输出过长，已截断显示。',
+      modelReasoning: '模型思考（仅供参考）',
       placeholder: '输入问题或编辑指令…',
       attachHint: '粘贴或拖入图片或 PDF，也可点击选择',
       attachmentPrivacy: '附件会发送到当前配置的 AI 服务。',
@@ -457,6 +485,11 @@ const labels = computed(() => chinese.value
       empty: 'Start a conversation about the current document.',
       you: 'You',
       ai: 'AI',
+      failureOutputTitle: 'View raw model output (debug)',
+      copyFailureOutput: 'Copy raw output',
+      copied: 'Copied',
+      failureOutputTruncated: 'The output was too long and has been truncated.',
+      modelReasoning: 'Model reasoning (informational)',
       placeholder: 'Ask a question or describe an edit…',
       attachHint: 'Paste, drop, or choose images or PDFs',
       attachmentPrivacy: 'Attachments are sent to the configured AI service.',
@@ -648,6 +681,27 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
 const currentProgressLabel = computed(() => ai.loading && ai.liveProgress
   ? liveProgressLabel(ai.liveProgress, ai.liveProgressElapsedMs)
   : progressLabelFor(ai.currentProgress))
+
+const copyFailureOutput = async (message: AiChatMessage): Promise<void> => {
+  const output = message.progress?.failureOutput
+  if (!output) return
+  try {
+    await navigator.clipboard.writeText(output)
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = output
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    textarea.remove()
+  }
+  copiedFailureId.value = message.id
+  window.setTimeout(() => {
+    if (copiedFailureId.value === message.id) copiedFailureId.value = ''
+  }, 1600)
+}
 
 const send = (): void => {
   const value = draft.value.trim()
@@ -890,6 +944,14 @@ onUnmounted(() => {
 .ai-message-model { margin: -2px 0 6px; color: var(--editorColor50); font-size: 10px; }
 .ai-edit-summary { color: var(--editorColor80); font-size: 13px; line-height: 1.4; }
 .ai-message-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.45; }
+.ai-message-reasoning { margin-top: 8px; color: var(--editorColor50); font-size: 11px; line-height: 1.4; }
+.ai-message-reasoning summary { cursor: pointer; color: var(--editorColor60); }
+.ai-message-reasoning div { max-height: 220px; margin-top: 5px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-failure-output { margin-top: 7px; color: var(--editorColor60); font-size: 11px; }
+.ai-failure-output summary { cursor: pointer; }
+.ai-failure-output pre { max-height: 280px; margin: 6px 0; padding: 7px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--editorColor); background: var(--editorColor10); font: 11px/1.35 monospace; }
+.ai-failure-output small { display: block; margin-bottom: 5px; color: var(--editorColor50); }
+.ai-copy-failure { margin-top: 3px; }
 .ai-message-attachments, .ai-pending-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
 .ai-attachment-chip, .ai-pending-attachment { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; box-sizing: border-box; padding: 4px 7px; border: 1px solid var(--editorColor20); border-radius: 5px; color: var(--editorColor70); background: var(--editorColor05, transparent); font-size: 11px; overflow: hidden; }
 .ai-attachment-name { min-width: 0; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

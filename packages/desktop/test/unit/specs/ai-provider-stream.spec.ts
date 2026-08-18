@@ -33,6 +33,37 @@ describe('provider response streams', () => {
     expect(progress).toContain(11)
   })
 
+  it('separates OpenAI reasoning fields from content', async() => {
+    const result = await consumeProviderStream(
+      'openai-chat-completions',
+      streamFrom([
+        'data: {"choices":[{"delta":{"reasoning_content":"Plan first.","content":"Done"}}]}\n\n',
+        'data: [DONE]\n\n'
+      ]),
+      undefined,
+      undefined,
+      { field: 'reasoning_content' }
+    )
+
+    expect(result.content).toBe('Done')
+    expect(result.reasoning).toBe('Plan first.')
+  })
+
+  it('filters think tags split across streamed content chunks', async() => {
+    const result = await consumeProviderStream(
+      'openai-chat-completions',
+      streamFrom([
+        'data: {"choices":[{"delta":{"content":"<thi"}}]}\n\n',
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'nk>Plan</think>\n# Done' } }] })}\n\n`,
+        'data: [DONE]\n\n'
+      ]),
+      undefined
+    )
+
+    expect(result.content).toBe('\n# Done')
+    expect(result.reasoning).toBe('Plan')
+  })
+
   it('assembles OpenAI tool-call argument deltas', async() => {
     const result = await consumeProviderStream(
       'openai-chat-completions',
@@ -70,6 +101,22 @@ describe('provider response streams', () => {
       input: { status: 'no_changes', summary: 'No change', edits: [] }
     }])
     expect(result.usage).toEqual({ inputTokens: 20, outputTokens: 7 })
+  })
+
+  it('separates Anthropic thinking blocks from text', async() => {
+    const result = await consumeProviderStream(
+      'anthropic-messages',
+      streamFrom([
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Done"}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ]),
+      undefined
+    )
+
+    expect(result.content).toBe('Done')
+    expect(result.reasoning).toBe('Plan')
   })
 
   it('stops promptly when the signal is aborted', async() => {
