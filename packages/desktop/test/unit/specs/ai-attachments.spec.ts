@@ -7,6 +7,8 @@ import {
   normalizeImageAttachment,
   normalizeImageUpload,
   normalizeImageUploads,
+  normalizePdfAttachment,
+  normalizePdfUpload,
   orderAttachmentLocations
 } from 'main_renderer/ai/attachments'
 
@@ -17,6 +19,11 @@ const png = (size = 8): Uint8Array => {
 }
 
 const bytes = (...values: number[]): Uint8Array => new Uint8Array(values)
+const pdf = (size = 5): Uint8Array => {
+  const data = new Uint8Array(Math.max(size, 5))
+  data.set([0x25, 0x50, 0x44, 0x46, 0x2d])
+  return data
+}
 
 const upload = (id = 'attachment-test-0001'): Record<string, unknown> => ({
   id,
@@ -71,6 +78,28 @@ describe('AI image attachment validation and storage', () => {
     expect(() => normalizeImageUploads(new Array(11).fill(null).map((_, index) => upload(`attachment-test-${String(index).padStart(4, '0')}`)))).toThrow(/10 images/i)
   })
 
+  it('validates PDF metadata and file signatures', () => {
+    const value = {
+      id: 'attachment-pdf-0001',
+      name: '../report.pdf',
+      mimeType: 'application/pdf',
+      byteSize: pdf().byteLength,
+      data: pdf(),
+      pages: [1, 3, 3]
+    }
+    expect(normalizePdfAttachment(value)).toEqual({
+      id: 'attachment-pdf-0001',
+      name: '.._report.pdf',
+      mimeType: 'application/pdf',
+      byteSize: 5,
+      pages: [1, 3]
+    })
+    expect(normalizePdfUpload(value).mimeType).toBe('application/pdf')
+    expect(() => normalizePdfUpload({ ...value, data: bytes(1, 2, 3, 4, 5) })).toThrow(/PDF data/i)
+    expect(() => normalizePdfAttachment({ ...value, id: '../escape' })).toThrow()
+    expect(() => normalizePdfAttachment({ ...value, pages: Array.from({ length: 11 }, (_, index) => index + 1) })).toThrow(/10 pages/i)
+  })
+
   it('stores, reads, and prunes only validated orphan files', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-attachments-'))
     try {
@@ -87,6 +116,29 @@ describe('AI image attachment validation and storage', () => {
       await utimes(storedPath, new Date(0), new Date(0))
       await store.prune(new Set(['attachment-test-0001']), 0)
       expect((await readdir(path.dirname(storedPath))).length).toBe(1)
+      await store.prune(new Set(), 0)
+      await expect(readFile(storedPath)).rejects.toThrow()
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('stores, reads, and prunes PDF attachments', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-pdf-attachments-'))
+    try {
+      const store = new AiAttachmentStore(directory)
+      const upload = normalizePdfUpload({
+        id: 'attachment-pdf-0001',
+        name: 'report.pdf',
+        mimeType: 'application/pdf',
+        data: pdf()
+      })
+      const saved = await store.save([upload])
+      expect(saved[0]).toMatchObject({ id: 'attachment-pdf-0001', mimeType: 'application/pdf' })
+      const storedPath = path.join(directory, 'ai-attachments', 'attachment-pdf-0001.pdf')
+      expect(new Uint8Array(await readFile(storedPath))).toEqual(pdf())
+      expect(await store.read('attachment-pdf-0001', 'application/pdf')).toEqual({ mimeType: 'application/pdf', data: pdf() })
+      await utimes(storedPath, new Date(0), new Date(0))
       await store.prune(new Set(), 0)
       await expect(readFile(storedPath)).rejects.toThrow()
     } finally {

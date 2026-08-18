@@ -53,4 +53,42 @@ describe('AI provider image message serialization', () => {
       }
     ])
   })
+
+  it('serializes rendered PDF pages as images for both providers', () => {
+    const result = serializeProviderMessages('openai-chat-completions', [{
+      role: 'user',
+      content: 'Read these PDF pages.',
+      images: [
+        { mimeType: 'image/png', data: 'cGFnZS0x' },
+        { mimeType: 'image/png', data: 'cGFnZS0y' }
+      ]
+    }])
+    expect(result[0]).toMatchObject({
+      content: [
+        { type: 'image_url' },
+        { type: 'image_url' },
+        { type: 'text', text: 'Read these PDF pages.' }
+      ]
+    })
+    expect(JSON.stringify(result)).not.toMatch(/file_data|input_file|application\/pdf/)
+    expect(serializeProviderMessages('anthropic-messages', [{
+      role: 'user',
+      content: 'Read these PDF pages.',
+      images: [{ mimeType: 'image/png', data: 'cGFnZS0x' }]
+    }])).toMatchObject([{
+      content: [{ type: 'image' }, { type: 'text', text: 'Read these PDF pages.' }]
+    }])
+  })
+
+  it('places rendered PDF context before the user text', () => {
+    const result = serializeProviderMessages('openai-chat-completions', [{
+      role: 'user',
+      content: 'Summarize the document.',
+      attachmentContext: 'These images are rendered pages from report.pdf. Selected pages, in order: 1, 3.'
+    }])
+    expect(result).toEqual([{
+      role: 'user',
+      content: 'These images are rendered pages from report.pdf. Selected pages, in order: 1, 3.\n\nSummarize the document.'
+    }])
+  })
 })

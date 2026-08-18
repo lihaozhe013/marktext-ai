@@ -164,6 +164,181 @@ describe('AI connection profiles and model routing', () => {
     expect(body).not.toHaveProperty('budget_tokens')
   })
 
+  it('sends locally rendered PDF pages as OpenAI image parts', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-pdf-request-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'pdf-model', 'openai-key'))
+    const fetchMock = vi.fn().mockResolvedValue(response({ choices: [{ message: { content: 'PDF answer' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const pdfData = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37])
+    const pageData = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+    await service.request({
+      requestId: 'pdf-request',
+      documentId: 'tab:pdf',
+      mode: 'answer',
+      prompt: 'Summarize the PDF.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id },
+      attachments: [{
+        id: 'attachment-pdf-0001',
+        name: 'report.pdf',
+        mimeType: 'application/pdf',
+        byteSize: pdfData.byteLength,
+        data: pdfData,
+        pages: [1]
+      }],
+      renderedPdfPages: [{
+        attachmentId: 'attachment-pdf-0001',
+        pageNumbers: [1],
+        pages: [{
+          id: 'attachment-page-0001',
+          name: 'report.pdf page 1',
+          mimeType: 'image/png',
+          byteSize: pageData.byteLength,
+          data: pageData
+        }]
+      }]
+    })
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.messages[0].content).toContain('rendered pages from a PDF attachment')
+    expect(body.messages[1].content[1].text).toContain('Selected pages, in order: 1')
+    expect(body.messages[1].content).toEqual([
+      expect.objectContaining({ type: 'image_url', image_url: expect.objectContaining({ url: `data:image/png;base64,${Buffer.from(pageData).toString('base64')}` }) }),
+      expect.objectContaining({ type: 'text' })
+    ])
+    expect(JSON.stringify(body)).not.toMatch(/file_data|input_file|application\/pdf/)
+    await service.saveChat('tab:pdf', {
+      messages: [{
+        id: 'message-pdf-0001',
+        role: 'user',
+        mode: 'answer',
+        content: 'Summarize the PDF.',
+        createdAt: 1,
+        attachments: [{
+          id: 'attachment-pdf-0001',
+          name: 'report.pdf',
+          mimeType: 'application/pdf',
+          byteSize: pdfData.byteLength,
+          pages: [1]
+        }]
+      }]
+    })
+    const storedChat = await readFile(path.join(directory, 'ai-chat.json'), 'utf8').catch(() => '')
+    expect(storedChat).not.toContain(Buffer.from(pdfData).toString('base64'))
+    expect(JSON.parse(storedChat)['tab:pdf'].messages[0].attachments[0]).toMatchObject({
+      name: 'report.pdf',
+      mimeType: 'application/pdf',
+      pages: [1]
+    })
+  })
+
+  it('persists progress entries without sending them to the model', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-progress-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'progress-model', 'openai-key'))
+    const fetchMock = vi.fn().mockResolvedValue(response({ choices: [{ message: { content: 'Done' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await service.request({
+      requestId: 'progress-request',
+      documentId: 'tab:progress',
+      mode: 'answer',
+      prompt: 'Read the document.',
+      markdown: '# Document',
+      messages: [{
+        id: 'progress-status',
+        role: 'assistant',
+        mode: 'answer',
+        content: '',
+        createdAt: 1,
+        kind: 'status',
+        progress: { phase: 'waiting' }
+      }, {
+        id: 'prior-user',
+        role: 'user',
+        mode: 'answer',
+        content: 'Earlier question',
+        createdAt: 2
+      }],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.messages).toHaveLength(3)
+    expect(JSON.stringify(body)).not.toContain('progress-status')
+    await service.saveChat('tab:progress', {
+      messages: [{
+        id: 'progress-status',
+        role: 'assistant',
+        mode: 'answer',
+        content: '',
+        createdAt: 1,
+        kind: 'status',
+        progress: { phase: 'waiting' }
+      }]
+    })
+    expect((await service.loadChat('tab:progress')).messages[0].progress).toEqual({ phase: 'waiting' })
+  })
+
+  it('sends rendered PDF pages to Anthropic as images', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-anthropic-pdf-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Anthropic',
+      protocol: 'anthropic-messages',
+      endpoint: 'https://anthropic.example',
+      models: [{ model: 'claude-model', label: 'Claude' }],
+      apiKey: 'anthropic-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      content: [{ type: 'text', text: 'PDF answer' }],
+      stop_reason: 'end_turn'
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pageData = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    await service.request({
+      requestId: 'anthropic-pdf-request',
+      documentId: 'tab:anthropic-pdf',
+      mode: 'answer',
+      prompt: 'Read the PDF.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id },
+      attachments: [{
+        id: 'attachment-pdf-0002',
+        name: 'report.pdf',
+        mimeType: 'application/pdf',
+        byteSize: 5,
+        data: new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]),
+        pages: [1]
+      }],
+      renderedPdfPages: [{
+        attachmentId: 'attachment-pdf-0002',
+        pageNumbers: [1],
+        pages: [{
+          id: 'attachment-page-0002',
+          name: 'report.pdf page 1',
+          mimeType: 'image/png',
+          byteSize: pageData.byteLength,
+          data: pageData
+        }]
+      }]
+    })
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.system).toContain('rendered pages from a PDF attachment')
+    expect(body.messages[0].content).toEqual([
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: Buffer.from(pageData).toString('base64') } },
+      expect.objectContaining({ type: 'text' })
+    ])
+  })
+
   it('loads legacy chat arrays and saves selected model metadata', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-chat-migration-'))
     directories.push(directory)

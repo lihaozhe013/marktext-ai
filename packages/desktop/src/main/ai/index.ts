@@ -6,28 +6,34 @@ import log from 'electron-log'
 import type {
   AiChatMessage,
   AiChatSession,
+  AiAttachment,
+  AiAttachmentData,
   AiConnectionInput,
   AiDiscoveredModel,
   AiEditSummary,
-  AiImageAttachment,
-  AiImageMimeType,
   AiMessageModel,
   AiModelListInput,
   AiModelProfile,
   AiModelRef,
   AiProtocol,
+  AiProgressPhase,
   AiRecoveryInfo,
   AiPreparedRevision,
   AiRequest,
+  AiRenderedPdfPages,
   AiResponse,
   AiRevisionRequest,
   AiSettings,
   AiTestResult,
   AiUndoResult
 } from '@shared/types/ai'
-import { AI_MAX_IMAGE_BYTES, AI_MAX_IMAGE_COUNT, AI_MAX_IMAGE_TOTAL_BYTES } from '@shared/types/ai'
+import {
+  AI_MAX_IMAGE_BYTES,
+  AI_MAX_IMAGE_COUNT,
+  AI_MAX_IMAGE_TOTAL_BYTES
+} from '@shared/types/ai'
 import { runDocumentEditAgent } from './documentEditAgent'
-import { AiAttachmentStore, normalizeImageAttachment, normalizeImageUploads, orderAttachmentLocations } from './attachments'
+import { AiAttachmentStore, normalizeAttachmentUploads, normalizeImageAttachment, normalizeImageUpload, normalizePdfAttachment, orderAttachmentLocations } from './attachments'
 import { preciseEditTool, serializeProviderMessages, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition } from './providerMessages'
 import {
   buildAnswerSystemPrompt,
@@ -38,7 +44,8 @@ import {
   connectionTestUserPrompt,
   makePromptToken,
   previousPreciseEditContextMessage,
-  previousRewriteContextMessage
+  previousRewriteContextMessage,
+  renderedPdfImageRules
 } from './prompts'
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
 
@@ -50,6 +57,7 @@ const CHAT_FILE = 'ai-chat.json'
 const REVISION_FILE = 'ai-revisions.json'
 const ANTHROPIC_VERSION = '2023-06-01'
 const MAX_CONTEXT_MESSAGES = 10
+const MAX_STORED_CHAT_MESSAGES = 100
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
 
@@ -123,13 +131,15 @@ const connectionLog = (message: string, ...args: unknown[]): void => {
   log.info(`[ai-connection] ${message}`, ...args)
 }
 
-const normalizeAttachmentList = (value: unknown): AiImageAttachment[] | undefined => {
+const normalizeAttachmentList = (value: unknown): AiAttachment[] | undefined => {
   if (!Array.isArray(value)) return undefined
-  const attachments: AiImageAttachment[] = []
+  const attachments: AiAttachment[] = []
   const ids = new Set<string>()
   for (const item of value.slice(0, AI_MAX_IMAGE_COUNT)) {
     try {
-      const attachment = normalizeImageAttachment(item)
+      const attachment = isRecord(item) && item.mimeType === 'application/pdf'
+        ? normalizePdfAttachment(item)
+        : normalizeImageAttachment(item)
       if (ids.has(attachment.id)) continue
       ids.add(attachment.id)
       attachments.push(attachment)
@@ -386,6 +396,28 @@ const normalizeMessageModel = (value: unknown): AiMessageModel | undefined => {
   }
 }
 
+const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefined => {
+  if (!isRecord(value)) return undefined
+  const phases: AiProgressPhase[] = [
+    'pdf-rendering',
+    'pdf-rendered',
+    'sending',
+    'sent',
+    'waiting',
+    'responded',
+    'local-processing',
+    'completed',
+    'failed',
+    'cancelled'
+  ]
+  if (!phases.includes(value.phase as AiProgressPhase)) return undefined
+  return {
+    phase: value.phase as AiProgressPhase,
+    current: typeof value.current === 'number' ? value.current : undefined,
+    total: typeof value.total === 'number' ? value.total : undefined
+  }
+}
+
 const normalizeMessages = (messages: unknown): AiChatMessage[] => {
   if (!Array.isArray(messages)) return []
   return messages
@@ -437,13 +469,15 @@ const normalizeMessages = (messages: unknown): AiChatMessage[] => {
         : undefined
       return {
         ...item,
+        kind: item.kind === 'status' ? 'status' as const : undefined,
+        progress: item.kind === 'status' ? normalizeProgress(item.progress) : undefined,
         revisionId: typeof item.revisionId === 'string' ? item.revisionId : undefined,
         editSummary,
         attachments: normalizeAttachmentList(item.attachments),
         model: normalizeMessageModel(item.model)
       }
     })
-    .slice(-MAX_CONTEXT_MESSAGES)
+    .slice(-MAX_STORED_CHAT_MESSAGES)
 }
 
 const normalizeChatSession = (value: unknown): AiChatSession => {
@@ -497,7 +531,7 @@ export class AiService {
   private readonly attachmentStore: AiAttachmentStore
   private readonly pendingAttachmentIds = new Map<string, number>()
   private readonly pendingAttachmentDocuments = new Map<string, string>()
-  private readonly attachmentMimeTypes = new Map<string, AiImageMimeType>()
+  private readonly attachmentMimeTypes = new Map<string, AiAttachment['mimeType']>()
   private readonly controllers = new Map<string, AbortController>()
   private readonly toolCapabilities = new Map<string, boolean>()
   private settingsMutation: Promise<void> = Promise.resolve()
@@ -774,11 +808,14 @@ export class AiService {
         'content-type': 'application/json'
       }
       let body: Record<string, unknown>
+      const effectiveSystem = messages.some(message => !!message.attachmentContext)
+        ? `${system}\n${renderedPdfImageRules}`
+        : system
       if (settings.protocol === 'anthropic-messages') {
         headers['x-api-key'] = apiKey
         headers['api-key'] = apiKey
         headers['anthropic-version'] = ANTHROPIC_VERSION
-        body = { model, max_tokens: 4096, system, messages: serializeProviderMessages(settings.protocol, messages) }
+        body = { model, max_tokens: 4096, system: effectiveSystem, messages: serializeProviderMessages(settings.protocol, messages) }
         if (options.tool) {
           body.tools = [{ name: options.tool.name, description: options.tool.description, input_schema: options.tool.parameters }]
           body.tool_choice = { type: 'tool', name: options.tool.name }
@@ -788,7 +825,7 @@ export class AiService {
         // Some OpenAI-compatible gateways, including MiMo Token Plan, document
         // `api-key` instead of the standard Authorization header.
         headers['api-key'] = apiKey
-        body = { model, messages: [{ role: 'system', content: system }, ...serializeProviderMessages(settings.protocol, messages)] }
+        body = { model, messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(settings.protocol, messages)] }
         if (options.tool) {
           body.tools = [{ type: 'function', function: { name: options.tool.name, description: options.tool.description, parameters: options.tool.parameters } }]
           body.tool_choice = { type: 'function', function: { name: options.tool.name } }
@@ -820,10 +857,10 @@ export class AiService {
         const providerMessage = isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === 'string'
           ? payload.error.message
           : `Provider returned HTTP ${response.status}.`
-        const visionHint = messages.some(message => !!message.images?.length)
+        const attachmentHint = messages.some(message => !!message.images?.length)
           ? ' The configured model or endpoint may not support image input.'
           : ''
-        throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${visionHint}`, response.status, !!options.tool)
+        throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`, response.status, !!options.tool)
       }
       const content = extractText(payload)
       const toolCalls = extractToolCalls(payload, settings.protocol)
@@ -843,8 +880,8 @@ export class AiService {
         )
         throw new Error('AI request was cancelled.')
       }
-      const hasImages = messages.some(message => !!message.images?.length)
-      if (hasImages) {
+      const hasAttachments = messages.some(message => !!message.images?.length)
+      if (hasAttachments) {
         featureLog(
           'request error name=%s protocol=%s requestId=%s',
           error instanceof Error ? error.name : 'unknown',
@@ -888,8 +925,8 @@ export class AiService {
     await this.attachmentStore.prune(referenced, graceMs)
   }
 
-  private async saveRequestAttachments(uploads: unknown, documentId: string): Promise<AiImageAttachment[]> {
-    const normalized = normalizeImageUploads(uploads)
+  private async saveRequestAttachments(uploads: unknown, documentId: string): Promise<AiAttachment[]> {
+    const normalized = normalizeAttachmentUploads(uploads)
     if (!normalized.length) return []
     const saved = await this.attachmentStore.save(normalized)
     const expiresAt = Date.now() + ATTACHMENT_GRACE_MS
@@ -899,59 +936,108 @@ export class AiService {
       this.attachmentMimeTypes.set(attachment.id, attachment.mimeType)
     }
     featureLog(
-      'request attachments saved count=%s bytes=%s',
+      'request attachments saved count=%s bytes=%s types=%s',
       saved.length,
-      saved.reduce((total, attachment) => total + attachment.byteSize, 0)
+      saved.reduce((total, attachment) => total + attachment.byteSize, 0),
+      Array.from(new Set(saved.map(attachment => attachment.mimeType === 'application/pdf' ? 'pdf' : 'image'))).sort().join('+') || 'none'
     )
     return saved
   }
 
   private async hydrateProviderMessages(
-    messages: Array<{ role: 'user' | 'assistant'; content: string; attachments?: AiImageAttachment[] }>,
-    priorityAttachmentIds: ReadonlySet<string> = new Set()
+    messages: Array<{ role: 'user' | 'assistant'; content: string; attachments?: AiAttachment[] }>,
+    priorityAttachmentIds: ReadonlySet<string> = new Set(),
+    renderedPdfPages: readonly AiRenderedPdfPages[] = []
   ): Promise<ProviderMessage[]> {
     const imagesByMessage = new Map<number, ProviderImage[]>()
+    const attachmentContextByMessage = new Map<number, string[]>()
+    const renderedPdfPagesById = new Map(renderedPdfPages.map(item => [item.attachmentId, item]))
     const selected = new Set<string>()
-    let imageCount = 0
+    let attachmentCount = 0
     let totalBytes = 0
     const addAttachment = async(
       index: number,
-      attachment: AiImageAttachment,
+      attachment: AiAttachment,
       required: boolean
     ): Promise<void> => {
       if (selected.has(attachment.id)) return
-      if (imageCount >= AI_MAX_IMAGE_COUNT || totalBytes + attachment.byteSize > AI_MAX_IMAGE_TOTAL_BYTES) {
-        if (required) throw new Error('The selected images exceed the image context limit.')
-        return
-      }
       try {
+        if (attachment.mimeType === 'application/pdf') {
+          const prepared = renderedPdfPagesById.get(attachment.id)
+          if (!prepared) {
+            if (required) throw new Error('The current PDF pages could not be prepared.')
+            return
+          }
+          const pages = prepared.pages.map(page => normalizeImageUpload(page))
+          const pageNumbers = [...prepared.pageNumbers].sort((a, b) => a - b)
+          const selectedPages = [...(attachment.pages ?? pageNumbers)].sort((a, b) => a - b)
+          if (
+            pages.length !== pageNumbers.length ||
+            pageNumbers.length !== selectedPages.length ||
+            pageNumbers.some((page, index) => page !== selectedPages[index])
+          ) {
+            throw new Error('The rendered PDF pages do not match the selected pages.')
+          }
+          const pageBytes = pages.reduce((total, page) => total + page.byteSize, 0)
+          if (
+            !pages.length ||
+            attachmentCount + pages.length > AI_MAX_IMAGE_COUNT ||
+            totalBytes + pageBytes > AI_MAX_IMAGE_TOTAL_BYTES
+          ) {
+            if (required) throw new Error('The selected attachments exceed the attachment context limit.')
+            return
+          }
+          selected.add(attachment.id)
+          attachmentCount += pages.length
+          totalBytes += pageBytes
+          const images = imagesByMessage.get(index) ?? []
+          images.push(...pages.map(page => ({
+            mimeType: page.mimeType,
+            data: Buffer.from(page.data).toString('base64')
+          })))
+          imagesByMessage.set(index, images)
+          const contexts = attachmentContextByMessage.get(index) ?? []
+          contexts.push(`The following images are rendered pages from the PDF attachment "${attachment.name}". Selected pages, in order: ${pageNumbers.join(', ')}. Treat these images as one document and do not infer content from unshown pages.`)
+          attachmentContextByMessage.set(index, contexts)
+          return
+        }
+        if (
+          attachmentCount >= AI_MAX_IMAGE_COUNT ||
+          totalBytes + attachment.byteSize > AI_MAX_IMAGE_TOTAL_BYTES
+        ) {
+          if (required) throw new Error('The selected attachments exceed the attachment context limit.')
+          return
+        }
         const stored = await this.attachmentStore.read(attachment.id, attachment.mimeType)
-        if (stored.data.byteLength > AI_MAX_IMAGE_BYTES) throw new Error('Image is too large.')
+        if (stored.data.byteLength > AI_MAX_IMAGE_BYTES) {
+          throw new Error('Image is too large.')
+        }
         if (totalBytes + stored.data.byteLength > AI_MAX_IMAGE_TOTAL_BYTES) {
-          if (required) throw new Error('The selected images exceed the image context limit.')
+          if (required) throw new Error('The selected attachments exceed the attachment context limit.')
           return
         }
         selected.add(attachment.id)
-        imageCount += 1
+        attachmentCount += 1
         totalBytes += stored.data.byteLength
         const images = imagesByMessage.get(index) ?? []
         images.push({ mimeType: stored.mimeType, data: Buffer.from(stored.data).toString('base64') })
         imagesByMessage.set(index, images)
       } catch (error) {
-        if (required) throw new Error(`The current image attachment could not be read. ${error instanceof Error ? error.message : String(error)}`)
-        featureLog('historical image attachment skipped reason=%s', error instanceof Error ? error.message : String(error))
+        if (required) throw new Error(`The current attachment could not be read. ${error instanceof Error ? error.message : String(error)}`)
+        featureLog('historical attachment skipped reason=%s', error instanceof Error ? error.message : String(error))
       }
     }
 
     const ordered = orderAttachmentLocations(messages, priorityAttachmentIds)
-    if (ordered.missing.length) throw new Error('The current image attachment was not found.')
+    if (ordered.missing.length) throw new Error('The current attachment was not found.')
     for (const location of ordered.locations) {
       await addAttachment(location.index, location.attachment, location.required)
     }
     return messages.map((message, index) => ({
       role: message.role,
       content: message.content,
-      images: imagesByMessage.get(index)
+      images: imagesByMessage.get(index),
+      attachmentContext: attachmentContextByMessage.get(index)?.join('\n')
     }))
   }
 
@@ -1018,12 +1104,12 @@ export class AiService {
     }
   }
 
-  async readAttachment(documentId: string, attachmentId: string): Promise<{ mimeType: AiImageMimeType; data: Uint8Array }> {
+  async readAttachment(documentId: string, attachmentId: string): Promise<AiAttachmentData> {
     const all = await readJson<Record<string, unknown>>(this.chatPath, {})
     const messages = normalizeChatSession(all[documentId]).messages
     const metadata = messages.flatMap(message => message.attachments ?? []).find(attachment => attachment.id === attachmentId)
     const mimeType = metadata?.mimeType ?? this.attachmentMimeTypes.get(attachmentId)
-    if (!mimeType) throw new Error('Image attachment was not found.')
+    if (!mimeType) throw new Error('Attachment was not found.')
     return this.attachmentStore.read(attachmentId, mimeType)
   }
 
@@ -1034,22 +1120,26 @@ export class AiService {
     const settings = target.connection
     const currentAttachments = await this.saveRequestAttachments(request.attachments, request.documentId)
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))
-    const recentMessages = normalizeMessages(request.messages).map(({ role, mode, content, attachments }) => ({
-      role,
-      content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
-      attachments
-    }))
+    const recentMessages = normalizeMessages(request.messages)
+      .filter(message => message.kind !== 'status')
+      .slice(-MAX_CONTEXT_MESSAGES)
+      .map(({ role, mode, content, attachments }) => ({
+        role,
+        content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
+        attachments
+      }))
     let documentKind = 'unknown'
     if (request.documentId.startsWith('path:')) documentKind = 'path'
     else if (request.documentId.startsWith('tab:')) documentKind = 'tab'
     featureLog(
-      'request input mode=%s documentKind=%s markdownChars=%s contextMessages=%s imageCount=%s imageBytes=%s requestId=%s',
+      'request input mode=%s documentKind=%s markdownChars=%s contextMessages=%s attachmentCount=%s attachmentBytes=%s renderedPdfPageCount=%s requestId=%s',
       request.mode,
       documentKind,
       request.markdown.length,
       recentMessages.length,
       currentAttachments.length,
       currentAttachments.reduce((total, attachment) => total + attachment.byteSize, 0),
+      request.renderedPdfPages?.reduce((total, item) => total + item.pages.length, 0) ?? 0,
       request.requestId
     )
     if (request.mode === 'answer') {
@@ -1057,7 +1147,7 @@ export class AiService {
       const messages = await this.hydrateProviderMessages([
         ...recentMessages,
         { role: 'user', content: buildDocumentPrompt(request.prompt, request.markdown, promptToken), attachments: currentAttachments }
-      ], priorityAttachmentIds)
+      ], priorityAttachmentIds, request.renderedPdfPages)
       const result = await this.requestProvider(
         target,
         buildAnswerSystemPrompt(promptToken),
@@ -1099,7 +1189,7 @@ export class AiService {
         const messages = await this.hydrateProviderMessages([
           ...recentMessages,
           { role: 'user', content: buildDocumentPrompt(request.prompt, request.markdown, promptToken), attachments: currentAttachments }
-        ], priorityAttachmentIds)
+        ], priorityAttachmentIds, request.renderedPdfPages)
         const result = await this.requestProvider(
           target,
           buildRewriteSystemPrompt(promptToken),
@@ -1143,10 +1233,12 @@ export class AiService {
         contextMessages: recentMessages,
         attachments: currentAttachments,
         generateTool: async(agentRequest) => {
-          const hasImages = agentRequest.messages.some(message => !!message.attachments?.length)
-          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}|${hasImages ? 'image' : 'text'}`
+          const attachmentKinds = Array.from(new Set(agentRequest.messages.flatMap(message =>
+            (message.attachments ?? []).map(() => 'image')
+          ))).sort().join('+') || 'text'
+          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}|${attachmentKinds}`
           if (this.toolCapabilities.get(capabilityKey) === false) return { content: '', toolUnsupported: true }
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds)
+          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
           try {
             const generated = await this.requestProvider(
               target,
@@ -1170,7 +1262,7 @@ export class AiService {
         requestId: request.requestId,
         signal: controller.signal,
         generate: async(agentRequest) => {
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds)
+          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
           const generated = await this.requestProvider(
             target,
             agentRequest.system,
@@ -1181,7 +1273,7 @@ export class AiService {
           return { content: generated.content, truncated: generated.truncated }
         },
         generateWhole: async(agentRequest) => {
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds)
+          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
           const generated = await this.requestProvider(
             target,
             agentRequest.system,

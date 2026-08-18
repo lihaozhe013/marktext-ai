@@ -9,6 +9,7 @@ export interface ProviderMessage {
   role: 'user' | 'assistant'
   content: string
   images?: ProviderImage[]
+  attachmentContext?: string
 }
 
 export interface ProviderToolDefinition {
@@ -55,12 +56,16 @@ export const serializeProviderMessages = (
   protocol: AiProtocol,
   messages: ProviderMessage[]
 ): Array<Record<string, unknown>> => messages.map(message => {
-  if (!message.images?.length) return { role: message.role, content: message.content }
+  const images = message.images ?? []
+  const content = message.attachmentContext
+    ? `${message.attachmentContext}\n\n${message.content}`
+    : message.content
+  if (!images.length) return { role: message.role, content }
   if (protocol === 'anthropic-messages') {
     return {
       role: message.role,
       content: [
-        ...message.images.map(image => ({
+        ...images.map(image => ({
           type: 'image',
           source: {
             type: 'base64',
@@ -68,18 +73,18 @@ export const serializeProviderMessages = (
             data: image.data
           }
         })),
-        { type: 'text', text: message.content }
+        { type: 'text', text: content }
       ]
     }
   }
   return {
     role: message.role,
     content: [
-      ...message.images.map(image => ({
+      ...images.map(image => ({
         type: 'image_url',
         image_url: { url: toImageDataUrl(image), detail: 'auto' }
       })),
-      { type: 'text', text: message.content }
+      { type: 'text', text: content }
     ]
   }
 })

@@ -1,5 +1,5 @@
 import type {
-  AiImageAttachment,
+  AiAttachment,
   AiEditOperationSummary,
   AiEditSummary,
   AiRecoveryInfo
@@ -19,7 +19,7 @@ import { assertMarkdownCompatibility, normalizeGeneratedMarkdown } from './outpu
 export interface DocumentEditMessage {
   role: 'user' | 'assistant'
   content: string
-  attachments?: AiImageAttachment[]
+  attachments?: AiAttachment[]
 }
 
 export interface GeneratedEditResponse {
@@ -53,7 +53,7 @@ export interface DocumentEditAgentRequest {
   markdown: string
   instruction: string
   contextMessages: DocumentEditMessage[]
-  attachments?: AiImageAttachment[]
+  attachments?: AiAttachment[]
   requestId: string
   signal: AbortSignal
   generate: (request: DocumentEditGenerateRequest) => Promise<GeneratedEditResponse>

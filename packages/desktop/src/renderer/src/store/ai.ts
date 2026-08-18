@@ -16,24 +16,39 @@ import {
 import type {
   AiChatMessage,
   AiChatSession,
+  AiAttachment,
+  AiAttachmentUpload,
   AiConnectionSettings,
   AiEditSummary,
-  AiImageAttachment,
   AiImageMimeType,
-  AiImageUpload,
+  AiPdfMimeType,
   AiInteractionMode,
   AiMessageModel,
   AiPreparedRevision,
   AiModelRef,
-  AiResponse
+  AiProgressInfo,
+  AiProgressPhase,
+  AiResponse,
+  AiRenderedPdfPages
 } from '@shared/types/ai'
 import {
   AI_IMAGE_MIME_TYPES,
   AI_MAX_IMAGE_BYTES,
   AI_MAX_IMAGE_COUNT,
-  AI_MAX_IMAGE_TOTAL_BYTES
+  AI_MAX_IMAGE_TOTAL_BYTES,
+  AI_MAX_PDF_BYTES,
+  AI_MAX_PDF_TOTAL_BYTES,
+  AI_PDF_MIME_TYPES
 } from '@shared/types/ai'
 import { AiChangeTracker, rangesFromSummary, fullDocumentRange, type AiChangeMarker } from './aiChangeTracker'
+import {
+  defaultPdfPages,
+  formatPdfPageSelection,
+  getPdfPageCount,
+  parsePdfPageSelection,
+  PdfPageSelectionError,
+  renderPdfPages
+} from './pdfRendering'
 
 export interface AiApplyPayload {
   tabId: string
@@ -44,12 +59,17 @@ export interface AiApplyPayload {
   onApplied: (success: boolean, markdown?: string) => void
 }
 
-export type AiAttachmentError = '' | 'unsupported' | 'too-large' | 'too-many' | 'total-too-large' | 'read-failed'
+export type AiAttachmentError = '' | 'unsupported' | 'too-large' | 'pdf-too-large' | 'too-many' | 'total-too-large' | 'read-failed' | 'pdf-pages-required' | 'pdf-invalid-pages' | 'pdf-render-failed' | 'render-too-large'
 
-export interface PendingAiImage {
-  attachment: AiImageAttachment
+export interface PendingAiAttachment {
+  attachment: AiAttachment
   data: Uint8Array
+  pdfPageCount?: number
+  pdfPageSelection?: string
 }
+
+/** Compatibility alias for renderer callers that still use the image-only name. */
+export type PendingAiImage = PendingAiAttachment
 
 export interface PendingAiRecovery {
   requestId: string
@@ -81,16 +101,20 @@ const featureLog = (message: string, ...args: unknown[]): void => {
   log.info(`[ai-editor] ${message}`, ...args)
 }
 
-const MIME_BY_EXTENSION: Record<string, AiImageMimeType> = {
+const MIME_BY_EXTENSION: Record<string, AiAttachment['mimeType']> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
-  '.gif': 'image/gif'
+  '.gif': 'image/gif',
+  '.pdf': 'application/pdf'
 }
 
-const resolveImageMimeType = (file: File): AiImageMimeType | undefined => {
+const MAX_STORED_CHAT_MESSAGES = 100
+
+const resolveAttachmentMimeType = (file: File): AiAttachment['mimeType'] | undefined => {
   if (AI_IMAGE_MIME_TYPES.includes(file.type as AiImageMimeType)) return file.type as AiImageMimeType
+  if (AI_PDF_MIME_TYPES.includes(file.type as AiPdfMimeType)) return file.type as AiPdfMimeType
   const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
   return MIME_BY_EXTENSION[extension]
 }
@@ -105,7 +129,12 @@ const toIpcChatMessage = (message: AiChatMessage): AiChatMessage => ({
   content: message.content,
   createdAt: message.createdAt,
   revisionId: message.revisionId,
-  attachments: message.attachments?.map(attachment => ({ ...attachment })),
+  kind: message.kind,
+  progress: message.progress ? { ...message.progress } : undefined,
+  attachments: message.attachments?.map(attachment => ({
+    ...attachment,
+    ...(attachment.mimeType === 'application/pdf' && attachment.pages ? { pages: [...attachment.pages] } : {})
+  })),
   model: message.model ? { ...message.model } : undefined,
   editSummary: message.editSummary
     ? {
@@ -131,9 +160,10 @@ export const useAiStore = defineStore('ai', () => {
   const width = ref(Number(localStorage.getItem('ai-panel-width')) || 380)
   const messages = ref<AiChatMessage[]>([])
   const selectedModel = ref<AiModelRef | undefined>()
-  const pendingAttachments = ref<PendingAiImage[]>([])
+  const pendingAttachments = ref<PendingAiAttachment[]>([])
   const attachmentError = ref<AiAttachmentError>('')
   const loading = ref(false)
+  const renderingPdf = ref(false)
   const error = ref('')
   const lastAnswer = ref('')
   const pendingRevision = ref<AiPreparedRevision | null>(null)
@@ -182,7 +212,7 @@ export const useAiStore = defineStore('ai', () => {
     pendingAttachments.value = []
   }
 
-  const addImageFiles = async(files: readonly File[]): Promise<void> => {
+  const addAttachmentFiles = async(files: readonly File[]): Promise<void> => {
     attachmentError.value = ''
     let rejected: AiAttachmentError = ''
     const available = AI_MAX_IMAGE_COUNT - pendingAttachments.value.length
@@ -190,38 +220,61 @@ export const useAiStore = defineStore('ai', () => {
     const selected = files.slice(0, Math.max(0, available))
     let totalBytes = pendingAttachments.value.reduce((total, item) => total + item.attachment.byteSize, 0)
     for (const file of selected) {
-      const mimeType = resolveImageMimeType(file)
+      const mimeType = resolveAttachmentMimeType(file)
       if (!mimeType) {
         rejected = rejected || 'unsupported'
         continue
       }
-      if (file.size <= 0 || file.size > AI_MAX_IMAGE_BYTES) {
-        rejected = rejected || 'too-large'
+      const maxBytes = mimeType === 'application/pdf' ? AI_MAX_PDF_BYTES : AI_MAX_IMAGE_BYTES
+      if (file.size <= 0 || file.size > maxBytes) {
+        rejected = rejected || (mimeType === 'application/pdf' ? 'pdf-too-large' : 'too-large')
         continue
       }
-      if (totalBytes + file.size > AI_MAX_IMAGE_TOTAL_BYTES) {
+      const totalLimit = mimeType === 'application/pdf' ? AI_MAX_PDF_TOTAL_BYTES : AI_MAX_IMAGE_TOTAL_BYTES
+      if (totalBytes + file.size > totalLimit) {
         rejected = rejected || 'total-too-large'
         continue
       }
       try {
         const data = new Uint8Array(await file.arrayBuffer())
-        const attachment: AiImageAttachment = {
-          id: createId(),
-          name: file.name || 'image',
-          mimeType,
-          byteSize: data.byteLength
+        let pdfPageCount: number | undefined
+        let pdfPageSelection: string | undefined
+        if (mimeType === 'application/pdf') {
+          pdfPageCount = await getPdfPageCount(data)
+          const pages = defaultPdfPages(pdfPageCount)
+          pdfPageSelection = pages.length ? formatPdfPageSelection(pages) : ''
         }
-        pendingAttachments.value.push({ attachment, data })
+        const attachment: AiAttachment = {
+          id: createId(),
+          name: file.name || (mimeType === 'application/pdf' ? 'document.pdf' : 'image'),
+          mimeType,
+          byteSize: data.byteLength,
+          ...(mimeType === 'application/pdf' && pdfPageCount !== undefined && pdfPageCount <= AI_MAX_IMAGE_COUNT
+            ? { pages: defaultPdfPages(pdfPageCount) }
+            : {})
+        }
+        pendingAttachments.value.push({ attachment, data, pdfPageCount, pdfPageSelection })
         totalBytes += data.byteLength
-      } catch {
-        rejected = rejected || 'read-failed'
+      } catch (error) {
+        if (mimeType === 'application/pdf' && error instanceof Error) rejected = rejected || 'pdf-render-failed'
+        else rejected = rejected || 'read-failed'
       }
     }
     attachmentError.value = rejected
   }
 
+  const addImageFiles = addAttachmentFiles
+
   const removePendingAttachment = (id: string): void => {
     pendingAttachments.value = pendingAttachments.value.filter(item => item.attachment.id !== id)
+  }
+
+  const setPendingPdfPageSelection = (id: string, value: string): void => {
+    const item = pendingAttachments.value.find(candidate => candidate.attachment.id === id)
+    if (!item || item.attachment.mimeType !== 'application/pdf') return
+    item.pdfPageSelection = value
+    item.attachment = { ...item.attachment, pages: undefined }
+    attachmentError.value = ''
   }
 
   const currentDocumentId = computed(() => {
@@ -370,7 +423,7 @@ export const useAiStore = defineStore('ai', () => {
         'mt::ai::chat-save',
         activeDocumentId.value,
         {
-          messages: toIpcChatMessages(messages.value.slice(-10)),
+          messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
           selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined
         }
       )
@@ -382,6 +435,7 @@ export const useAiStore = defineStore('ai', () => {
     messages.value = []
     selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
+    currentProgress.value = undefined
     attachmentError.value = ''
     if (pendingRecovery.value) {
       endAiEditSession(pendingRecovery.value.requestId)
@@ -396,7 +450,14 @@ export const useAiStore = defineStore('ai', () => {
     role: 'user' | 'assistant',
     content: string,
     messageMode: AiInteractionMode,
-    options: { revisionId?: string; editSummary?: AiEditSummary; attachments?: AiImageAttachment[]; model?: AiMessageModel } = {}
+    options: {
+      revisionId?: string
+      editSummary?: AiEditSummary
+      attachments?: AiAttachment[]
+      model?: AiMessageModel
+      kind?: AiChatMessage['kind']
+      progress?: AiProgressInfo
+    } = {}
   ): void => {
     messages.value.push({
       id: createId(),
@@ -406,8 +467,105 @@ export const useAiStore = defineStore('ai', () => {
       createdAt: Date.now(),
       ...options
     })
-    const retainedMessages = messages.value.slice(-10)
+    const retainedMessages = messages.value.slice(-MAX_STORED_CHAT_MESSAGES)
     messages.value = retainedMessages
+  }
+
+  const currentProgress = ref<AiProgressInfo | undefined>()
+
+  const appendProgress = async(
+    phase: AiProgressPhase,
+    details: Pick<AiProgressInfo, 'current' | 'total'> = {}
+  ): Promise<void> => {
+    const progress: AiProgressInfo = { phase, ...details }
+    currentProgress.value = progress
+    appendMessage('assistant', '', 'answer', { kind: 'status', progress })
+    await saveChat()
+  }
+
+  const preparePendingPdfSelections = async(pending: PendingAiAttachment[]): Promise<void> => {
+    for (const item of pending) {
+      if (item.attachment.mimeType !== 'application/pdf') continue
+      const pageCount = item.pdfPageCount ?? await getPdfPageCount(item.data)
+      const input = item.pdfPageSelection?.trim() ?? ''
+      const pages = input
+        ? parsePdfPageSelection(input, pageCount)
+        : defaultPdfPages(pageCount)
+      if (!pages.length) throw new PdfPageSelectionError('Select PDF pages before sending.')
+      item.pdfPageCount = pageCount
+      item.pdfPageSelection = formatPdfPageSelection(pages)
+      item.attachment = { ...item.attachment, pages }
+    }
+  }
+
+  const prepareRenderedPdfPages = async(
+    documentId: string,
+    contextMessages: readonly AiChatMessage[],
+    pending: PendingAiAttachment[],
+    onPageRendered?: (current: number, total: number) => Promise<void>
+  ): Promise<AiRenderedPdfPages[]> => {
+    const currentById = new Map(pending.map(item => [item.attachment.id, item]))
+    const ordered: AiAttachment[] = pending.map(item => item.attachment)
+    for (let index = contextMessages.length - 1; index >= 0; index -= 1) {
+      for (const attachment of contextMessages[index].attachments ?? []) ordered.push(attachment)
+    }
+    const seen = new Set<string>()
+    const rendered: AiRenderedPdfPages[] = []
+    let mediaCount = 0
+    let renderedBytes = 0
+    const pdfPageTotal = ordered.reduce((total, attachment) => {
+      if (attachment.mimeType !== 'application/pdf') return total
+      const pendingItem = currentById.get(attachment.id)
+      const pendingPages = pendingItem?.attachment.mimeType === 'application/pdf'
+        ? pendingItem.attachment.pages?.length
+        : undefined
+      return total + (attachment.pages?.length ?? pendingPages ?? 0)
+    }, 0)
+    let renderedPdfPageCount = 0
+    for (const attachment of ordered) {
+      if (seen.has(attachment.id)) continue
+      seen.add(attachment.id)
+      if (attachment.mimeType !== 'application/pdf') {
+        if (mediaCount >= AI_MAX_IMAGE_COUNT) {
+          if (currentById.has(attachment.id)) throw new PdfPageSelectionError(`The request can contain at most ${AI_MAX_IMAGE_COUNT} images, including PDF pages.`)
+          continue
+        }
+        mediaCount += 1
+        continue
+      }
+      const pendingItem = currentById.get(attachment.id)
+      let data = pendingItem?.data
+      if (!data) {
+        const stored = await window.electron.ipcRenderer.invoke('mt::ai::attachment-read', documentId, attachment.id)
+        if (stored.mimeType !== 'application/pdf') throw new Error('The stored PDF attachment has an invalid format.')
+        data = stored.data
+      }
+      const pageCount = pendingItem?.pdfPageCount ?? await getPdfPageCount(data)
+      const pages = attachment.pages?.length
+        ? attachment.pages
+        : defaultPdfPages(pageCount)
+      if (!pages.length) {
+        if (pendingItem) throw new PdfPageSelectionError('Select PDF pages before sending.')
+        throw new PdfPageSelectionError('A historical PDF has no saved page selection. Reattach it before sending.')
+      }
+      if (mediaCount + pages.length > AI_MAX_IMAGE_COUNT) {
+        if (pendingItem) throw new PdfPageSelectionError(`The request can contain at most ${AI_MAX_IMAGE_COUNT} images, including PDF pages.`)
+        continue
+      }
+      const result = await renderPdfPages(data, pages, attachment.name, async() => {
+        renderedPdfPageCount += 1
+        await onPageRendered?.(renderedPdfPageCount, pdfPageTotal)
+      })
+      const pageBytes = result.pages.reduce((total, page) => total + page.byteSize, 0)
+      if (renderedBytes + pageBytes > AI_MAX_IMAGE_TOTAL_BYTES) {
+        if (pendingItem) throw new Error('Rendered PDF pages exceed the 30 MB request limit.')
+        continue
+      }
+      renderedBytes += pageBytes
+      mediaCount += result.pages.length
+      rendered.push({ attachmentId: attachment.id, pageNumbers: [...pages], pages: result.pages })
+    }
+    return rendered
   }
 
   const submit = async(prompt: string): Promise<void> => {
@@ -435,8 +593,6 @@ export const useAiStore = defineStore('ai', () => {
       })
     if (requestMode !== 'answer' && !editSession) return
     const pending = pendingAttachments.value.map(item => ({ ...item, attachment: { ...item.attachment } }))
-    const attachments = pending.map(item => item.attachment)
-    const uploads: AiImageUpload[] = pending.map(item => ({ ...item.attachment, data: new Uint8Array(item.data) }))
     let keepEditSession = false
     try {
       await loadChat(requestDocumentId)
@@ -455,20 +611,42 @@ export const useAiStore = defineStore('ai', () => {
         error.value = 'Configure at least one AI model before sending a request.'
         return
       }
+      const contextMessages = messages.value.slice()
+      loading.value = true
+      activeRequestId.value = requestId
+      currentProgress.value = undefined
+      renderingPdf.value = pending.some(item => item.attachment.mimeType === 'application/pdf')
+      await preparePendingPdfSelections(pending)
+      const attachments = pending.map(item => item.attachment)
+      const uploads: AiAttachmentUpload[] = pending.map(item => ({ ...item.attachment, data: new Uint8Array(item.data) }))
+      appendMessage('user', value, requestMode, { attachments })
+      await saveChat()
+      if (renderingPdf.value) await appendProgress('pdf-rendering')
+      const renderedPdfPages = await prepareRenderedPdfPages(
+        requestDocumentId,
+        contextMessages,
+        pending,
+        async(current, total) => appendProgress('pdf-rendering', { current, total })
+      )
+      if (renderingPdf.value) {
+        const renderedPageCount = renderedPdfPages.reduce((total, item) => total + item.pages.length, 0)
+        await appendProgress('pdf-rendered', { current: renderedPageCount, total: renderedPageCount })
+      }
       pendingAttachments.value = []
       attachmentError.value = ''
-      appendMessage('user', value, requestMode, { attachments })
       featureLog(
         'request snapshot mode=%s documentKind=%s markdownChars=%s contextMessages=%s requestId=%s',
         requestMode,
         documentIdentityKind(documentId),
         baseMarkdown.length,
-        messages.value.length - 1,
+        contextMessages.length,
         requestId
       )
       error.value = ''
-      loading.value = true
-      activeRequestId.value = requestId
+      renderingPdf.value = false
+      await appendProgress('sending')
+      await appendProgress('sent')
+      await appendProgress('waiting')
       const response: AiResponse = await window.electron.ipcRenderer.invoke('mt::ai::request', {
         requestId,
         documentId,
@@ -477,9 +655,11 @@ export const useAiStore = defineStore('ai', () => {
         markdown: baseMarkdown,
         modelRef: requestModel,
         attachments: uploads,
-        messages: toIpcChatMessages(messages.value.slice(0, -1))
+        messages: toIpcChatMessages(contextMessages),
+        renderedPdfPages
       })
       if (requestId !== activeRequestId.value || documentId !== currentDocumentId.value) return
+      await appendProgress('responded')
       if (requestMode === 'answer') {
         appendMessage('assistant', response.content, requestMode, { model: response.model })
         lastAnswer.value = response.content
@@ -499,14 +679,23 @@ export const useAiStore = defineStore('ai', () => {
           }
           keepEditSession = true
         } else {
-          await applyEdit(response, requestId, requestTabId, baseMarkdown)
+          await appendProgress('local-processing')
+          const applied = await applyEdit(response, requestId, requestTabId, baseMarkdown)
+          if (applied) await appendProgress('completed')
         }
       }
     } catch (err) {
       if (requestId === activeRequestId.value) {
+        if (err instanceof PdfPageSelectionError) {
+          attachmentError.value = err.message.includes('historical') ? 'pdf-pages-required' : 'pdf-invalid-pages'
+        } else if (err instanceof Error && /rendered PDF|PDF page renderer|stored PDF/i.test(err.message)) {
+          attachmentError.value = 'pdf-render-failed'
+        }
         error.value = err instanceof Error ? err.message : String(err)
+        await appendProgress('failed').catch(() => undefined)
       }
     } finally {
+      renderingPdf.value = false
       if (requestId === activeRequestId.value) {
         loading.value = false
         activeRequestId.value = null
@@ -528,7 +717,8 @@ export const useAiStore = defineStore('ai', () => {
     requestId: string,
     tabId: string,
     beforeMarkdown: string
-  ): Promise<void> => {
+  ): Promise<boolean> => {
+    let applied = false
     editorStore.flushActiveEditor()
     const currentFile = editorStore.currentFile
     const nextMarkdown = response.markdown
@@ -547,16 +737,16 @@ export const useAiStore = defineStore('ai', () => {
       nextMarkdown === undefined
     ) {
       error.value = 'The document changed while the AI was working. The edit was discarded.'
-      return
+      return false
     }
     if (nextMarkdown === beforeMarkdown) {
       appendMessage('assistant', response.summary ?? '', response.mode, { editSummary: response.editSummary })
       await saveChat()
-      return
+      return true
     }
     if (!setAiEditSessionStatus(requestId, 'applying')) {
       error.value = 'The document changed while the AI was working. The edit was discarded.'
-      return
+      return false
     }
     const revision = await window.electron.ipcRenderer.invoke('mt::ai::revision-prepare', {
       documentId: response.documentId,
@@ -577,7 +767,7 @@ export const useAiStore = defineStore('ai', () => {
       await discardPreparedRevision(revisionId)
       pendingRevision.value = null
       error.value = 'The document changed while the AI was working. The edit was discarded.'
-      return
+      return false
     }
     const applySaveSequence = saveSequence
     await new Promise<void>((resolve) => {
@@ -633,6 +823,7 @@ export const useAiStore = defineStore('ai', () => {
                 model: response.model
               })
               await saveChat()
+              applied = true
             } catch (err) {
               error.value = err instanceof Error ? err.message : String(err)
               if (!committed) await discardPreparedRevision(revisionId)
@@ -659,6 +850,7 @@ export const useAiStore = defineStore('ai', () => {
         })
       })
     })
+    return applied
   }
 
   const acceptPendingRecovery = async(): Promise<void> => {
@@ -680,6 +872,7 @@ export const useAiStore = defineStore('ai', () => {
     window.electron.ipcRenderer.send('mt::ai::cancel', requestId)
     activeRequestId.value = null
     loading.value = false
+    appendProgress('cancelled').catch(() => undefined)
   }
 
   const undoAiEdit = async(): Promise<void> => {
@@ -758,6 +951,8 @@ export const useAiStore = defineStore('ai', () => {
     pendingRecovery,
     attachmentError,
     loading,
+    renderingPdf,
+    currentProgress,
     error,
     lastAnswer,
     currentChangeMarker,
@@ -770,6 +965,8 @@ export const useAiStore = defineStore('ai', () => {
     setDefaultModel,
     setWidth,
     addImageFiles,
+    addAttachmentFiles,
+    setPendingPdfPageSelection,
     removePendingAttachment,
     clearPendingAttachments,
     navigateToChange,
