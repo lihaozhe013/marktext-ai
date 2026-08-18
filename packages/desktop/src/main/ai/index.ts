@@ -17,6 +17,11 @@ import type {
   AiModelRef,
   AiProtocol,
   AiProgressPhase,
+  AiProgressEvent,
+  AiFailureReason,
+  AiReasoningControl,
+  AiReasoningField,
+  AiReasoningTag,
   AiRecoveryInfo,
   AiPreparedRevision,
   AiRequest,
@@ -35,6 +40,8 @@ import {
 import { runDocumentEditAgent } from './documentEditAgent'
 import { AiAttachmentStore, normalizeAttachmentUploads, normalizeImageAttachment, normalizeImageUpload, normalizePdfAttachment, orderAttachmentLocations } from './attachments'
 import { preciseEditTool, serializeProviderMessages, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition } from './providerMessages'
+import { consumeProviderStream, estimateTokenCount, type ProviderStreamProgress, type ProviderUsage } from './providerStream'
+import { extractProviderContentParts, normalizeProviderContent, readReasoningField, type ProviderReasoningCompatibility } from './providerReasoning'
 import {
   buildAnswerSystemPrompt,
   buildDocumentPrompt,
@@ -50,29 +57,45 @@ import {
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
-const SETTINGS_SCHEMA_VERSION = 2
+const SETTINGS_SCHEMA_VERSION = 4
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
 const CHAT_FILE = 'ai-chat.json'
 const REVISION_FILE = 'ai-revisions.json'
 const ANTHROPIC_VERSION = '2023-06-01'
 const MAX_CONTEXT_MESSAGES = 10
+const MAX_EDIT_CONTEXT_MESSAGES = 4
+const DEFAULT_EDIT_AUTO_RETRY_COUNT = 1
+const MAX_EDIT_AUTO_RETRY_COUNT = 3
+const DEFAULT_FAILURE_OUTPUT_AFTER = 1
+const MAX_FAILURE_OUTPUT_AFTER = 3
+const MAX_FAILURE_OUTPUT_CHARS = 200_000
 const MAX_STORED_CHAT_MESSAGES = 100
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
 
 interface ProviderResponse {
   content: string
+  rawContent: string
+  reasoning?: string
   truncated: boolean
   toolCalls?: ProviderToolCall[]
+  usage?: ProviderUsage
 }
 
 interface ProviderRequestOptions {
   tool?: ProviderToolDefinition
+  stream?: boolean
+  attempt?: number
+  onWaiting?: () => void
+  onProgress?: (progress: ProviderStreamProgress) => void
 }
+
+type AiProgressSink = (event: AiProgressEvent) => void
 
 interface RepairedMarkdownResult {
   content: string
+  reasoning?: string
   recovery: AiRecoveryInfo
 }
 
@@ -90,6 +113,19 @@ class ProviderRequestError extends Error {
 
 const normalizeRevisionMarkdown = (value: string): string => value.replace(/[\r\n]+$/, '')
 
+const makeFailureOutput = (rawContent: string, content: string, reasoning?: string): { value?: string; truncated: boolean } => {
+  const visible = rawContent || content
+  const reasoningSuffix = reasoning && !visible.includes(reasoning)
+    ? `\n\n[provider reasoning]\n${reasoning}`
+    : ''
+  const combined = `${visible}${reasoningSuffix}`
+  if (!combined) return { truncated: false }
+  return {
+    value: combined.slice(0, MAX_FAILURE_OUTPUT_CHARS),
+    truncated: combined.length > MAX_FAILURE_OUTPUT_CHARS
+  }
+}
+
 interface StoredConnection {
   id: string
   name: string
@@ -102,6 +138,8 @@ interface StoredSettings {
   schemaVersion: typeof SETTINGS_SCHEMA_VERSION
   connections: StoredConnection[]
   defaultModel?: AiModelRef
+  editAutoRetryCount: number
+  failureOutputAfter: number
 }
 
 type StoredKeys = Record<string, string>
@@ -214,11 +252,35 @@ const normalizeModelRef = (value: unknown): AiModelRef | undefined => {
   return { connectionId: value.connectionId, modelId: value.modelId }
 }
 
+const normalizeEditAutoRetryCount = (value: unknown): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_EDIT_AUTO_RETRY_COUNT
+  return Math.min(MAX_EDIT_AUTO_RETRY_COUNT, Math.max(0, Math.floor(value)))
+}
+
+const normalizeFailureOutputAfter = (value: unknown): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_FAILURE_OUTPUT_AFTER
+  return Math.min(MAX_FAILURE_OUTPUT_AFTER, Math.max(0, Math.floor(value)))
+}
+
 const normalizeModelCapabilities = (value: unknown): AiModelProfile['capabilities'] => {
   if (!isRecord(value)) return undefined
   const reasoningControl = value.reasoningControl
-  if (reasoningControl !== 'unknown' && reasoningControl !== 'effort' && reasoningControl !== 'budget') return undefined
-  return { reasoningControl }
+  const reasoningField = value.reasoningField
+  const reasoningTag = value.reasoningTag
+  const replayReasoning = value.replayReasoning
+  if (
+    (reasoningControl !== undefined && reasoningControl !== 'unknown' && reasoningControl !== 'effort' && reasoningControl !== 'budget') ||
+    (reasoningField !== undefined && reasoningField !== 'reasoning' && reasoningField !== 'reasoning_content' && reasoningField !== 'reason_content' && reasoningField !== 'reasoning_text') ||
+    (reasoningTag !== undefined && reasoningTag !== 'think' && reasoningTag !== 'thinking' && reasoningTag !== 'analysis' && reasoningTag !== 'reasoning') ||
+    (replayReasoning !== undefined && typeof replayReasoning !== 'boolean')
+  ) return undefined
+  if (reasoningControl === undefined && reasoningField === undefined && reasoningTag === undefined && replayReasoning === undefined) return undefined
+  return {
+    ...(reasoningControl !== undefined ? { reasoningControl: reasoningControl as AiReasoningControl } : {}),
+    ...(reasoningField !== undefined ? { reasoningField: reasoningField as AiReasoningField } : {}),
+    ...(reasoningTag !== undefined ? { reasoningTag: reasoningTag as AiReasoningTag } : {}),
+    ...(replayReasoning !== undefined ? { replayReasoning } : {})
+  }
 }
 
 const normalizeModelProfile = (value: unknown): AiModelProfile | undefined => {
@@ -254,7 +316,12 @@ const normalizeStoredConnection = (value: unknown, index: number): StoredConnect
 const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; legacy: boolean } => {
   if (value === undefined) {
     return {
-      settings: { schemaVersion: SETTINGS_SCHEMA_VERSION, connections: [] },
+      settings: {
+        schemaVersion: SETTINGS_SCHEMA_VERSION,
+        connections: [],
+        editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
+        failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
+      },
       legacy: false
     }
   }
@@ -266,7 +333,9 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
       settings: {
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         connections,
-        defaultModel: normalizeModelRef(value.defaultModel)
+        defaultModel: normalizeModelRef(value.defaultModel),
+        editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
+        failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter)
       },
       legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION
     }
@@ -289,7 +358,9 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
       connections: [legacyConnection],
       defaultModel: legacyModel
         ? { connectionId: legacyConnection.id, modelId: legacyConnection.models[0].id }
-        : undefined
+        : undefined,
+      editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
+      failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
     },
     legacy: true
   }
@@ -369,6 +440,8 @@ const resolveModelsEndpoint = (settings: Pick<StoredConnection, 'protocol' | 'en
 
 const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
   defaultModel: settings.defaultModel,
+  editAutoRetryCount: settings.editAutoRetryCount,
+  failureOutputAfter: settings.failureOutputAfter,
   connections: settings.connections.map(connection => ({
     ...connection,
     models: connection.models.map(model => ({ ...model })),
@@ -404,7 +477,12 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     'sending',
     'sent',
     'waiting',
+    'streaming',
     'responded',
+    'validating',
+    'attempt-failed',
+    'retrying',
+    'fallback',
     'local-processing',
     'completed',
     'failed',
@@ -414,7 +492,19 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
   return {
     phase: value.phase as AiProgressPhase,
     current: typeof value.current === 'number' ? value.current : undefined,
-    total: typeof value.total === 'number' ? value.total : undefined
+    total: typeof value.total === 'number' ? value.total : undefined,
+    attempt: typeof value.attempt === 'number' ? value.attempt : undefined,
+    elapsedMs: typeof value.elapsedMs === 'number' ? value.elapsedMs : undefined,
+    outputTokens: typeof value.outputTokens === 'number' ? value.outputTokens : undefined,
+    outputTokensEstimated: typeof value.outputTokensEstimated === 'boolean' ? value.outputTokensEstimated : undefined,
+    inputTokens: typeof value.inputTokens === 'number' ? value.inputTokens : undefined,
+    inputTokensEstimated: typeof value.inputTokensEstimated === 'boolean' ? value.inputTokensEstimated : undefined,
+    failureCount: typeof value.failureCount === 'number' ? value.failureCount : undefined,
+    failureOutput: typeof value.failureOutput === 'string' ? value.failureOutput.slice(0, MAX_FAILURE_OUTPUT_CHARS) : undefined,
+    failureOutputTruncated: typeof value.failureOutputTruncated === 'boolean' ? value.failureOutputTruncated : undefined,
+    failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'unknown'
+      ? value.failureReason
+      : undefined
   }
 }
 
@@ -469,6 +559,7 @@ const normalizeMessages = (messages: unknown): AiChatMessage[] => {
         : undefined
       return {
         ...item,
+        reasoning: typeof item.reasoning === 'string' ? item.reasoning : undefined,
         kind: item.kind === 'status' ? 'status' as const : undefined,
         progress: item.kind === 'status' ? normalizeProgress(item.progress) : undefined,
         revisionId: typeof item.revisionId === 'string' ? item.revisionId : undefined,
@@ -489,30 +580,58 @@ const normalizeChatSession = (value: unknown): AiChatSession => {
   }
 }
 
-const extractText = (payload: unknown): string => {
-  if (!isRecord(payload)) return ''
+const extractResponseContent = (
+  payload: unknown,
+  protocol: AiProtocol,
+  compatibility: ProviderReasoningCompatibility
+): { content: string; rawContent?: string; reasoning?: string } => {
+  if (!isRecord(payload)) return { content: '' }
+  if (protocol === 'anthropic-messages') {
+    const native = extractProviderContentParts(payload, protocol, compatibility)
+    if (native.content || native.reasoning) return native
+  }
   const choices = payload.choices
   if (Array.isArray(choices)) {
     const message = choices[0]
     if (isRecord(message) && isRecord(message.message)) {
       const content = message.message.content
-      if (typeof content === 'string') return content
+      const fieldReasoning = readReasoningField(message.message, compatibility.field)
+      if (typeof content === 'string') {
+        return normalizeProviderContent(content, fieldReasoning, compatibility)
+      }
       if (Array.isArray(content)) {
-        return content
-          .filter(isRecord)
-          .map((part) => (typeof part.text === 'string' ? part.text : ''))
-          .join('')
+        const visible: string[] = []
+        const reasoning: string[] = [fieldReasoning]
+        for (const part of content) {
+          if (!isRecord(part)) continue
+          if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'thinking') {
+            const text = typeof part.text === 'string' ? part.text : typeof part.content === 'string' ? part.content : ''
+            if (text) reasoning.push(text)
+          } else if (typeof part.text === 'string') {
+            visible.push(part.text)
+          }
+        }
+        return normalizeProviderContent(visible.join(''), reasoning.filter(Boolean).join('\n\n'), compatibility, 'native')
       }
     }
   }
   const content = payload.content
+  if (typeof content === 'string') return normalizeProviderContent(content, readReasoningField(payload, compatibility.field), compatibility)
   if (Array.isArray(content)) {
-    return content
-      .filter(isRecord)
-      .map((part) => (typeof part.text === 'string' ? part.text : ''))
-      .join('')
+    const visible: string[] = []
+    const reasoning: string[] = [readReasoningField(payload, compatibility.field)]
+    for (const part of content) {
+      if (!isRecord(part)) continue
+      if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'thinking') {
+        const text = typeof part.text === 'string' ? part.text : typeof part.content === 'string' ? part.content : ''
+        if (text) reasoning.push(text)
+      } else if (typeof part.text === 'string') {
+        visible.push(part.text)
+      }
+    }
+    return normalizeProviderContent(visible.join(''), reasoning.filter(Boolean).join('\n\n'), compatibility, 'native')
   }
-  return ''
+  return { content: '' }
 }
 
 const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean => {
@@ -521,6 +640,24 @@ const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean =>
   const choices = payload.choices
   if (!Array.isArray(choices) || !isRecord(choices[0])) return false
   return choices[0].finish_reason === 'length'
+}
+
+const extractUsage = (payload: unknown, protocol: AiProtocol): ProviderUsage | undefined => {
+  if (!isRecord(payload)) return undefined
+  const usage = isRecord(payload.usage)
+    ? payload.usage
+    : protocol === 'anthropic-messages' && isRecord(payload.message) && isRecord(payload.message.usage)
+      ? payload.message.usage
+      : undefined
+  if (!usage) return undefined
+  const inputTokens = protocol === 'anthropic-messages'
+    ? typeof usage.input_tokens === 'number' ? usage.input_tokens : undefined
+    : typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : undefined
+  const outputTokens = protocol === 'anthropic-messages'
+    ? typeof usage.output_tokens === 'number' ? usage.output_tokens : undefined
+    : typeof usage.completion_tokens === 'number' ? usage.completion_tokens : undefined
+  if (inputTokens === undefined && outputTokens === undefined) return undefined
+  return { inputTokens, outputTokens }
 }
 
 export class AiService {
@@ -613,7 +750,12 @@ export class AiService {
         : connection.models[0]
           ? { connectionId: connection.id, modelId: connection.models[0].id }
           : undefined
-      const settings: StoredSettings = { schemaVersion: SETTINGS_SCHEMA_VERSION, connections, defaultModel }
+      const settings: StoredSettings = {
+        ...current.settings,
+        schemaVersion: SETTINGS_SCHEMA_VERSION,
+        connections,
+        defaultModel
+      }
       const keys = { ...current.keys }
       if (typeof input.apiKey === 'string' && input.apiKey.trim()) keys[connection.id] = input.apiKey.trim()
       await writeJsonAtomic(this.settingsPath, settings)
@@ -636,7 +778,12 @@ export class AiService {
           ? { connectionId: fallbackConnection.id, modelId: fallbackConnection.models[0].id }
           : undefined
         : current.settings.defaultModel
-      const settings: StoredSettings = { schemaVersion: SETTINGS_SCHEMA_VERSION, connections, defaultModel }
+      const settings: StoredSettings = {
+        ...current.settings,
+        schemaVersion: SETTINGS_SCHEMA_VERSION,
+        connections,
+        defaultModel
+      }
       await writeJsonAtomic(this.settingsPath, settings)
       await writeJsonAtomic(this.keyPath, keys)
       featureLog('connection deleted connectionId=%s', connectionId)
@@ -670,6 +817,32 @@ export class AiService {
         defaultModel: modelRef ?? undefined
       }
       await writeJsonAtomic(this.settingsPath, settings)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
+  async setEditAutoRetryCount(retryCount: number): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        editAutoRetryCount: normalizeEditAutoRetryCount(retryCount)
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('edit auto retry count updated count=%s', settings.editAutoRetryCount)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
+  async setFailureOutputAfter(failureCount: number): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        failureOutputAfter: normalizeFailureOutputAfter(failureCount)
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('failure output threshold updated count=%s', settings.failureOutputAfter)
       return toPublicSettings(settings, current.keys)
     })
   }
@@ -774,13 +947,11 @@ export class AiService {
       throw new Error('Configure an AI endpoint and model first.')
     }
     const requestEndpoint = resolveRequestEndpoint(settings)
-    featureLog(
-      'request start protocol=%s endpoint=%s model=%s requestId=%s',
-      settings.protocol,
-      requestEndpoint,
-      model,
-      requestId
-    )
+    const compatibility: ProviderReasoningCompatibility = {
+      field: target.model.capabilities?.reasoningField,
+      tag: target.model.capabilities?.reasoningTag,
+      replay: target.model.capabilities?.replayReasoning
+    }
     const controller = new AbortController()
     const abortFromParent = () => controller.abort()
     if (signal) {
@@ -803,69 +974,162 @@ export class AiService {
       controller.abort()
     }, REQUEST_TIMEOUT_MS)
     try {
-      const headers: Record<string, string> = {
-        accept: 'application/json',
-        'content-type': 'application/json'
-      }
-      let body: Record<string, unknown>
-      const effectiveSystem = messages.some(message => !!message.attachmentContext)
-        ? `${system}\n${renderedPdfImageRules}`
-        : system
-      if (settings.protocol === 'anthropic-messages') {
-        headers['x-api-key'] = apiKey
-        headers['api-key'] = apiKey
-        headers['anthropic-version'] = ANTHROPIC_VERSION
-        body = { model, max_tokens: 4096, system: effectiveSystem, messages: serializeProviderMessages(settings.protocol, messages) }
-        if (options.tool) {
-          body.tools = [{ name: options.tool.name, description: options.tool.description, input_schema: options.tool.parameters }]
-          body.tool_choice = { type: 'tool', name: options.tool.name }
+      let streaming = options.stream === true
+      let includeStreamUsage = streaming && settings.protocol === 'openai-chat-completions'
+      let streamFallbackAttempted = false
+      while (true) {
+        const headers: Record<string, string> = {
+          accept: streaming ? 'text/event-stream, application/json' : 'application/json',
+          'content-type': 'application/json'
         }
-      } else {
-        headers.authorization = `Bearer ${apiKey}`
-        // Some OpenAI-compatible gateways, including MiMo Token Plan, document
-        // `api-key` instead of the standard Authorization header.
-        headers['api-key'] = apiKey
-        body = { model, messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(settings.protocol, messages)] }
-        if (options.tool) {
-          body.tools = [{ type: 'function', function: { name: options.tool.name, description: options.tool.description, parameters: options.tool.parameters } }]
-          body.tool_choice = { type: 'function', function: { name: options.tool.name } }
+        let body: Record<string, unknown>
+        const effectiveSystem = messages.some(message => !!message.attachmentContext)
+          ? `${system}\n${renderedPdfImageRules}`
+          : system
+        if (settings.protocol === 'anthropic-messages') {
+          headers['x-api-key'] = apiKey
+          headers['api-key'] = apiKey
+          headers['anthropic-version'] = ANTHROPIC_VERSION
+          body = {
+            model,
+            max_tokens: 4096,
+            system: effectiveSystem,
+            messages: serializeProviderMessages(
+              settings.protocol,
+              messages,
+              undefined,
+              compatibility.replay
+            ),
+            ...(streaming ? { stream: true } : {})
+          }
+          if (options.tool) {
+            body.tools = [{ name: options.tool.name, description: options.tool.description, input_schema: options.tool.parameters }]
+            body.tool_choice = { type: 'tool', name: options.tool.name }
+          }
+        } else {
+          headers.authorization = `Bearer ${apiKey}`
+          // Some OpenAI-compatible gateways, including MiMo Token Plan, document
+          // `api-key` instead of the standard Authorization header.
+          headers['api-key'] = apiKey
+          body = {
+            model,
+            max_tokens: 8192,
+            messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(
+              settings.protocol,
+              messages,
+              compatibility.replay
+                ? compatibility.field ?? 'reasoning_content'
+                : undefined,
+              compatibility.replay
+            )],
+            ...(streaming ? { stream: true } : {})
+          }
+          if (includeStreamUsage) body.stream_options = { include_usage: true }
+          if (options.tool) {
+            body.tools = [{ type: 'function', function: { name: options.tool.name, description: options.tool.description, parameters: options.tool.parameters } }]
+            body.tool_choice = { type: 'function', function: { name: options.tool.name } }
+          }
+        }
+        featureLog(
+          'request start protocol=%s endpoint=%s model=%s stream=%s attempt=%s requestId=%s',
+          settings.protocol,
+          requestEndpoint,
+          model,
+          streaming,
+          options.attempt ?? 1,
+          requestId
+        )
+        options.onWaiting?.()
+        const requestStartedAt = Date.now()
+        const response = await fetch(requestEndpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          redirect: 'error',
+          signal: controller.signal
+        })
+        const contentType = response.headers?.get('content-type') ?? ''
+        featureLog(
+          'request headers received status=%s contentType=%s protocol=%s stream=%s elapsedMs=%s requestId=%s',
+          response.status,
+          contentType.split(';', 1)[0],
+          settings.protocol,
+          streaming,
+          Date.now() - requestStartedAt,
+          requestId
+        )
+        if (response.ok && streaming && contentType.toLowerCase().includes('text/event-stream')) {
+          if (!response.body) throw new Error('The provider returned an empty event stream.')
+          const streamed = await consumeProviderStream(settings.protocol, response.body, controller.signal, options.onProgress, compatibility)
+          featureLog(
+            'request body complete protocol=%s stream=true contentChars=%s outputTokens=%s outputTokensEstimated=%s elapsedMs=%s requestId=%s',
+            settings.protocol,
+            streamed.content.length,
+            streamed.usage?.outputTokens ?? estimateTokenCount(streamed.content),
+            streamed.usage?.outputTokens === undefined,
+            Date.now() - requestStartedAt,
+            requestId
+          )
+          if (!streamed.content && !streamed.toolCalls.length) throw new Error('The provider returned no text content.')
+          return streamed
+        }
+        const text = await response.text()
+        featureLog(
+          'request body complete protocol=%s stream=%s contentChars=%s elapsedMs=%s requestId=%s',
+          settings.protocol,
+          streaming,
+          text.length,
+          Date.now() - requestStartedAt,
+          requestId
+        )
+        let payload: unknown
+        try {
+          payload = JSON.parse(text)
+        } catch {
+          payload = null
+        }
+        if (!response.ok) {
+          const unsupportedStreamStatus = streaming && [400, 404, 405, 415, 422].includes(response.status)
+          if (unsupportedStreamStatus && includeStreamUsage) {
+            includeStreamUsage = false
+            featureLog('stream usage option rejected; retrying without usage option requestId=%s', requestId)
+            continue
+          }
+          if (unsupportedStreamStatus && !streamFallbackAttempted) {
+            streaming = false
+            streamFallbackAttempted = true
+            featureLog('stream unsupported; falling back to JSON requestId=%s', requestId)
+            continue
+          }
+          const providerMessage = isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === 'string'
+            ? payload.error.message
+            : `Provider returned HTTP ${response.status}.`
+          const attachmentHint = messages.some(message => !!message.images?.length)
+            ? ' The configured model or endpoint may not support image input.'
+            : ''
+          throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`, response.status, !!options.tool)
+        }
+        const extracted = extractResponseContent(payload, settings.protocol, compatibility)
+        const content = extracted.content
+        const toolCalls = extractToolCalls(payload, settings.protocol)
+        if (!content && !toolCalls.length) throw new Error('The provider returned no text content.')
+        const usage = extractUsage(payload, settings.protocol)
+        options.onProgress?.({
+          outputCharacters: content.length + (extracted.reasoning?.length ?? 0),
+          reasoningCharacters: extracted.reasoning?.length ?? 0,
+          outputTokens: usage?.outputTokens ?? estimateTokenCount(`${content}${extracted.reasoning ?? ''}`),
+          usage,
+          firstEvent: true
+        })
+        return {
+          content,
+          rawContent: extracted.rawContent ?? content,
+          reasoning: extracted.reasoning,
+          toolCalls,
+          usage,
+          truncated: isTruncatedResponse(payload, settings.protocol)
         }
       }
-      const response = await fetch(requestEndpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        redirect: 'error',
-        signal: controller.signal
-      })
-      featureLog(
-        'request response status=%s protocol=%s endpoint=%s model=%s requestId=%s',
-        response.status,
-        settings.protocol,
-        requestEndpoint,
-        model,
-        requestId
-      )
-      const text = await response.text()
-      let payload: unknown
-      try {
-        payload = JSON.parse(text)
-      } catch {
-        payload = null
-      }
-      if (!response.ok) {
-        const providerMessage = isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === 'string'
-          ? payload.error.message
-          : `Provider returned HTTP ${response.status}.`
-        const attachmentHint = messages.some(message => !!message.images?.length)
-          ? ' The configured model or endpoint may not support image input.'
-          : ''
-        throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`, response.status, !!options.tool)
-      }
-      const content = extractText(payload)
-      const toolCalls = extractToolCalls(payload, settings.protocol)
-      if (!content && !toolCalls.length) throw new Error('The provider returned no text content.')
-      return { content, toolCalls, truncated: isTruncatedResponse(payload, settings.protocol) }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         if (timedOut) {
@@ -945,7 +1209,7 @@ export class AiService {
   }
 
   private async hydrateProviderMessages(
-    messages: Array<{ role: 'user' | 'assistant'; content: string; attachments?: AiAttachment[] }>,
+    messages: Array<{ role: 'user' | 'assistant'; content: string; reasoning?: string; attachments?: AiAttachment[] }>,
     priorityAttachmentIds: ReadonlySet<string> = new Set(),
     renderedPdfPages: readonly AiRenderedPdfPages[] = []
   ): Promise<ProviderMessage[]> {
@@ -1036,6 +1300,7 @@ export class AiService {
     return messages.map((message, index) => ({
       role: message.role,
       content: message.content,
+      reasoning: message.reasoning,
       images: imagesByMessage.get(index),
       attachmentContext: attachmentContextByMessage.get(index)?.join('\n')
     }))
@@ -1049,7 +1314,8 @@ export class AiService {
     requestId: string,
     signal: AbortSignal | undefined,
     stripOuterFence: boolean,
-    strict: boolean
+    strict: boolean,
+    providerOptions: ProviderRequestOptions = {}
   ): Promise<RepairedMarkdownResult> {
     const normalized = normalizeGeneratedMarkdown(generated.content, { stripOuterFence })
     if (!normalized.content.trim()) throw new Error('The model returned an empty document.')
@@ -1057,6 +1323,7 @@ export class AiService {
     if (!inspection.issues.length) {
       return {
         content: normalized.content.trim(),
+        reasoning: generated.reasoning,
         recovery: {
           strategy: normalized.changes.length ? 'local-normalization' : 'direct',
           attempts: 1,
@@ -1071,17 +1338,19 @@ export class AiService {
         system,
         [
           ...messages,
-          { role: 'assistant', content: generated.content },
+          { role: 'assistant', content: generated.content, reasoning: generated.reasoning },
           { role: 'user', content: buildMarkdownFormatRepairPrompt(failure) }
         ],
         requestId,
-        signal
+        signal,
+        providerOptions
       )
       const repairedNormalized = normalizeGeneratedMarkdown(repaired.content, { stripOuterFence })
       const repairedInspection = inspectMarkdown(repairedNormalized.content)
       if (repairedInspection.issues.length) throw new Error(repairedInspection.issues.map(issue => issue.message).join(' '))
       return {
         content: repairedNormalized.content.trim(),
+        reasoning: repaired.reasoning ?? generated.reasoning,
         recovery: {
           strategy: 'model-repair',
           attempts: 2,
@@ -1092,6 +1361,7 @@ export class AiService {
       if (!strict) {
         return {
           content: normalized.content.trim(),
+          reasoning: generated.reasoning,
           recovery: {
             strategy: normalized.changes.length ? 'local-normalization' : 'direct',
             attempts: 2,
@@ -1113,7 +1383,7 @@ export class AiService {
     return this.attachmentStore.read(attachmentId, mimeType)
   }
 
-  async request(request: AiRequest): Promise<AiResponse> {
+  async request(request: AiRequest, progressSink?: AiProgressSink): Promise<AiResponse> {
     if (!request.requestId || !request.documentId) throw new Error('Invalid AI request.')
     const state = await this.readSettingsState()
     const target = await this.resolveModelTarget(request.modelRef, state)
@@ -1122,10 +1392,11 @@ export class AiService {
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))
     const recentMessages = normalizeMessages(request.messages)
       .filter(message => message.kind !== 'status')
-      .slice(-MAX_CONTEXT_MESSAGES)
-      .map(({ role, mode, content, attachments }) => ({
+      .slice(-(request.mode === 'edit' ? MAX_EDIT_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES))
+      .map(({ role, mode, content, reasoning, attachments }) => ({
         role,
         content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
+        reasoning,
         attachments
       }))
     let documentKind = 'unknown'
@@ -1142,6 +1413,72 @@ export class AiService {
       request.renderedPdfPages?.reduce((total, item) => total + item.pages.length, 0) ?? 0,
       request.requestId
     )
+    const requestStartedAt = Date.now()
+    let lastAttempt = 1
+    let lastFailureReason: AiFailureReason | undefined
+    let failureCount = 0
+    let lastFailureOutput: string | undefined
+    let lastFailureOutputTruncated = false
+    let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming'> = {
+      outputTokens: 0,
+      outputTokensEstimated: true,
+      streaming: false
+    }
+    const emitProgress = (
+      phase: AiProgressEvent['phase'],
+      attempt: number,
+      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated'>> = {}
+    ): void => {
+      lastAttempt = Math.max(lastAttempt, attempt)
+      const { failureReason, failureCount: eventFailureCount, failureOutput, failureOutputTruncated, ...stats } = details
+      if (failureReason) lastFailureReason = failureReason
+      lastProgressStats = { ...lastProgressStats, ...stats }
+      progressSink?.({
+        requestId: request.requestId,
+        mode: request.mode,
+        phase,
+        attempt,
+        elapsedMs: Date.now() - requestStartedAt,
+        ...lastProgressStats,
+        ...(failureReason ? { failureReason } : {}),
+        ...(eventFailureCount !== undefined ? { failureCount: eventFailureCount } : {}),
+        ...(failureOutput !== undefined ? { failureOutput } : {}),
+        ...(failureOutputTruncated !== undefined ? { failureOutputTruncated } : {})
+      })
+    }
+    const rememberProviderResponse = (response: ProviderResponse): void => {
+      const output = makeFailureOutput(response.rawContent, response.content, response.reasoning)
+      if (output.value) {
+        lastFailureOutput = output.value
+        lastFailureOutputTruncated = output.truncated
+      }
+    }
+    const makeProviderProgress = (attempt: number) => {
+      let lastProgressAt = 0
+      return {
+        onWaiting: () => emitProgress('waiting', attempt, {
+          outputTokens: 0,
+          outputTokensEstimated: true,
+          inputTokens: undefined,
+          inputTokensEstimated: undefined,
+          streaming: false
+        }),
+        onProgress: (progress: ProviderStreamProgress): void => {
+          const now = Date.now()
+          const exactUsage = progress.usage?.outputTokens !== undefined
+          if (!progress.firstEvent && !exactUsage && now - lastProgressAt < 150) return
+          lastProgressAt = now
+          const usage = progress.usage
+          emitProgress('streaming', attempt, {
+            outputTokens: usage?.outputTokens ?? progress.outputTokens,
+            outputTokensEstimated: usage?.outputTokens === undefined,
+            inputTokens: usage?.inputTokens,
+            inputTokensEstimated: usage?.inputTokens === undefined,
+            streaming: true
+          })
+        }
+      }
+    }
     if (request.mode === 'answer') {
       const promptToken = makePromptToken('MT_CONTEXT')
       const messages = await this.hydrateProviderMessages([
@@ -1152,8 +1489,18 @@ export class AiService {
         target,
         buildAnswerSystemPrompt(promptToken),
         messages,
-        request.requestId
+        request.requestId,
+        undefined,
+        { stream: true, attempt: 1, ...makeProviderProgress(1) }
       )
+      rememberProviderResponse(result)
+      emitProgress('validating', 1, {
+        outputTokens: result.usage?.outputTokens ?? estimateTokenCount(result.content),
+        outputTokensEstimated: result.usage?.outputTokens === undefined,
+        inputTokens: result.usage?.inputTokens,
+        inputTokensEstimated: result.usage?.inputTokens === undefined,
+        streaming: false
+      })
       const repaired = await this.repairMarkdownResponse(
         target,
         buildAnswerSystemPrompt(promptToken),
@@ -1162,18 +1509,21 @@ export class AiService {
         request.requestId,
         undefined,
         false,
-        false
+        false,
+        { stream: true, attempt: 2, ...makeProviderProgress(2) }
       )
       featureLog(
-        'request content received mode=%s contentChars=%s requestId=%s',
+        'request content received mode=%s contentChars=%s elapsedMs=%s requestId=%s',
         request.mode,
         result.content.length,
+        Date.now() - requestStartedAt,
         request.requestId
       )
       return {
         requestId: request.requestId,
         mode: request.mode,
         content: repaired.content,
+        reasoning: repaired.reasoning,
         recovery: repaired.recovery,
         documentId: request.documentId,
         baseMarkdown: request.markdown,
@@ -1195,9 +1545,18 @@ export class AiService {
           buildRewriteSystemPrompt(promptToken),
           messages,
           request.requestId,
-          controller.signal
+          controller.signal,
+          { stream: true, attempt: 1, ...makeProviderProgress(1) }
         )
+        rememberProviderResponse(result)
         if (result.truncated) throw new Error('The model response was truncated before a complete document was returned.')
+        emitProgress('validating', 1, {
+          outputTokens: result.usage?.outputTokens ?? estimateTokenCount(result.content),
+          outputTokensEstimated: result.usage?.outputTokens === undefined,
+          inputTokens: result.usage?.inputTokens,
+          inputTokensEstimated: result.usage?.inputTokens === undefined,
+          streaming: false
+        })
         const repaired = await this.repairMarkdownResponse(
           target,
           buildRewriteSystemPrompt(promptToken),
@@ -1206,19 +1565,22 @@ export class AiService {
           request.requestId,
           controller.signal,
           true,
-          true
+          true,
+          { stream: true, attempt: 2, ...makeProviderProgress(2) }
         )
         const markdown = repaired.content
         featureLog(
-          'request content received mode=%s contentChars=%s requestId=%s',
+          'request content received mode=%s contentChars=%s elapsedMs=%s requestId=%s',
           request.mode,
           markdown.length,
+          Date.now() - requestStartedAt,
           request.requestId
         )
         return {
           requestId: request.requestId,
           mode: request.mode,
           content: '',
+          reasoning: repaired.reasoning,
           markdown,
           recovery: repaired.recovery,
           documentId: request.documentId,
@@ -1246,10 +1608,16 @@ export class AiService {
               messages,
               agentRequest.requestId,
               agentRequest.signal,
-              { tool: preciseEditTool }
+              {
+                tool: preciseEditTool,
+                stream: true,
+                attempt: agentRequest.attempt ?? 1,
+                ...makeProviderProgress(agentRequest.attempt ?? 1)
+              }
             )
+            rememberProviderResponse(generated)
             this.toolCapabilities.set(capabilityKey, true)
-            return { content: generated.content, toolCalls: generated.toolCalls, truncated: generated.truncated }
+            return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, toolCalls: generated.toolCalls, truncated: generated.truncated }
           } catch (error) {
             if (error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)) {
               this.toolCapabilities.set(capabilityKey, false)
@@ -1261,6 +1629,7 @@ export class AiService {
         },
         requestId: request.requestId,
         signal: controller.signal,
+        maxRetries: state.settings.editAutoRetryCount,
         generate: async(agentRequest) => {
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
           const generated = await this.requestProvider(
@@ -1268,9 +1637,15 @@ export class AiService {
             agentRequest.system,
             messages,
             agentRequest.requestId,
-            agentRequest.signal
+            agentRequest.signal,
+            {
+              stream: true,
+              attempt: agentRequest.attempt ?? 1,
+              ...makeProviderProgress(agentRequest.attempt ?? 1)
+            }
           )
-          return { content: generated.content, truncated: generated.truncated }
+          rememberProviderResponse(generated)
+          return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, truncated: generated.truncated }
         },
         generateWhole: async(agentRequest) => {
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
@@ -1279,11 +1654,34 @@ export class AiService {
             agentRequest.system,
             messages,
             agentRequest.requestId,
-            agentRequest.signal
+            agentRequest.signal,
+            {
+              stream: true,
+              attempt: agentRequest.attempt ?? 1,
+              ...makeProviderProgress(agentRequest.attempt ?? 1)
+            }
           )
-          return { content: generated.content, truncated: generated.truncated }
+          rememberProviderResponse(generated)
+          return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, truncated: generated.truncated }
+        },
+        onPhase: (phase, attempt) => {
+          emitProgress(phase, attempt, {
+            streaming: false
+          })
         },
         onValidationFailure: diagnostic => {
+          failureCount += 1
+          const output = makeFailureOutput(diagnostic.response ?? '', diagnostic.response ?? '', diagnostic.reasoning)
+          if (output.value) {
+            lastFailureOutput = output.value
+            lastFailureOutputTruncated = output.truncated
+          }
+          const failureReason: AiFailureReason = diagnostic.code === 'exact-match'
+            ? 'exact-match'
+            : diagnostic.code === 'truncated'
+              ? 'truncated'
+              : 'format'
+          emitProgress('attempt-failed', diagnostic.attempt, { failureReason, streaming: false })
           featureLog(
             'edit agent validation failure attempt=%s code=%s error=%s responseChars=%s responseLines=%s summaryMarkers=%s searchMarkers=%s dividerMarkers=%s replaceMarkers=%s requestId=%s',
             diagnostic.attempt,
@@ -1300,18 +1698,20 @@ export class AiService {
         }
       })
       featureLog(
-        'edit agent applied mode=%s attempts=%s operations=%s addedLines=%s removedLines=%s requestId=%s',
+        'edit agent applied mode=%s attempts=%s operations=%s addedLines=%s removedLines=%s elapsedMs=%s requestId=%s',
         request.mode,
         result.attempts,
         result.summary.operationCount,
         result.summary.addedLines,
         result.summary.removedLines,
+        Date.now() - requestStartedAt,
         request.requestId
       )
       return {
         requestId: request.requestId,
         mode: request.mode,
         content: '',
+        reasoning: result.reasoning,
         summary: result.message,
         markdown: result.markdown,
         editSummary: result.summary,
@@ -1320,6 +1720,25 @@ export class AiService {
         baseMarkdown: request.markdown,
         model: toMessageModel(target)
       }
+    } catch (error) {
+      const cancelled = error instanceof Error && /cancelled|canceled/i.test(error.message)
+      const exposeFailureOutput = !cancelled &&
+        state.settings.failureOutputAfter > 0 &&
+        failureCount >= state.settings.failureOutputAfter &&
+        !!lastFailureOutput
+      emitProgress(cancelled ? 'cancelled' : 'failed', lastAttempt, {
+        streaming: false,
+        ...(cancelled
+          ? {}
+          : {
+            failureReason: lastFailureReason ?? 'provider',
+            failureCount,
+            ...(exposeFailureOutput
+              ? { failureOutput: lastFailureOutput, failureOutputTruncated: lastFailureOutputTruncated }
+              : {})
+          })
+      })
+      throw error
     } finally {
       this.controllers.delete(request.requestId)
     }
@@ -1509,6 +1928,16 @@ export const registerAiIpcHandlers = (userDataPath: string): void => {
     }
   }
   ipcMain.handle('mt::ai::get-settings', () => aiService.getSettings())
+  ipcMain.handle('mt::ai::set-edit-retry-count', async(_event, retryCount: number) => {
+    const saved = await aiService.setEditAutoRetryCount(retryCount)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-failure-output-after', async(_event, failureCount: number) => {
+    const saved = await aiService.setFailureOutputAfter(failureCount)
+    broadcastSettings(saved)
+    return saved
+  })
   ipcMain.handle('mt::ai::save-connection', async(_event, connection: AiConnectionInput) => {
     const saved = await aiService.saveConnection(connection)
     broadcastSettings(saved)
@@ -1531,7 +1960,9 @@ export const registerAiIpcHandlers = (userDataPath: string): void => {
   })
   ipcMain.handle('mt::ai::test-connection', (_event, connection: AiConnectionInput) => aiService.testConnection(connection))
   ipcMain.handle('mt::ai::list-models', (_event, connection: AiModelListInput) => aiService.listModels(connection))
-  ipcMain.handle('mt::ai::request', (_event, request: AiRequest) => aiService.request(request))
+  ipcMain.handle('mt::ai::request', (event, request: AiRequest) => aiService.request(request, progress => {
+    if (!event.sender.isDestroyed()) event.sender.send('mt::ai::progress', progress)
+  }))
   ipcMain.on('mt::ai::cancel', (_event, requestId: string) => aiService.cancel(requestId))
   ipcMain.handle('mt::ai::chat-load', (_event, documentId: string) => aiService.loadChat(documentId))
   ipcMain.handle('mt::ai::chat-save', (_event, documentId: string, session: AiChatSession) => aiService.saveChat(documentId, session))

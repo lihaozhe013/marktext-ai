@@ -109,7 +109,22 @@
           />
           {{ progressLabel(message) }}
         </div>
-        <template v-else>
+        <details
+          v-if="message.kind === 'status' && message.progress?.failureOutput"
+          class="ai-failure-output"
+        >
+          <summary>{{ labels.failureOutputTitle }}</summary>
+          <pre>{{ message.progress.failureOutput }}</pre>
+          <small v-if="message.progress.failureOutputTruncated">{{ labels.failureOutputTruncated }}</small>
+          <button
+            class="secondary-button ai-copy-failure"
+            type="button"
+            @click="copyFailureOutput(message)"
+          >
+            {{ copiedFailureId === message.id ? labels.copied : labels.copyFailureOutput }}
+          </button>
+        </details>
+        <template v-else-if="message.kind !== 'status'">
           <div class="ai-message-role">
             {{ message.role === 'user' ? labels.you : labels.ai }}
           </div>
@@ -125,6 +140,13 @@
           >
             {{ message.content }}
           </div>
+          <details
+            v-if="message.reasoning"
+            class="ai-message-reasoning"
+          >
+            <summary>{{ labels.modelReasoning }}</summary>
+            <div>{{ message.reasoning }}</div>
+          </details>
           <div
             v-if="message.attachments?.length"
             class="ai-message-attachments"
@@ -379,16 +401,18 @@ import { storeToRefs } from 'pinia'
 import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
 import bus from '@/bus'
-import type { AiChatMessage, AiModelRef, AiProgressInfo } from '@shared/types/ai'
+import type { AiChatMessage, AiModelRef, AiProgressEvent, AiProgressInfo } from '@shared/types/ai'
 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
 const panelElement = ref<HTMLElement | null>(null)
 const draft = ref('')
 const dragOver = ref(false)
+const copiedFailureId = ref('')
 const resizing = ref(false)
 const resizeStartX = ref(0)
 const resizeStartWidth = ref(380)
+let stopProgressListener: (() => void) | undefined
 
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
 const labels = computed(() => chinese.value
@@ -408,6 +432,11 @@ const labels = computed(() => chinese.value
       empty: '在这里开始与当前文档对话。',
       you: '你',
       ai: 'AI',
+      failureOutputTitle: '查看模型原始输出（调试）',
+      copyFailureOutput: '复制原始输出',
+      copied: '已复制',
+      failureOutputTruncated: '输出过长，已截断显示。',
+      modelReasoning: '模型思考（仅供参考）',
       placeholder: '输入问题或编辑指令…',
       attachHint: '粘贴或拖入图片或 PDF，也可点击选择',
       attachmentPrivacy: '附件会发送到当前配置的 AI 服务。',
@@ -456,6 +485,11 @@ const labels = computed(() => chinese.value
       empty: 'Start a conversation about the current document.',
       you: 'You',
       ai: 'AI',
+      failureOutputTitle: 'View raw model output (debug)',
+      copyFailureOutput: 'Copy raw output',
+      copied: 'Copied',
+      failureOutputTruncated: 'The output was too long and has been truncated.',
+      modelReasoning: 'Model reasoning (informational)',
       placeholder: 'Ask a question or describe an edit…',
       attachHint: 'Paste, drop, or choose images or PDFs',
       attachmentPrivacy: 'Attachments are sent to the configured AI service.',
@@ -550,6 +584,19 @@ const editSummaryLabel = (message: AiChatMessage): string => {
 const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const current = progress?.current
   const total = progress?.total
+  const tokenUsage = progress?.outputTokens === undefined
+    ? ''
+    : progress.inputTokens !== undefined
+      ? `${progress.outputTokensEstimated ? '约 ' : ''}${progress.inputTokens + progress.outputTokens} tokens（输入 ${progress.inputTokens} / 输出 ${progress.outputTokens}）`
+      : `${progress.outputTokensEstimated ? '约 ' : ''}输出 ${progress.outputTokens} tokens`
+  const attempt = progress?.attempt ? `第 ${progress.attempt} 次尝试` : ''
+  const failureReason = progress?.failureReason === 'exact-match'
+    ? 'SEARCH 未精确匹配'
+    : progress?.failureReason === 'truncated'
+      ? '输出被截断'
+      : progress?.failureReason === 'provider'
+        ? '模型请求失败'
+        : '格式不符合要求'
   if (chinese.value) {
     switch (progress?.phase) {
       case 'pdf-rendering':
@@ -558,11 +605,16 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'sending': return '正在发送给模型…'
       case 'sent': return '已发送给模型'
       case 'waiting': return '正在等待模型响应…'
+      case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
+      case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
+      case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
+      case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
+      case 'fallback': return `正在生成安全替代结果… · ${attempt}`
       case 'local-processing': return '正在本地解析和编辑…'
-      case 'completed': return '本地解析和编辑完成'
+      case 'completed': return tokenUsage ? `处理完成 · ${tokenUsage}` : '本地解析和编辑完成'
       case 'cancelled': return '请求已停止'
-      case 'failed': return '请求未完成'
+      case 'failed': return `请求失败${attempt ? ` · ${attempt}` : ''}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       default: return '正在处理…'
     }
   }
@@ -573,17 +625,83 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'sending': return 'Sending to model…'
     case 'sent': return 'Sent to model'
     case 'waiting': return 'Waiting for model response…'
+    case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
+    case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
+    case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
+    case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
+    case 'fallback': return `Generating safe fallback… · ${attempt}`
     case 'local-processing': return 'Parsing and editing locally…'
-    case 'completed': return 'Local parsing and editing completed'
+    case 'completed': return tokenUsage ? `Completed · ${tokenUsage}` : 'Local parsing and editing completed'
     case 'cancelled': return 'Request stopped'
-    case 'failed': return 'Request did not complete'
+    case 'failed': return `Request failed${attempt ? ` · ${attempt}` : ''}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     default: return 'Working…'
   }
 }
 
 const progressLabel = (message: AiChatMessage): string => progressLabelFor(message.progress)
-const currentProgressLabel = computed(() => progressLabelFor(ai.currentProgress))
+
+const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: number): string => {
+  if (!progress) return ''
+  const elapsed = `${Math.max(0, Math.floor(elapsedMs / 1000))} 秒`
+  const tokens = progress.outputTokensEstimated
+    ? `输出约 ${progress.outputTokens} tokens`
+    : `输出 ${progress.outputTokens} tokens`
+  const usage = progress.inputTokens !== undefined
+    ? `输入 ${progress.inputTokens} / ${tokens}`
+    : tokens
+  if (chinese.value) {
+    switch (progress.phase) {
+      case 'waiting': return `正在等待模型响应… · ${elapsed}`
+      case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
+      case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'attempt-failed': return `第 ${progress.attempt} 次尝试失败 · ${usage} · ${elapsed}`
+      case 'retrying': return `格式不符合要求，正在重试… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'fallback': return `正在生成安全替代结果… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'completed': return `处理完成 · ${elapsed}`
+      case 'failed': return `请求失败 · 第 ${progress.attempt} 次尝试 · ${usage} · ${elapsed}`
+      case 'cancelled': return `请求已停止 · ${elapsed}`
+      default: return `${tokens} · ${elapsed}`
+    }
+  }
+  switch (progress.phase) {
+    case 'waiting': return `Waiting for model response… · ${elapsed}`
+    case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
+    case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
+    case 'attempt-failed': return `Attempt ${progress.attempt} failed · ${usage} · ${elapsed}`
+    case 'retrying': return `Format validation failed; retrying… · attempt ${progress.attempt} · ${elapsed}`
+    case 'fallback': return `Generating safe fallback… · attempt ${progress.attempt} · ${elapsed}`
+    case 'completed': return `Completed · ${elapsed}`
+    case 'failed': return `Request failed · attempt ${progress.attempt} · ${usage} · ${elapsed}`
+    case 'cancelled': return `Request stopped · ${elapsed}`
+    default: return `${tokens} · ${elapsed}`
+  }
+}
+
+const currentProgressLabel = computed(() => ai.loading && ai.liveProgress
+  ? liveProgressLabel(ai.liveProgress, ai.liveProgressElapsedMs)
+  : progressLabelFor(ai.currentProgress))
+
+const copyFailureOutput = async (message: AiChatMessage): Promise<void> => {
+  const output = message.progress?.failureOutput
+  if (!output) return
+  try {
+    await navigator.clipboard.writeText(output)
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = output
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    textarea.remove()
+  }
+  copiedFailureId.value = message.id
+  window.setTimeout(() => {
+    if (copiedFailureId.value === message.id) copiedFailureId.value = ''
+  }, 1600)
+}
 
 const send = (): void => {
   const value = draft.value.trim()
@@ -744,6 +862,7 @@ const stopResize = (): void => {
 onMounted(() => {
   ai.loadSettings().catch(() => undefined)
   ai.loadChat().catch(() => undefined)
+  stopProgressListener = ai.listenForProgress()
   window.electron.ipcRenderer.on('mt::ai-settings-changed', (_event, value) => {
     ai.setSettings(value)
   })
@@ -759,6 +878,8 @@ watch(currentDocumentId, (value) => {
 })
 
 onUnmounted(() => {
+  stopProgressListener?.()
+  stopProgressListener = undefined
   window.electron.ipcRenderer.removeAllListeners('mt::ai-toggle-panel')
   window.electron.ipcRenderer.removeAllListeners('mt::ai-settings-changed')
   ai.clearPendingAttachments()
@@ -823,6 +944,14 @@ onUnmounted(() => {
 .ai-message-model { margin: -2px 0 6px; color: var(--editorColor50); font-size: 10px; }
 .ai-edit-summary { color: var(--editorColor80); font-size: 13px; line-height: 1.4; }
 .ai-message-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.45; }
+.ai-message-reasoning { margin-top: 8px; color: var(--editorColor50); font-size: 11px; line-height: 1.4; }
+.ai-message-reasoning summary { cursor: pointer; color: var(--editorColor60); }
+.ai-message-reasoning div { max-height: 220px; margin-top: 5px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-failure-output { margin-top: 7px; color: var(--editorColor60); font-size: 11px; }
+.ai-failure-output summary { cursor: pointer; }
+.ai-failure-output pre { max-height: 280px; margin: 6px 0; padding: 7px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--editorColor); background: var(--editorColor10); font: 11px/1.35 monospace; }
+.ai-failure-output small { display: block; margin-bottom: 5px; color: var(--editorColor50); }
+.ai-copy-failure { margin-top: 3px; }
 .ai-message-attachments, .ai-pending-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
 .ai-attachment-chip, .ai-pending-attachment { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; box-sizing: border-box; padding: 4px 7px; border: 1px solid var(--editorColor20); border-radius: 5px; color: var(--editorColor70); background: var(--editorColor05, transparent); font-size: 11px; overflow: hidden; }
 .ai-attachment-name { min-width: 0; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

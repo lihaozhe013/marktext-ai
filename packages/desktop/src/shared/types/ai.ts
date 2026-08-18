@@ -3,6 +3,8 @@ export type AiInteractionMode = 'answer' | 'edit' | 'rewrite'
 export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback'
 export type AiModelSource = 'manual' | 'discovered'
 export type AiReasoningControl = 'unknown' | 'effort' | 'budget'
+export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_content' | 'reasoning_text'
+export type AiReasoningTag = 'think' | 'thinking' | 'analysis' | 'reasoning'
 
 export interface AiRecoveryInfo {
   strategy: AiRecoveryStrategy
@@ -80,6 +82,9 @@ export type AiAttachmentData = AiImageData | AiPdfData
 
 export interface AiModelCapabilities {
   reasoningControl?: AiReasoningControl
+  reasoningField?: AiReasoningField
+  reasoningTag?: AiReasoningTag
+  replayReasoning?: boolean
 }
 
 export interface AiModelProfile {
@@ -107,6 +112,10 @@ export interface AiModelRef {
 export interface AiSettings {
   connections: AiConnectionProfile[]
   defaultModel?: AiModelRef
+  /** Number of protocol repair attempts after the initial edit generation. */
+  editAutoRetryCount?: number
+  /** Number of failed attempts before exposing the final raw model output. */
+  failureOutputAfter?: number
 }
 
 /** Compatibility alias for renderer code that refers to the AI settings object. */
@@ -157,7 +166,12 @@ export type AiProgressPhase =
   | 'sending'
   | 'sent'
   | 'waiting'
+  | 'streaming'
   | 'responded'
+  | 'validating'
+  | 'attempt-failed'
+  | 'retrying'
+  | 'fallback'
   | 'local-processing'
   | 'completed'
   | 'failed'
@@ -167,6 +181,37 @@ export interface AiProgressInfo {
   phase: AiProgressPhase
   current?: number
   total?: number
+  attempt?: number
+  elapsedMs?: number
+  outputTokens?: number
+  outputTokensEstimated?: boolean
+  inputTokens?: number
+  inputTokensEstimated?: boolean
+  failureReason?: AiFailureReason
+  failureCount?: number
+  failureOutput?: string
+  failureOutputTruncated?: boolean
+}
+
+export type AiFailureReason = 'format' | 'exact-match' | 'truncated' | 'provider' | 'unknown'
+
+export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'validating' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
+
+export interface AiProgressEvent {
+  requestId: string
+  mode: AiInteractionMode
+  phase: AiLiveProgressPhase
+  attempt: number
+  elapsedMs: number
+  outputTokens: number
+  outputTokensEstimated: boolean
+  inputTokens?: number
+  inputTokensEstimated?: boolean
+  streaming: boolean
+  failureReason?: AiFailureReason
+  failureCount?: number
+  failureOutput?: string
+  failureOutputTruncated?: boolean
 }
 
 export interface AiChatMessage {
@@ -174,6 +219,8 @@ export interface AiChatMessage {
   role: 'user' | 'assistant'
   mode: AiInteractionMode
   content: string
+  /** Provider reasoning kept separate from the assistant's usable content. */
+  reasoning?: string
   createdAt: number
   revisionId?: string
   editSummary?: AiEditSummary
@@ -223,6 +270,7 @@ export interface AiResponse {
   requestId: string
   mode: AiInteractionMode
   content: string
+  reasoning?: string
   summary?: string
   markdown?: string
   editSummary?: AiEditSummary

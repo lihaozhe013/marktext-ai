@@ -91,4 +91,28 @@ describe('AI provider image message serialization', () => {
       content: 'These images are rendered pages from report.pdf. Selected pages, in order: 1, 3.\n\nSummarize the document.'
     }])
   })
+
+  it('replays configured reasoning separately for compatible providers', () => {
+    expect(serializeProviderMessages('openai-chat-completions', [{
+      role: 'assistant',
+      content: 'Done',
+      reasoning: 'Plan'
+    }], 'reasoning_content', true)).toEqual([{
+      role: 'assistant',
+      content: 'Done',
+      reasoning_content: 'Plan'
+    }])
+
+    expect(serializeProviderMessages('anthropic-messages', [{
+      role: 'assistant',
+      content: 'Done',
+      reasoning: 'Plan'
+    }], undefined, true)).toEqual([{
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'Plan' },
+        { type: 'text', text: 'Done' }
+      ]
+    }])
+  })
 })

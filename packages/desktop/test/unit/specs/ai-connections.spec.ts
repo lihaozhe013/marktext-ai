@@ -15,8 +15,22 @@ import { AiService } from 'main_renderer/ai'
 const response = (payload: unknown, status = 200): Response => ({
   ok: status >= 200 && status < 300,
   status,
+  headers: { get: () => 'application/json' },
   text: async() => JSON.stringify(payload)
-} as Response)
+} as unknown as Response)
+
+const streamResponse = (events: string[], status = 200): Response => ({
+  ok: status >= 200 && status < 300,
+  status,
+  headers: { get: () => 'text/event-stream' },
+  body: new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder()
+      for (const event of events) controller.enqueue(encoder.encode(event))
+      controller.close()
+    }
+  })
+} as unknown as Response)
 
 const connection = (name: string, endpoint: string, model: string, apiKey: string): AiConnectionInput => ({
   name,
@@ -71,6 +85,51 @@ describe('AI connection profiles and model routing', () => {
     }])
     const migratedKeys = JSON.parse(await readFile(path.join(directory, 'ai-connection-key.json'), 'utf8'))
     expect(migratedKeys).toEqual({ 'legacy-default': 'legacy-key' })
+  })
+
+  it('persists and clamps the edit auto-retry setting', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-retries-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+
+    expect((await service.getSettings()).editAutoRetryCount).toBe(1)
+    expect((await service.setEditAutoRetryCount(0)).editAutoRetryCount).toBe(0)
+    expect((await service.setEditAutoRetryCount(99)).editAutoRetryCount).toBe(3)
+    expect((await service.getSettings()).editAutoRetryCount).toBe(3)
+    expect((await service.getSettings()).failureOutputAfter).toBe(1)
+    expect((await service.setFailureOutputAfter(0)).failureOutputAfter).toBe(0)
+    expect((await service.setFailureOutputAfter(99)).failureOutputAfter).toBe(3)
+    expect((await service.getSettings()).failureOutputAfter).toBe(3)
+  })
+
+  it('exposes the final raw edit output after the configured failure threshold', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-failure-output-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'failure-model', 'openai-key'))
+    await service.setEditAutoRetryCount(0)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: '<think>tool plan</think>raw tool output' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'raw protocol output' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const progress: Array<{ phase: string; failureCount?: number; failureOutput?: string }> = []
+
+    await expect(service.request({
+      requestId: 'failure-output-request',
+      documentId: 'tab:failure-output',
+      mode: 'edit',
+      prompt: 'Update the title.',
+      markdown: '# Original title',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    }, event => progress.push({ phase: event.phase, failureCount: event.failureCount, failureOutput: event.failureOutput }))).rejects.toThrow('after 2 attempts')
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'failed',
+      failureCount: 2,
+      failureOutput: 'raw protocol output'
+    })
   })
 
   it('discovers models without putting the key in the returned list', async() => {
@@ -162,6 +221,101 @@ describe('AI connection profiles and model routing', () => {
     expect(body).not.toHaveProperty('reasoning_effort')
     expect(body).not.toHaveProperty('thinking')
     expect(body).not.toHaveProperty('budget_tokens')
+  })
+
+  it('streams answer responses and reports live progress without changing the final response', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-streaming-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'stream-model', 'openai-key'))
+    const fetchMock = vi.fn().mockResolvedValue(streamResponse([
+      'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2}}\n\n',
+      'data: [DONE]\n\n'
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    const progress: Array<{ phase: string; outputTokens: number; outputTokensEstimated: boolean }> = []
+
+    const result = await service.request({
+      requestId: 'stream-request',
+      documentId: 'tab:stream',
+      mode: 'answer',
+      prompt: 'Say hello.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    }, event => progress.push({ phase: event.phase, outputTokens: event.outputTokens, outputTokensEstimated: event.outputTokensEstimated }))
+
+    expect(result.content).toBe('Hello')
+    expect(progress.some(event => event.phase === 'streaming')).toBe(true)
+    expect(progress.at(-1)).toMatchObject({ phase: 'validating', outputTokens: 2, outputTokensEstimated: false })
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.stream).toBe(true)
+    expect(body.stream_options).toEqual({ include_usage: true })
+  })
+
+  it('filters reasoning tags from ordinary JSON responses without a repair request', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-reasoning-json-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'OpenAI-compatible',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://openai.example/v1',
+      models: [{
+        model: 'tag-model',
+        label: 'Tag model',
+        capabilities: { reasoningTag: 'think' }
+      }],
+      apiKey: 'openai-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      choices: [{ message: { content: '<think>Plan the answer.</think>\nVisible answer' }, finish_reason: 'stop' }]
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'reasoning-json-request',
+      documentId: 'tab:reasoning-json',
+      mode: 'answer',
+      prompt: 'Answer briefly.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.content).toBe('Visible answer')
+    expect(result.reasoning).toBe('Plan the answer.')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back from rejected streaming options to a normal JSON response', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-stream-fallback-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'fallback-model', 'openai-key'))
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ error: { message: 'stream_options is unsupported' } }, 400))
+      .mockResolvedValueOnce(response({ error: { message: 'stream is unsupported' } }, 400))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Fallback answer' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'stream-fallback-request',
+      documentId: 'tab:stream-fallback',
+      mode: 'answer',
+      prompt: 'Say hello.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.content).toBe('Fallback answer')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toMatchObject({ stream: true, stream_options: { include_usage: true } })
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string)).toMatchObject({ stream: true })
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string)).not.toHaveProperty('stream_options')
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body as string)).not.toHaveProperty('stream')
   })
 
   it('sends locally rendered PDF pages as OpenAI image parts', async() => {

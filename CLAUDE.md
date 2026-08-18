@@ -85,6 +85,51 @@ AI logs use `[ai-editor]` and `[ai-output-repair]`; they must not include API
 keys, image bytes/base64, attachment paths, or document content. Relevant
 tests are in `packages/desktop/test/unit/specs/ai-*.spec.ts`.
 
+Final validation failures may expose a bounded raw model output through the
+typed progress event when the configured failure threshold is reached. This
+output is intentionally user-visible and copyable for debugging, while
+intermediate attempts remain summary-only and the raw output is never written
+to logs or chat history.
+
+### AI reasoning compatibility
+
+Reasoning is not a portable OpenAI-compatible field. Providers may expose it
+as a native field (`reasoning_content`, `reasoning`, `reason_content`, or
+`reasoning_text`), an Anthropic `thinking` content block, or a legacy
+`<think>...</think>`-style wrapper inside ordinary text. Treat the wrapper as
+a compatibility format, not as Markdown or as an edit protocol error.
+
+The provider boundary must normalize every response into separate usable
+`content` and optional `reasoning` values. Field extraction takes precedence
+over tag extraction. Tag extraction is block-oriented and must not modify
+fenced code, inline code, or ordinary HTML. A response containing only
+reasoning and no usable content is still an empty provider response and must
+not be applied.
+
+Reasoning handling by mode:
+
+- `answer`: show reasoning only in a separate, explicitly labeled UI section;
+  never merge it into the answer text or normal chat context.
+- `edit`: pass only normalized `content` to the tool/protocol parser. A
+  reasoning block must never cause a protocol retry by itself.
+- `rewrite`: pass only normalized `content` to Markdown repair and validation;
+  do not persist reasoning as document Markdown.
+
+Model profiles may declare `reasoningField`, `reasoningTag`, and
+`replayReasoning`. Provider-specific request controls must only be sent when a
+model profile declares that capability. If `replayReasoning` is enabled, the
+configured reasoning field is preserved on assistant history because some
+thinking APIs require it on follow-up requests. Unknown fields are not sent to
+the provider. Reasoning content may be shown and stored only as a separate chat
+field; it must never be merged into Markdown or written to diagnostic logs.
+
+The streaming parser must tolerate tags and JSON fields split across chunks.
+Local reasoning normalization is not a provider retry. A retry is allowed only
+when normalized content is empty, truncated, or fails the existing Markdown,
+tool, or SEARCH/REPLACE validation. Keep tests for native fields, Anthropic
+thinking blocks, split tags, protected code, reasoning-only responses, and
+assistant-history replay in `packages/desktop/test/unit/specs/ai-*.spec.ts`.
+
 ### AI Edit Transaction Contract
 
 This is a fork-owned design contract for AI document mutations. Read it before

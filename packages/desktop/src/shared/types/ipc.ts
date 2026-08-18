@@ -40,6 +40,7 @@ import type {
   AiModelListInput,
   AiModelRef,
   AiPreparedRevision,
+  AiProgressEvent,
   AiRequest,
   AiResponse,
   AiSettings,
@@ -54,6 +55,8 @@ import type {
 
 export interface IpcInvokeChannels {
   'mt::ai::get-settings': { args: []; ret: AiSettings }
+  'mt::ai::set-edit-retry-count': { args: [retryCount: number]; ret: AiSettings }
+  'mt::ai::set-failure-output-after': { args: [failureCount: number]; ret: AiSettings }
   'mt::ai::save-connection': { args: [connection: AiConnectionInput]; ret: AiSettings }
   'mt::ai::delete-connection': { args: [connectionId: string]; ret: AiSettings }
   'mt::ai::delete-connection-key': { args: [connectionId: string]; ret: AiSettings }
@@ -256,6 +259,7 @@ export interface IpcMainEventChannels {
   'mt::about-dialog': []
   'mt::ask-for-close': []
   'mt::ai-settings-changed': [settings: AiSettings]
+  'mt::ai::progress': [payload: AiProgressEvent]
   'mt::ai-toggle-panel': []
   'mt::bootstrap-editor': [config: BootstrapEditorConfig]
   'mt::cm-copy-as-html': []
