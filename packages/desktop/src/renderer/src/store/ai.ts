@@ -172,6 +172,11 @@ export const useAiStore = defineStore('ai', () => {
   const pendingRecovery = ref<PendingAiRecovery | null>(null)
   const activeRequestId = ref<string | null>(null)
   const activeDocumentId = ref('')
+  // Requests in this set have already changed the editor one validated step at
+  // a time. Their final response only carries the summary; it must not replay
+  // the complete document through the transactional apply path.
+  const progressiveEditRequests = new Set<string>()
+  const expectedAgentMarkdown = new Map<string, string>()
   const changeTracker = new AiChangeTracker()
   const changeVersion = ref(0)
   const lastSavedSequence = new Map<string, number>()
@@ -325,7 +330,9 @@ export const useAiStore = defineStore('ai', () => {
       session.status !== 'applying' &&
       data.markdown !== session.beforeMarkdown
     ) {
-      setAiEditSessionStatus(session.requestId, 'stale')
+      if (expectedAgentMarkdown.get(session.requestId) !== data.markdown) {
+        setAiEditSessionStatus(session.requestId, 'stale')
+      }
     }
     refreshChangeMarker(data.id)
   })
@@ -508,11 +515,65 @@ export const useAiStore = defineStore('ai', () => {
     }, 1000)
   }
 
+  const applyAgentStep = (event: AiProgressEvent): void => {
+    if (
+      event.phase !== 'agent-step' ||
+      typeof event.documentId !== 'string' ||
+      typeof event.stepBaseMarkdown !== 'string' ||
+      typeof event.stepMarkdown !== 'string'
+    ) return
+    const session = aiEditSession.value
+    const currentFile = editorStore.currentFile
+    if (
+      !session ||
+      session.requestId !== event.requestId ||
+      session.documentId !== event.documentId ||
+      session.status === 'stale' ||
+      !currentFile ||
+      currentFile.id !== session.tabId ||
+      (!progressiveEditRequests.has(event.requestId) && currentFile.markdown !== event.stepBaseMarkdown)
+    ) {
+      setAiEditSessionStatus(event.requestId, 'stale')
+      window.electron.ipcRenderer.send('mt::ai::cancel', event.requestId)
+      return
+    }
+    if (!setAiEditSessionStatus(event.requestId, 'applying')) return
+    expectedAgentMarkdown.set(event.requestId, event.stepMarkdown)
+    let settled = false
+    const onApplied = (success: boolean, appliedMarkdown?: string): void => {
+      if (settled) return
+      settled = true
+      if (!success) {
+        setAiEditSessionStatus(event.requestId, 'stale')
+        window.electron.ipcRenderer.send('mt::ai::cancel', event.requestId)
+        return
+      }
+      progressiveEditRequests.add(event.requestId)
+      if (typeof appliedMarkdown === 'string') expectedAgentMarkdown.set(event.requestId, appliedMarkdown)
+      setAiEditSessionStatus(event.requestId, 'running')
+    }
+    bus.emit('ai-apply-markdown', {
+      tabId: session.tabId,
+      surface: session.surface,
+      mode: 'edit',
+      beforeMarkdown: event.stepBaseMarkdown,
+      markdown: event.stepMarkdown,
+      onApplied
+    } satisfies AiApplyPayload)
+    queueMicrotask(() => {
+      if (settled) return
+      settled = true
+      setAiEditSessionStatus(event.requestId, 'stale')
+      window.electron.ipcRenderer.send('mt::ai::cancel', event.requestId)
+    })
+  }
+
   const listenForProgress = (): (() => void) => window.electron.ipcRenderer.on('mt::ai::progress', (_event, event) => {
     if (!activeRequestId.value || event.requestId !== activeRequestId.value) return
     if (!liveProgressStartedAt) liveProgressStartedAt = Date.now() - event.elapsedMs
     liveProgress.value = event
     liveProgressElapsedMs.value = Math.max(event.elapsedMs, Date.now() - liveProgressStartedAt)
+    applyAgentStep(event)
     if (!['attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
     const progress: AiProgressInfo = {
       phase: event.phase,
@@ -525,7 +586,15 @@ export const useAiStore = defineStore('ai', () => {
       failureCount: event.failureCount,
       failureOutput: event.failureOutput,
       failureOutputTruncated: event.failureOutputTruncated,
-      failureReason: event.failureReason
+      failureReason: event.failureReason,
+      step: event.step,
+      maxSteps: event.maxSteps,
+      successfulSteps: event.successfulSteps,
+      toolFailures: event.toolFailures,
+      documentVersion: event.documentVersion,
+      stepDescription: event.stepDescription,
+      cachedInputTokens: event.cachedInputTokens,
+      cacheWriteInputTokens: event.cacheWriteInputTokens
     }
     progressPersistSequence = progressPersistSequence
       .then(() => appendProgress(event.phase, progress))
@@ -534,7 +603,7 @@ export const useAiStore = defineStore('ai', () => {
 
   const appendProgress = async(
     phase: AiProgressPhase,
-    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated'>> = {}
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'cachedInputTokens' | 'cacheWriteInputTokens'>> = {}
   ): Promise<void> => {
     const progress: AiProgressInfo = { phase, ...details }
     currentProgress.value = progress
@@ -552,6 +621,14 @@ export const useAiStore = defineStore('ai', () => {
       outputTokensEstimated: progress.outputTokensEstimated,
       inputTokens: progress.inputTokens,
       inputTokensEstimated: progress.inputTokensEstimated,
+      step: progress.step,
+      maxSteps: progress.maxSteps,
+      successfulSteps: progress.successfulSteps,
+      toolFailures: progress.toolFailures,
+      documentVersion: progress.documentVersion,
+      stepDescription: progress.stepDescription,
+      cachedInputTokens: progress.cachedInputTokens,
+      cacheWriteInputTokens: progress.cacheWriteInputTokens,
       failureCount: progress.failureCount,
       failureOutput: progress.failureOutput,
       failureOutputTruncated: progress.failureOutputTruncated
@@ -757,7 +834,9 @@ export const useAiStore = defineStore('ai', () => {
           keepEditSession = true
         } else {
           await appendProgress('local-processing')
-          const applied = await applyEdit(response, requestId, requestTabId, baseMarkdown)
+          const applied = progressiveEditRequests.has(requestId)
+            ? await finishProgressiveEdit(response, requestId, requestTabId, baseMarkdown)
+            : await applyEdit(response, requestId, requestTabId, baseMarkdown)
           if (applied) await appendProgress('completed', finalProgressDetails())
         }
       }
@@ -779,6 +858,8 @@ export const useAiStore = defineStore('ai', () => {
         stopLiveProgress()
       }
       if (!keepEditSession) endAiEditSession(requestId)
+      progressiveEditRequests.delete(requestId)
+      expectedAgentMarkdown.delete(requestId)
     }
   }
 
@@ -933,6 +1014,43 @@ export const useAiStore = defineStore('ai', () => {
       })
     })
     return applied
+  }
+
+  const finishProgressiveEdit = async(
+    response: AiResponse,
+    requestId: string,
+    tabId: string,
+    beforeMarkdown: string
+  ): Promise<boolean> => {
+    const session = aiEditSession.value
+    const currentMarkdown = editorStore.currentFile?.markdown
+    if (
+      !session ||
+      session.requestId !== requestId ||
+      session.tabId !== tabId ||
+      session.status === 'stale' ||
+      editorStore.currentFile?.id !== tabId ||
+      currentMarkdown === undefined
+    ) {
+      error.value = 'The document changed while the AI was working. Completed agent steps were kept.'
+      return false
+    }
+    const revisionId = `agent-${requestId}`
+    changeTracker.apply(
+      tabId,
+      revisionId,
+      beforeMarkdown,
+      currentMarkdown,
+      response.editSummary ? rangesFromSummary(currentMarkdown, response.editSummary) : fullDocumentRange(currentMarkdown)
+    )
+    refreshChangeMarker(tabId)
+    appendMessage('assistant', response.summary ?? '', response.mode, {
+      editSummary: response.editSummary,
+      model: response.model,
+      reasoning: response.reasoning
+    })
+    await saveChat()
+    return true
   }
 
   const acceptPendingRecovery = async(): Promise<void> => {

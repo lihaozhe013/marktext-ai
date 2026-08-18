@@ -114,6 +114,8 @@ export interface AiSettings {
   defaultModel?: AiModelRef
   /** Number of protocol repair attempts after the initial edit generation. */
   editAutoRetryCount?: number
+  /** Maximum number of successful local agent edits per precise-edit request. */
+  editAgentMaxSteps?: number
   /** Number of failed attempts before exposing the final raw model output. */
   failureOutputAfter?: number
 }
@@ -169,6 +171,7 @@ export type AiProgressPhase =
   | 'streaming'
   | 'responded'
   | 'validating'
+  | 'agent-step'
   | 'attempt-failed'
   | 'retrying'
   | 'fallback'
@@ -191,11 +194,19 @@ export interface AiProgressInfo {
   failureCount?: number
   failureOutput?: string
   failureOutputTruncated?: boolean
+  step?: number
+  maxSteps?: number
+  successfulSteps?: number
+  toolFailures?: number
+  documentVersion?: number
+  stepDescription?: string
+  cachedInputTokens?: number
+  cacheWriteInputTokens?: number
 }
 
-export type AiFailureReason = 'format' | 'exact-match' | 'truncated' | 'provider' | 'unknown'
+export type AiFailureReason = 'format' | 'exact-match' | 'truncated' | 'provider' | 'capability' | 'unknown'
 
-export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'validating' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
+export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'validating' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
 
 export interface AiProgressEvent {
   requestId: string
@@ -212,6 +223,18 @@ export interface AiProgressEvent {
   failureCount?: number
   failureOutput?: string
   failureOutputTruncated?: boolean
+  step?: number
+  maxSteps?: number
+  successfulSteps?: number
+  toolFailures?: number
+  documentVersion?: number
+  stepDescription?: string
+  cachedInputTokens?: number
+  cacheWriteInputTokens?: number
+  /** The validated agent step snapshot to apply immediately in the renderer. */
+  documentId?: string
+  stepBaseMarkdown?: string
+  stepMarkdown?: string
 }
 
 export interface AiChatMessage {

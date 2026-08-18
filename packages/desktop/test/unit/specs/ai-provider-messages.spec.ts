@@ -27,6 +27,29 @@ describe('AI provider image message serialization', () => {
     ])
   })
 
+  it('serializes linked multi-turn tool calls and results', () => {
+    const messages = [
+      {
+        role: 'assistant' as const,
+        content: '',
+        toolCalls: [{ id: 'call-1', name: 'apply_markdown_edit', input: { version: 0 }, rawInput: '{"version":0}' }]
+      },
+      {
+        role: 'user' as const,
+        content: '',
+        toolResults: [{ toolCallId: 'call-1', content: '{"ok":true}' }]
+      }
+    ]
+    expect(serializeProviderMessages('openai-chat-completions', messages)).toEqual([
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'apply_markdown_edit', arguments: '{"version":0}' } }] },
+      { role: 'tool', tool_call_id: 'call-1', content: '{"ok":true}' }
+    ])
+    expect(serializeProviderMessages('anthropic-messages', messages)).toEqual([
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call-1', name: 'apply_markdown_edit', input: { version: 0 } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: '{"ok":true}' }] }
+    ])
+  })
+
   it('serializes OpenAI-compatible images before text', () => {
     expect(serializeProviderMessages('openai-chat-completions', messages)).toEqual([
       {

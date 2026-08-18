@@ -11,6 +11,8 @@ export interface ProviderMessage {
   reasoning?: string
   images?: ProviderImage[]
   attachmentContext?: string
+  toolCalls?: ProviderToolCall[]
+  toolResults?: ProviderToolResult[]
 }
 
 export interface ProviderToolDefinition {
@@ -20,32 +22,62 @@ export interface ProviderToolDefinition {
 }
 
 export interface ProviderToolCall {
+  id?: string
   name: string
-  input: unknown
+  input?: unknown
+  rawInput?: string
+  parseError?: string
 }
 
+export interface ProviderToolResult {
+  toolCallId: string
+  content: string
+  isError?: boolean
+}
+
+export const applyMarkdownEditTool: ProviderToolDefinition = {
+  name: 'apply_markdown_edit',
+  description: 'Apply exactly one precise Markdown replacement to the current virtual document. SEARCH must be copied exactly and uniquely from the current document.',
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      version: { type: 'integer', minimum: 0 },
+      search: { type: 'string' },
+      replace: { type: 'string' },
+      description: { type: 'string', maxLength: 160 }
+    },
+    required: ['version', 'search', 'replace', 'description']
+  }
+}
+
+export const finishMarkdownEditTool: ProviderToolDefinition = {
+  name: 'finish_markdown_edit',
+  description: 'Finish the Markdown editing task after all requested changes have been applied to the virtual document.',
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      version: { type: 'integer', minimum: 0 },
+      summary: { type: 'string', maxLength: 240 }
+    },
+    required: ['version', 'summary']
+  }
+}
+
+export const preciseEditTools: ProviderToolDefinition[] = [applyMarkdownEditTool, finishMarkdownEditTool]
+
+/** @deprecated Kept for persisted/test callers; the agent uses preciseEditTools. */
 export const preciseEditTool: ProviderToolDefinition = {
   name: 'submit_markdown_edits',
-  description: 'Submit validated Markdown edit operations. SEARCH strings must be copied exactly from the current document.',
+  description: 'Submit validated Markdown edit operations.',
   parameters: {
     type: 'object',
     additionalProperties: false,
     properties: {
       status: { type: 'string', enum: ['changed', 'no_changes'] },
       summary: { type: 'string' },
-      edits: {
-        type: 'array',
-        maxItems: 32,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            search: { type: 'string' },
-            replace: { type: 'string' }
-          },
-          required: ['search', 'replace']
-        }
-      }
+      edits: { type: 'array', maxItems: 32, items: { type: 'object', properties: { search: { type: 'string' }, replace: { type: 'string' } }, required: ['search', 'replace'] } }
     },
     required: ['status', 'summary', 'edits']
   }
@@ -58,7 +90,7 @@ export const serializeProviderMessages = (
   messages: ProviderMessage[],
   reasoningField?: AiReasoningField,
   replayReasoning = false
-): Array<Record<string, unknown>> => messages.map(message => {
+): Array<Record<string, unknown>> => messages.flatMap((message): Array<Record<string, unknown>> => {
   const images = message.images ?? []
   const content = message.attachmentContext
     ? `${message.attachmentContext}\n\n${message.content}`
@@ -67,16 +99,64 @@ export const serializeProviderMessages = (
   const reasoning = reasoningField && shouldReplayReasoning
     ? { [reasoningField]: message.reasoning }
     : {}
+  const toolCalls = message.toolCalls ?? []
+  const toolResults = message.toolResults ?? []
+  if (protocol === 'openai-chat-completions' && message.role === 'assistant' && toolCalls.length) {
+    return [{
+      role: 'assistant',
+      content: content || null,
+      tool_calls: toolCalls.map(call => ({
+        id: call.id,
+        type: 'function',
+        function: {
+          name: call.name,
+          arguments: call.rawInput ?? JSON.stringify(call.input ?? {})
+        }
+      })),
+      ...reasoning
+    }]
+  }
+  if (protocol === 'openai-chat-completions' && toolResults.length) {
+    return toolResults.map(result => ({
+      role: 'tool',
+      tool_call_id: result.toolCallId,
+      content: result.content
+    }))
+  }
   if (!images.length && protocol === 'anthropic-messages' && shouldReplayReasoning) {
-    return {
+    return [{
       role: message.role,
       content: [
         { type: 'thinking', thinking: message.reasoning },
+        ...(content ? [{ type: 'text', text: content }] : []),
+        ...toolCalls.map(call => ({ type: 'tool_use', id: call.id, name: call.name, input: call.input ?? {} }))
+      ]
+    }]
+  }
+  if (protocol === 'anthropic-messages' && message.role === 'assistant' && toolCalls.length) {
+    return [{
+      role: 'assistant',
+      content: [
+        ...(content ? [{ type: 'text', text: content }] : []),
+        ...toolCalls.map(call => ({ type: 'tool_use', id: call.id, name: call.name, input: call.input ?? {} }))
+      ]
+    }]
+  }
+  if (protocol === 'anthropic-messages' && toolResults.length) {
+    return [{
+      role: 'user',
+      content: [
+        ...toolResults.map(result => ({
+          type: 'tool_result',
+          tool_use_id: result.toolCallId,
+          content: result.content,
+          ...(result.isError ? { is_error: true } : {})
+        })),
         ...(content ? [{ type: 'text', text: content }] : [])
       ]
-    }
+    }]
   }
-  if (!images.length) return { role: message.role, content, ...reasoning }
+  if (!images.length) return [{ role: message.role, content, ...reasoning }]
   if (protocol === 'anthropic-messages') {
     const anthropicContent = [
       ...(shouldReplayReasoning ? [{ type: 'thinking', thinking: message.reasoning }] : []),
@@ -90,12 +170,12 @@ export const serializeProviderMessages = (
       })),
       { type: 'text', text: content }
     ]
-    return {
+    return [{
       role: message.role,
       content: anthropicContent
-    }
+    }]
   }
-  return {
+  return [{
     role: message.role,
     content: [
       ...images.map(image => ({
@@ -105,5 +185,5 @@ export const serializeProviderMessages = (
       { type: 'text', text: content }
     ],
     ...reasoning
-  }
+  }]
 })

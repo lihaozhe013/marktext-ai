@@ -590,7 +590,7 @@ const editSummaryLabel = (message: AiChatMessage): string => {
 const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const current = progress?.current
   const total = progress?.total
-  const tokenUsage = progress?.outputTokens === undefined
+  const baseTokenUsage = progress?.outputTokens === undefined
     ? ''
     : progress.inputTokens !== undefined
       ? chinese.value
@@ -599,6 +599,10 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       : chinese.value
         ? `${progress.outputTokensEstimated ? '约 ' : ''}输出 ${progress.outputTokens} tokens`
         : `${progress.outputTokensEstimated ? 'about ' : ''}${progress.outputTokens} output tokens`
+  const cacheUsage = progress?.cachedInputTokens !== undefined
+    ? chinese.value ? `缓存输入 ${progress.cachedInputTokens}` : `cached input ${progress.cachedInputTokens}`
+    : ''
+  const tokenUsage = [baseTokenUsage, cacheUsage].filter(Boolean).join(' · ')
   const attempt = progress?.attempt
     ? chinese.value ? `第 ${progress.attempt} 次尝试` : `attempt ${progress.attempt}`
     : ''
@@ -608,7 +612,9 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       ? chinese.value ? '输出被截断' : 'Output was truncated'
       : progress?.failureReason === 'provider'
         ? chinese.value ? '模型请求失败' : 'Model request failed'
-        : chinese.value ? '格式不符合要求' : 'Format validation failed'
+        : progress?.failureReason === 'capability'
+          ? chinese.value ? '模型不支持工具调用' : 'Model does not support tool calling'
+          : chinese.value ? '格式不符合要求' : 'Format validation failed'
   if (chinese.value) {
     switch (progress?.phase) {
       case 'pdf-rendering':
@@ -620,6 +626,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
       case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
+      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
       case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
       case 'fallback': return `正在生成安全替代结果… · ${attempt}`
@@ -640,6 +647,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
     case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
+    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${progress?.stepDescription ? ` · ${progress.stepDescription}` : ''}`
     case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
     case 'fallback': return `Generating safe fallback… · ${attempt}`
@@ -658,9 +666,12 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
   const elapsed = chinese.value
     ? `${Math.max(0, Math.floor(elapsedMs / 1000))} 秒`
     : `${Math.max(0, Math.floor(elapsedMs / 1000))} seconds`
-  const tokens = progress.outputTokensEstimated
+  const outputTokens = progress.outputTokensEstimated
     ? chinese.value ? `输出约 ${progress.outputTokens} tokens` : `about ${progress.outputTokens} output tokens`
     : chinese.value ? `输出 ${progress.outputTokens} tokens` : `${progress.outputTokens} output tokens`
+  const tokens = progress.cachedInputTokens !== undefined
+    ? `${outputTokens} · ${chinese.value ? `缓存输入 ${progress.cachedInputTokens}` : `cached input ${progress.cachedInputTokens}`}`
+    : outputTokens
   const usage = progress.inputTokens !== undefined
     ? chinese.value ? `输入 ${progress.inputTokens} / ${tokens}` : `input ${progress.inputTokens} / ${tokens}`
     : tokens
@@ -669,6 +680,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
       case 'waiting': return `正在等待模型响应… · ${elapsed}`
       case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
       case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
+      case 'agent-step': return `第 ${progress.step ?? 0}/${progress.maxSteps ?? 0} 步已应用，继续执行… · ${elapsed}`
       case 'attempt-failed': return `第 ${progress.attempt} 次尝试失败 · ${usage} · ${elapsed}`
       case 'retrying': return `格式不符合要求，正在重试… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
       case 'fallback': return `正在生成安全替代结果… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
@@ -682,6 +694,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
     case 'waiting': return `Waiting for model response… · ${elapsed}`
     case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
     case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
+    case 'agent-step': return `Applied agent step ${progress.step ?? 0}/${progress.maxSteps ?? 0}; continuing… · ${elapsed}`
     case 'attempt-failed': return `Attempt ${progress.attempt} failed · ${usage} · ${elapsed}`
     case 'retrying': return `Format validation failed; retrying… · attempt ${progress.attempt} · ${elapsed}`
     case 'fallback': return `Generating safe fallback… · attempt ${progress.attempt} · ${elapsed}`

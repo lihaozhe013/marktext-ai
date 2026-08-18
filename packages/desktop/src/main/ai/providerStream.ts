@@ -10,6 +10,8 @@ import {
 export interface ProviderUsage {
   inputTokens?: number
   outputTokens?: number
+  cachedInputTokens?: number
+  cacheWriteInputTokens?: number
 }
 
 export interface ProviderStreamProgress {
@@ -35,11 +37,13 @@ interface SseEvent {
 }
 
 interface OpenAiToolAccumulator {
+  id: string
   name: string
   arguments: string
 }
 
 interface AnthropicToolAccumulator {
+  id: string
   name: string
   input: string
 }
@@ -160,7 +164,8 @@ const readOpenAiDelta = (
     for (const item of delta.tool_calls) {
       if (!isRecord(item)) continue
       const index = asNumber(item.index) ?? tools.size
-      const current = tools.get(index) ?? { name: '', arguments: '' }
+      const current = tools.get(index) ?? { id: '', name: '', arguments: '' }
+      if (typeof item.id === 'string') current.id = item.id
       const functionValue = isRecord(item.function) ? item.function : undefined
       if (typeof functionValue?.name === 'string') current.name += functionValue.name
       if (typeof functionValue?.arguments === 'string') current.arguments += functionValue.arguments
@@ -172,8 +177,14 @@ const readOpenAiDelta = (
   const payloadUsage = isRecord(payload.usage) ? payload.usage : undefined
   const inputTokens = asNumber(payloadUsage?.prompt_tokens)
   const outputTokens = asNumber(payloadUsage?.completion_tokens)
+  const promptDetails = isRecord(payloadUsage?.prompt_tokens_details) ? payloadUsage.prompt_tokens_details : undefined
+  const cachedInputTokens = asNumber(promptDetails?.cached_tokens)
   if (inputTokens !== undefined || outputTokens !== undefined) {
-    usage.value = { inputTokens, outputTokens }
+    usage.value = {
+      ...(inputTokens !== undefined ? { inputTokens } : {}),
+      ...(outputTokens !== undefined ? { outputTokens } : {}),
+      ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {})
+    }
   }
   return {
     content: typeof delta?.content === 'string' ? delta.content : '',
@@ -195,12 +206,22 @@ const readAnthropicDelta = (
     const message = isRecord(payload.message) ? payload.message : undefined
     const messageUsage = message && isRecord(message.usage) ? message.usage : undefined
     const inputTokens = asNumber(messageUsage?.input_tokens)
-    if (inputTokens !== undefined) usage.value = { ...usage.value, inputTokens }
+    const cachedInputTokens = asNumber(messageUsage?.cache_read_input_tokens)
+    const cacheWriteInputTokens = asNumber(messageUsage?.cache_creation_input_tokens)
+    if (inputTokens !== undefined || cachedInputTokens !== undefined || cacheWriteInputTokens !== undefined) {
+      usage.value = {
+        ...usage.value,
+        ...(inputTokens !== undefined ? { inputTokens } : {}),
+        ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+        ...(cacheWriteInputTokens !== undefined ? { cacheWriteInputTokens } : {})
+      }
+    }
   } else if (eventType === 'content_block_start') {
     const index = asNumber(payload.index) ?? tools.size
     const block = isRecord(payload.content_block) ? payload.content_block : undefined
     if (block?.type === 'tool_use') {
       tools.set(index, {
+        id: typeof block.id === 'string' ? block.id : '',
         name: typeof block.name === 'string' ? block.name : '',
         input: ''
       })
@@ -218,7 +239,7 @@ const readAnthropicDelta = (
       return { content: '', reasoning: thinking }
     }
     if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
-      const tool = tools.get(index) ?? { name: '', input: '' }
+      const tool = tools.get(index) ?? { id: '', name: '', input: '' }
       tool.input += delta.partial_json
       tools.set(index, tool)
     }
@@ -227,7 +248,16 @@ const readAnthropicDelta = (
     if (delta?.stop_reason === 'max_tokens') state.truncated = true
     const deltaUsage = isRecord(payload.usage) ? payload.usage : undefined
     const outputTokens = asNumber(deltaUsage?.output_tokens)
-    if (outputTokens !== undefined) usage.value = { ...usage.value, outputTokens }
+    const cachedInputTokens = asNumber(deltaUsage?.cache_read_input_tokens)
+    const cacheWriteInputTokens = asNumber(deltaUsage?.cache_creation_input_tokens)
+    if (outputTokens !== undefined || cachedInputTokens !== undefined || cacheWriteInputTokens !== undefined) {
+      usage.value = {
+        ...usage.value,
+        ...(outputTokens !== undefined ? { outputTokens } : {}),
+        ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+        ...(cacheWriteInputTokens !== undefined ? { cacheWriteInputTokens } : {})
+      }
+    }
   }
   return { content: '', reasoning: '' }
 }
@@ -289,11 +319,29 @@ export const consumeProviderStream = async(
 
   const toolCalls: ProviderToolCall[] = protocol === 'anthropic-messages'
     ? [...anthropicTools.values()]
-      .map(tool => ({ name: tool.name, input: parseToolInput(tool.input) }))
-      .filter(tool => !!tool.name && tool.input !== undefined)
+      .map(tool => {
+        const input = parseToolInput(tool.input)
+        return {
+          ...(tool.id ? { id: tool.id } : {}),
+          name: tool.name,
+          input,
+          ...(tool.id ? { rawInput: tool.input } : {}),
+          ...(input === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
+        }
+      })
+      .filter(tool => !!tool.name)
     : [...openAiTools.values()]
-      .map(tool => ({ name: tool.name, input: parseToolInput(tool.arguments) }))
-      .filter(tool => !!tool.name && tool.input !== undefined)
+      .map(tool => {
+        const input = parseToolInput(tool.arguments)
+        return {
+          ...(tool.id ? { id: tool.id } : {}),
+          name: tool.name,
+          input,
+          ...(tool.id ? { rawInput: tool.arguments } : {}),
+          ...(input === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
+        }
+      })
+      .filter(tool => !!tool.name)
 
   const normalized = normalizeProviderContent(content.value, reasoning.value, compatibility, 'field')
   if (!done && !normalized.content && !toolCalls.length) {
