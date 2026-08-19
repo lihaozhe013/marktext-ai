@@ -73,6 +73,7 @@ $ pnpm run build:linux
 - [Debugging](DEBUGGING.md)
 - [Inter-process communication (IPC)](IPC.md)
 - [Interface](INTERFACE.md)
+- [AI edit Agent flow and state machine](AI_EDIT_AGENT.md)
 - [Steps to release MarkText](RELEASE.md)
 - [Prepare a hotfix](RELEASE_HOTFIX.md)
 - [TypeScript layout and conventions](TYPESCRIPT.md)

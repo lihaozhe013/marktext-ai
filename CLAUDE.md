@@ -81,6 +81,12 @@ renderer AI panel/store, and `packages/desktop/src/shared/types/ai.ts`:
   human changes. AI edits can be undone deterministically without another
   model call.
 
+The complete request lifecycle and precise-edit state machine are documented in
+[`packages/website/content/docs/dev/AI_EDIT_AGENT.md`](packages/website/content/docs/dev/AI_EDIT_AGENT.md).
+Read it before changing Agent tools, progress phases, progressive step
+application, chat persistence ordering, recovery confirmation, or AI edit
+cleanup. Update that document when the lifecycle or state ownership changes.
+
 AI logs use `[ai-editor]` and `[ai-output-repair]`; they must not include API
 keys, image bytes/base64, attachment paths, or document content. Relevant
 tests are in `packages/desktop/test/unit/specs/ai-*.spec.ts`.
