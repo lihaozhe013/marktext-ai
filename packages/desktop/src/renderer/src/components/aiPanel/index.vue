@@ -96,29 +96,6 @@
       >
         {{ labels.empty }}
       </div>
-      <section
-        v-if="ai.loading && ai.liveProgress?.planStepCount !== undefined"
-        class="ai-plan-card"
-        role="status"
-      >
-        <div class="ai-plan-title">
-          {{ labels.editPlan }}
-        </div>
-        <div class="ai-plan-summary">
-          {{ ai.liveProgress.planSummary }}
-        </div>
-        <div class="ai-plan-count">
-          {{ labels.planSteps(ai.liveProgress.planStepCount) }}
-        </div>
-        <ol>
-          <li
-            v-for="(description, index) in ai.liveProgress.planStepDescriptions || []"
-            :key="`${index}-${description}`"
-          >
-            {{ description }}
-          </li>
-        </ol>
-      </section>
       <article
         v-for="message in ai.messages"
         :key="message.id"
@@ -126,7 +103,30 @@
         :class="[message.role, { 'ai-status-message': message.kind === 'status' }]"
       >
         <div
-          v-if="message.kind === 'status' && message.progress?.phase === 'agent-step' && hasStepDiff(message.progress)"
+          v-if="message.kind === 'status' && message.progress?.phase === 'agent-plan'"
+          class="ai-plan-card"
+          role="status"
+        >
+          <div class="ai-plan-title">
+            {{ labels.editPlan }}
+          </div>
+          <div class="ai-plan-summary">
+            {{ message.progress.planSummary }}
+          </div>
+          <div class="ai-plan-count">
+            {{ labels.planSteps(message.progress.planStepCount ?? 0) }}
+          </div>
+          <ol>
+            <li
+              v-for="(description, index) in message.progress.planStepDescriptions || []"
+              :key="`${index}-${description}`"
+            >
+              {{ description }}
+            </li>
+          </ol>
+        </div>
+        <div
+          v-else-if="message.kind === 'status' && message.progress?.phase === 'agent-step' && hasStepDiff(message.progress)"
           class="ai-step-diff"
           role="status"
         >

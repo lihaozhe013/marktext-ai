@@ -716,6 +716,7 @@ export class AiService {
   private readonly controllers = new Map<string, AbortController>()
   private readonly toolCapabilities = new Map<string, boolean>()
   private settingsMutation: Promise<void> = Promise.resolve()
+  private chatMutation: Promise<void> = Promise.resolve()
 
   constructor(userDataPath: string) {
     this.settingsPath = path.join(userDataPath, SETTINGS_FILE)
@@ -728,6 +729,12 @@ export class AiService {
   private queueSettingsMutation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.settingsMutation.then(operation, operation)
     this.settingsMutation = result.then(() => undefined, () => undefined)
+    return result
+  }
+
+  private queueChatMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.chatMutation.then(operation, operation)
+    this.chatMutation = result.then(() => undefined, () => undefined)
     return result
   }
 
@@ -1857,28 +1864,32 @@ export class AiService {
   }
 
   async saveChat(documentId: string, session: AiChatSession): Promise<void> {
-    const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-    const normalized: AiChatSession = {
-      messages: normalizeMessages(session.messages),
-      selectedModel: normalizeModelRef(session.selectedModel)
-    }
-    all[documentId] = normalized
-    for (const [id, pendingDocumentId] of this.pendingAttachmentDocuments) {
-      if (pendingDocumentId === documentId) {
-        this.pendingAttachmentIds.delete(id)
-        this.pendingAttachmentDocuments.delete(id)
-        this.attachmentMimeTypes.delete(id)
+    return this.queueChatMutation(async() => {
+      const all = await readJson<Record<string, unknown>>(this.chatPath, {})
+      const normalized: AiChatSession = {
+        messages: normalizeMessages(session.messages),
+        selectedModel: normalizeModelRef(session.selectedModel)
       }
-    }
-    await writeJsonAtomic(this.chatPath, all)
-    await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
+      all[documentId] = normalized
+      for (const [id, pendingDocumentId] of this.pendingAttachmentDocuments) {
+        if (pendingDocumentId === documentId) {
+          this.pendingAttachmentIds.delete(id)
+          this.pendingAttachmentDocuments.delete(id)
+          this.attachmentMimeTypes.delete(id)
+        }
+      }
+      await writeJsonAtomic(this.chatPath, all)
+      await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
+    })
   }
 
   async clearChat(documentId: string): Promise<void> {
-    const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-    delete all[documentId]
-    await writeJsonAtomic(this.chatPath, all)
-    await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
+    return this.queueChatMutation(async() => {
+      const all = await readJson<Record<string, unknown>>(this.chatPath, {})
+      delete all[documentId]
+      await writeJsonAtomic(this.chatPath, all)
+      await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
+    })
   }
 
   async cleanupAttachments(): Promise<void> {
@@ -1964,22 +1975,24 @@ export class AiService {
 
   async migrateDocumentIdentity(fromDocumentId: string, toDocumentId: string): Promise<void> {
     if (!fromDocumentId || !toDocumentId || fromDocumentId === toDocumentId) return
-    const chats = await readJson<Record<string, unknown>>(this.chatPath, {})
-    if (chats[fromDocumentId] !== undefined) {
-      chats[toDocumentId] = chats[toDocumentId] ?? chats[fromDocumentId]
-      delete chats[fromDocumentId]
-      await writeJsonAtomic(this.chatPath, chats)
-    }
-    const state = await this.readRevisions()
-    let changed = false
-    for (const revision of state.revisions) {
-      if (revision.documentId === fromDocumentId) {
-        revision.documentId = toDocumentId
-        changed = true
+    return this.queueChatMutation(async() => {
+      const chats = await readJson<Record<string, unknown>>(this.chatPath, {})
+      if (chats[fromDocumentId] !== undefined) {
+        chats[toDocumentId] = chats[toDocumentId] ?? chats[fromDocumentId]
+        delete chats[fromDocumentId]
+        await writeJsonAtomic(this.chatPath, chats)
       }
-    }
-    if (changed) await writeJsonAtomic(this.revisionPath, state)
-    await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
+      const state = await this.readRevisions()
+      let changed = false
+      for (const revision of state.revisions) {
+        if (revision.documentId === fromDocumentId) {
+          revision.documentId = toDocumentId
+          changed = true
+        }
+      }
+      if (changed) await writeJsonAtomic(this.revisionPath, state)
+      await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
+    })
   }
 }
 

@@ -42,6 +42,8 @@ import {
   AI_PDF_MIME_TYPES
 } from '@shared/types/ai'
 import { AiChangeTracker, rangesFromSummary, fullDocumentRange, type AiChangeMarker } from './aiChangeTracker'
+import { createAiChatPersistenceQueue } from './aiChatPersistence'
+import { toIpcChatMessages } from './aiChatSerialization'
 import {
   defaultPdfPages,
   formatPdfPageSelection,
@@ -120,37 +122,6 @@ const resolveAttachmentMimeType = (file: File): AiAttachment['mimeType'] | undef
   return MIME_BY_EXTENSION[extension]
 }
 
-// Pinia wraps store values in Vue reactive proxies. Electron IPC uses the
-// structured clone algorithm, which cannot clone those proxies, so every
-// chat message crossing the renderer/main boundary must be copied explicitly.
-const toIpcChatMessage = (message: AiChatMessage): AiChatMessage => ({
-  id: message.id,
-  role: message.role,
-  mode: message.mode,
-  content: message.content,
-  reasoning: message.reasoning,
-  createdAt: message.createdAt,
-  revisionId: message.revisionId,
-  kind: message.kind,
-  progress: message.progress ? { ...message.progress } : undefined,
-  attachments: message.attachments?.map(attachment => ({
-    ...attachment,
-    ...(attachment.mimeType === 'application/pdf' && attachment.pages ? { pages: [...attachment.pages] } : {})
-  })),
-  model: message.model ? { ...message.model } : undefined,
-  editSummary: message.editSummary
-    ? {
-      operationCount: message.editSummary.operationCount,
-      addedLines: message.editSummary.addedLines,
-      removedLines: message.editSummary.removedLines,
-      operations: message.editSummary.operations.map(operation => ({ ...operation }))
-    }
-    : undefined
-})
-
-const toIpcChatMessages = (items: readonly AiChatMessage[]): AiChatMessage[] =>
-  items.map(toIpcChatMessage)
-
 export const useAiStore = defineStore('ai', () => {
   const editorStore = useEditorStore()
   const preferencesStore = usePreferencesStore()
@@ -183,6 +154,9 @@ export const useAiStore = defineStore('ai', () => {
   let saveSequence = 0
   let chatLoadSequence = 0
   let loadedChatDocumentId = ''
+  const chatPersistence = createAiChatPersistenceQueue(error => {
+    featureLog('chat save failed reason=%s', error instanceof Error ? error.message : String(error))
+  })
 
   const modelRefKey = (value: AiModelRef | undefined): string => value
     ? JSON.stringify(value)
@@ -426,17 +400,18 @@ export const useAiStore = defineStore('ai', () => {
     }
   }
 
-  const saveChat = async(): Promise<void> => {
-    if (activeDocumentId.value) {
-      await window.electron.ipcRenderer.invoke(
-        'mt::ai::chat-save',
-        activeDocumentId.value,
-        {
-          messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
-          selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined
-        }
-      )
+  const enqueueChatPersistence = (operation: () => Promise<void>): Promise<void> => {
+    return chatPersistence.enqueue(operation)
+  }
+
+  const saveChat = (): Promise<void> => {
+    const documentId = activeDocumentId.value
+    if (!documentId) return Promise.resolve()
+    const session: AiChatSession = {
+      messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
+      selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined
     }
+    return enqueueChatPersistence(() => window.electron.ipcRenderer.invoke('mt::ai::chat-save', documentId, session))
   }
 
   const clearChat = async(): Promise<void> => {
@@ -451,7 +426,8 @@ export const useAiStore = defineStore('ai', () => {
     }
     pendingRecovery.value = null
     if (activeDocumentId.value) {
-      await window.electron.ipcRenderer.invoke('mt::ai::chat-clear', activeDocumentId.value)
+      const documentId = activeDocumentId.value
+      await enqueueChatPersistence(() => window.electron.ipcRenderer.invoke('mt::ai::chat-clear', documentId))
     }
   }
 
@@ -574,7 +550,7 @@ export const useAiStore = defineStore('ai', () => {
     liveProgress.value = event
     liveProgressElapsedMs.value = Math.max(event.elapsedMs, Date.now() - liveProgressStartedAt)
     applyAgentStep(event)
-    if (!['agent-step', 'attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
+    if (!['agent-plan', 'agent-step', 'attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
     const progress: AiProgressInfo = {
       phase: event.phase,
       attempt: event.attempt,
@@ -593,6 +569,11 @@ export const useAiStore = defineStore('ai', () => {
       toolFailures: event.toolFailures,
       documentVersion: event.documentVersion,
       stepDescription: event.stepDescription,
+      planSummary: event.planSummary,
+      planStepCount: event.planStepCount,
+      planStepDescriptions: event.planStepDescriptions,
+      planRevisionCount: event.planRevisionCount,
+      currentPlanStep: event.currentPlanStep,
       stepAddedLines: event.stepAddedLines,
       stepRemovedLines: event.stepRemovedLines,
       stepRemovedText: event.stepRemovedText,
@@ -600,9 +581,7 @@ export const useAiStore = defineStore('ai', () => {
       cachedInputTokens: event.cachedInputTokens,
       cacheWriteInputTokens: event.cacheWriteInputTokens
     }
-    progressPersistSequence = progressPersistSequence
-      .then(() => appendProgress(event.phase, progress))
-      .catch(() => undefined)
+    enqueueProgress(event.phase, progress)
   })
 
   const appendProgress = async(
@@ -613,6 +592,18 @@ export const useAiStore = defineStore('ai', () => {
     currentProgress.value = progress
     appendMessage('assistant', '', 'answer', { kind: 'status', progress })
     await saveChat()
+  }
+
+  const enqueueProgress = (
+    phase: AiProgressPhase,
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
+  ): Promise<void> => {
+    progressPersistSequence = progressPersistSequence
+      .then(() => appendProgress(phase, details))
+      .catch(error => {
+        featureLog('progress persistence failed phase=%s reason=%s', phase, error instanceof Error ? error.message : String(error))
+      })
+    return progressPersistSequence
   }
 
   const finalProgressDetails = (): Partial<AiProgressInfo> => {
@@ -782,16 +773,16 @@ export const useAiStore = defineStore('ai', () => {
       const uploads: AiAttachmentUpload[] = pending.map(item => ({ ...item.attachment, data: new Uint8Array(item.data) }))
       appendMessage('user', value, requestMode, { attachments })
       await saveChat()
-      if (renderingPdf.value) await appendProgress('pdf-rendering')
+      if (renderingPdf.value) await enqueueProgress('pdf-rendering')
       const renderedPdfPages = await prepareRenderedPdfPages(
         requestDocumentId,
         contextMessages,
         pending,
-        async(current, total) => appendProgress('pdf-rendering', { current, total })
+        async(current, total) => enqueueProgress('pdf-rendering', { current, total })
       )
       if (renderingPdf.value) {
         const renderedPageCount = renderedPdfPages.reduce((total, item) => total + item.pages.length, 0)
-        await appendProgress('pdf-rendered', { current: renderedPageCount, total: renderedPageCount })
+        await enqueueProgress('pdf-rendered', { current: renderedPageCount, total: renderedPageCount })
       }
       pendingAttachments.value = []
       attachmentError.value = ''
@@ -805,9 +796,9 @@ export const useAiStore = defineStore('ai', () => {
       )
       error.value = ''
       renderingPdf.value = false
-      await appendProgress('sending')
-      await appendProgress('sent')
-      await appendProgress('waiting')
+      await enqueueProgress('sending')
+      await enqueueProgress('sent')
+      await enqueueProgress('waiting')
       const response: AiResponse = await window.electron.ipcRenderer.invoke('mt::ai::request', {
         requestId,
         documentId,
@@ -820,12 +811,12 @@ export const useAiStore = defineStore('ai', () => {
         renderedPdfPages
       })
       if (requestId !== activeRequestId.value || documentId !== currentDocumentId.value) return
-      await appendProgress('responded')
+      await enqueueProgress('responded')
       if (requestMode === 'answer') {
         appendMessage('assistant', response.content, requestMode, { model: response.model, reasoning: response.reasoning })
         lastAnswer.value = response.content
         await saveChat()
-        await appendProgress('completed', finalProgressDetails())
+        await enqueueProgress('completed', finalProgressDetails())
       } else if (response.markdown !== undefined) {
         if (response.recovery?.requiresConfirmation) {
           if (!setAiEditSessionStatus(requestId, 'awaiting-confirmation')) {
@@ -841,11 +832,11 @@ export const useAiStore = defineStore('ai', () => {
           }
           keepEditSession = true
         } else {
-          await appendProgress('local-processing')
+          await enqueueProgress('local-processing')
           const applied = progressiveEditRequests.has(requestId)
             ? await finishProgressiveEdit(response, requestId, requestTabId, baseMarkdown)
             : await applyEdit(response, requestId, requestTabId, baseMarkdown)
-          if (applied) await appendProgress('completed', finalProgressDetails())
+          if (applied) await enqueueProgress('completed', finalProgressDetails())
         }
       }
     } catch (err) {
@@ -856,7 +847,7 @@ export const useAiStore = defineStore('ai', () => {
           attachmentError.value = 'pdf-render-failed'
         }
         error.value = err instanceof Error ? err.message : String(err)
-        if (liveProgress.value?.phase !== 'failed') await appendProgress('failed', finalProgressDetails()).catch(() => undefined)
+        if (liveProgress.value?.phase !== 'failed') await enqueueProgress('failed', finalProgressDetails())
       }
     } finally {
       renderingPdf.value = false
@@ -877,6 +868,14 @@ export const useAiStore = defineStore('ai', () => {
     } catch (err) {
       featureLog('revision discard failed revisionId=%s reason=%s', revisionId, err instanceof Error ? err.message : String(err))
     }
+  }
+
+  const responseSummary = (response: AiResponse): string => {
+    const summary = response.summary?.trim()
+    if (summary) return summary
+    const operationCount = response.editSummary?.operationCount ?? 0
+    if (!operationCount) return 'No document changes were needed.'
+    return `Applied ${operationCount} local edit${operationCount === 1 ? '' : 's'}.`
   }
 
   const applyEdit = async(
@@ -907,7 +906,7 @@ export const useAiStore = defineStore('ai', () => {
       return false
     }
     if (nextMarkdown === beforeMarkdown) {
-      appendMessage('assistant', response.summary ?? '', response.mode, {
+      appendMessage('assistant', responseSummary(response), response.mode, {
         editSummary: response.editSummary,
         reasoning: response.reasoning
       })
@@ -987,7 +986,7 @@ export const useAiStore = defineStore('ai', () => {
                 changeTracker.markSaved(tabId)
               }
               refreshChangeMarker(tabId)
-              appendMessage('assistant', response.summary ?? '', response.mode, {
+              appendMessage('assistant', responseSummary(response), response.mode, {
                 revisionId,
                 editSummary: response.editSummary,
                 model: response.model,
@@ -1052,7 +1051,7 @@ export const useAiStore = defineStore('ai', () => {
       response.editSummary ? rangesFromSummary(currentMarkdown, response.editSummary) : fullDocumentRange(currentMarkdown)
     )
     refreshChangeMarker(tabId)
-    appendMessage('assistant', response.summary ?? '', response.mode, {
+    appendMessage('assistant', responseSummary(response), response.mode, {
       editSummary: response.editSummary,
       model: response.model,
       reasoning: response.reasoning
@@ -1082,7 +1081,7 @@ export const useAiStore = defineStore('ai', () => {
     activeRequestId.value = null
     loading.value = false
     stopLiveProgress()
-    appendProgress(
+    enqueueProgress(
       'cancelled',
       progress
         ? {

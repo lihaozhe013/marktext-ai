@@ -166,12 +166,12 @@ describe('document edit agent', () => {
     expect(result.markdown).toBe('# Title')
   })
 
-  it('rejects an invented first anchor in an empty document and accepts a corrected plan', async() => {
+  it('rejects an end anchor on the first step of an empty document and accepts a corrected plan', async() => {
     let turn = 0
     const diagnostics: DocumentEditValidationDiagnostic[] = []
     const generateAgent = vi.fn(async() => {
       turn += 1
-      if (turn === 1) return { content: '', toolCalls: [{ id: 'bad-plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Create a guide.', steps: [{ id: 'first', description: 'Create the guide.', intent: 'Insert the guide.', startAnchor: '<!DOCTYPE html>', dependsOn: [] }] } }] }
+      if (turn === 1) return { content: '', toolCalls: [{ id: 'bad-plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Create a guide.', steps: [{ id: 'first', description: 'Create the guide.', intent: 'Insert the guide.', startAnchor: '', endAnchor: 'intro', dependsOn: [] }] } }] }
       if (turn === 2) return { content: '', toolCalls: [{ id: 'good-plan', name: 'create_markdown_edit_plan', input: { version: 0, summary: 'Create a guide.', steps: [{ id: 'first', description: 'Create the guide.', intent: 'Insert the guide.', startAnchor: '', dependsOn: [] }] } }] }
       if (turn === 3) return { content: '', toolCalls: [{ id: 'apply', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'first', search: '', replace: '# HTML Guide', description: 'Created the guide.' } }] }
       return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 1, summary: 'Created the guide.' } }] }
