@@ -439,6 +439,25 @@ describe('AI connection profiles and model routing', () => {
     expect((await service.loadChat('tab:progress')).messages[0].progress).toEqual({ phase: 'waiting' })
   })
 
+  it('serializes concurrent chat saves without losing the later session', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-chat-queue-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+
+    await Promise.all([
+      service.saveChat('tab:queue', {
+        messages: [{ id: 'queue-user', role: 'user', mode: 'edit', content: 'Add a plan.', createdAt: 1 }]
+      }),
+      service.saveChat('tab:queue', {
+        messages: [{ id: 'queue-completed', role: 'assistant', mode: 'edit', content: 'Completed.', createdAt: 2 }]
+      })
+    ])
+
+    expect((await service.loadChat('tab:queue')).messages).toEqual([
+      expect.objectContaining({ id: 'queue-completed', content: 'Completed.' })
+    ])
+  })
+
   it('sends rendered PDF pages to Anthropic as images', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-anthropic-pdf-'))
     directories.push(directory)

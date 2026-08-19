@@ -746,6 +746,7 @@ const validateInitialPlan = (markdown: string, steps: AgentPlanStep[]): void => 
   if (!first) return
   if (!markdown) {
     if (first.startAnchor) throw new Error('The first plan step for an empty document must use an empty startAnchor and an empty SEARCH insertion.')
+    if (first.endAnchor !== undefined) throw new Error('The first plan step for an empty document must not provide an endAnchor.')
     return
   }
   try {
