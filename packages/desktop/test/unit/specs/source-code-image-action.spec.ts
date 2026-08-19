@@ -56,7 +56,8 @@ const loadComponent = (deps: Record<string, unknown>) => {
     `const { _defineComponent, ref, watch, onMounted, onBeforeUnmount, nextTick,
       useEditorStore, usePreferencesStore, storeToRefs, codeMirror,
       setCursorAtFirstLine, setTextDirection, getWordCount, adjustCursor, bus,
-      oneDarkThemes, railscastsThemes, aiEditLocked, isAiEditLocked } = __deps
+      oneDarkThemes, railscastsThemes, aiEditLocked, isAiEditLocked,
+      createAiEditorSurfaceController } = __deps
     ${js}
     return module.exports`
   ) as (deps: Record<string, unknown>, exports: object, module: object) => SetupModule
@@ -85,6 +86,10 @@ const makeDeps = (over: Record<string, unknown> = {}) => ({
   railscastsThemes: [],
   aiEditLocked: ref(false),
   isAiEditLocked: () => false,
+  createAiEditorSurfaceController: ({ setLocked, applyMarkdown }: {
+    setLocked: (locked: boolean) => void
+    applyMarkdown: (request: unknown) => unknown
+  }) => ({ setLocked, applyMarkdown }),
   ...over
 })
 
