@@ -109,6 +109,7 @@ describe('AI image attachment validation and storage', () => {
       const storedPath = path.join(directory, 'ai-attachments', 'attachment-test-0001.png')
       expect(new Uint8Array(await readFile(storedPath))).toEqual(png())
       expect(await store.read('attachment-test-0001', 'image/png')).toEqual({ mimeType: 'image/png', data: png() })
+      await utimes(storedPath, new Date(0), new Date(0))
       await store.prune(new Set(), 0)
       await expect(readFile(storedPath)).rejects.toThrow()
 
