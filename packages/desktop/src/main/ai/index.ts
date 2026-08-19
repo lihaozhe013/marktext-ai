@@ -55,6 +55,8 @@ import {
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
 import { featureLog, connectionLog } from './logging'
 import { readJson, writeJsonAtomic } from './storage'
+import { AiChatStore } from './chatStore'
+import { AiRevisionStore } from './revisionStore'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
 const SETTINGS_SCHEMA_VERSION = 4
@@ -115,8 +117,6 @@ class ProviderRequestError extends Error {
   }
 }
 
-const normalizeRevisionMarkdown = (value: string): string => value.replace(/[\r\n]+$/, '')
-
 const makeFailureOutput = (rawContent: string, content: string, reasoning?: string): { value?: string; truncated: boolean } => {
   const visible = rawContent || content
   const reasoningSuffix = reasoning && !visible.includes(reasoning)
@@ -157,12 +157,12 @@ interface ResolvedModelTarget {
   attribution: AiMessageModel
 }
 
-interface StoredRevision extends AiPreparedRevision {
+export interface StoredRevision extends AiPreparedRevision {
   status: 'prepared' | 'committed'
   committedAt?: number
 }
 
-interface StoredRevisionState {
+export interface StoredRevisionState {
   revisions: StoredRevision[]
 }
 
@@ -670,33 +670,44 @@ export class AiService {
   private readonly settingsPath: string
   private readonly keyPath: string
   private readonly chatPath: string
-  private readonly revisionPath: string
   private readonly attachmentStore: AiAttachmentStore
+  private readonly chatStore: AiChatStore
+  private readonly revisionStore: AiRevisionStore
   private readonly pendingAttachmentIds = new Map<string, number>()
   private readonly pendingAttachmentDocuments = new Map<string, string>()
   private readonly attachmentMimeTypes = new Map<string, AiAttachment['mimeType']>()
   private readonly controllers = new Map<string, AbortController>()
   private readonly toolCapabilities = new Map<string, boolean>()
   private settingsMutation: Promise<void> = Promise.resolve()
-  private chatMutation: Promise<void> = Promise.resolve()
 
   constructor(userDataPath: string) {
     this.settingsPath = path.join(userDataPath, SETTINGS_FILE)
     this.keyPath = path.join(userDataPath, KEY_FILE)
     this.chatPath = path.join(userDataPath, CHAT_FILE)
-    this.revisionPath = path.join(userDataPath, REVISION_FILE)
     this.attachmentStore = new AiAttachmentStore(userDataPath)
+    this.revisionStore = new AiRevisionStore(path.join(userDataPath, REVISION_FILE))
+    this.chatStore = new AiChatStore(this.chatPath, {
+      normalizeMessages,
+      normalizeModel: normalizeModelRef,
+      normalizeSession: normalizeChatSession,
+      clearPendingAttachments: documentId => {
+        for (const [id, pendingDocumentId] of this.pendingAttachmentDocuments) {
+          if (pendingDocumentId === documentId) {
+            this.pendingAttachmentIds.delete(id)
+            this.pendingAttachmentDocuments.delete(id)
+            this.attachmentMimeTypes.delete(id)
+          }
+        }
+      },
+      pruneAttachments: graceMs => this.pruneAttachments(graceMs),
+      onCleanupError: error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)),
+      migrateRevisions: (fromDocumentId, toDocumentId) => this.revisionStore.migrateDocumentIdentity(fromDocumentId, toDocumentId)
+    })
   }
 
   private queueSettingsMutation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.settingsMutation.then(operation, operation)
     this.settingsMutation = result.then(() => undefined, () => undefined)
-    return result
-  }
-
-  private queueChatMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.chatMutation.then(operation, operation)
-    this.chatMutation = result.then(() => undefined, () => undefined)
     return result
   }
 
@@ -1821,140 +1832,39 @@ export class AiService {
   }
 
   async loadChat(documentId: string): Promise<AiChatSession> {
-    const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-    return normalizeChatSession(all[documentId])
+    return this.chatStore.load(documentId)
   }
 
   async saveChat(documentId: string, session: AiChatSession): Promise<void> {
-    return this.queueChatMutation(async() => {
-      const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-      const normalized: AiChatSession = {
-        messages: normalizeMessages(session.messages),
-        selectedModel: normalizeModelRef(session.selectedModel)
-      }
-      all[documentId] = normalized
-      for (const [id, pendingDocumentId] of this.pendingAttachmentDocuments) {
-        if (pendingDocumentId === documentId) {
-          this.pendingAttachmentIds.delete(id)
-          this.pendingAttachmentDocuments.delete(id)
-          this.attachmentMimeTypes.delete(id)
-        }
-      }
-      await writeJsonAtomic(this.chatPath, all)
-      await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
-    })
+    return this.chatStore.save(documentId, session)
   }
 
   async clearChat(documentId: string): Promise<void> {
-    return this.queueChatMutation(async() => {
-      const all = await readJson<Record<string, unknown>>(this.chatPath, {})
-      delete all[documentId]
-      await writeJsonAtomic(this.chatPath, all)
-      await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
-    })
+    return this.chatStore.clear(documentId)
   }
 
   async cleanupAttachments(): Promise<void> {
     await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
   }
 
-  private async readRevisions(): Promise<StoredRevisionState> {
-    const state = await readJson<StoredRevisionState>(this.revisionPath, { revisions: [] })
-    return { revisions: Array.isArray(state.revisions) ? state.revisions : [] }
-  }
-
   async prepareRevision(request: AiRevisionRequest): Promise<AiPreparedRevision> {
-    if (!request.documentId) throw new Error('Invalid document identity.')
-    const revision: StoredRevision = {
-      ...request,
-      revisionId: crypto.randomUUID(),
-      preparedAt: Date.now(),
-      status: 'prepared'
-    }
-    const state = await this.readRevisions()
-    state.revisions.push(revision)
-    await writeJsonAtomic(this.revisionPath, state)
-    featureLog(
-      'revision prepared revisionId=%s beforeChars=%s afterChars=%s',
-      revision.revisionId,
-      revision.beforeMarkdown.length,
-      revision.afterMarkdown.length
-    )
-    return revision
+    return this.revisionStore.prepare(request)
   }
 
   async commitRevision(revisionId: string, documentId: string, afterMarkdown: string): Promise<void> {
-    const state = await this.readRevisions()
-    const revision = state.revisions.find((item) => item.revisionId === revisionId)
-    if (!revision || revision.documentId !== documentId) throw new Error('Revision is no longer valid.')
-    // Muya may normalize Markdown while applying a replacement. The renderer
-    // sends that serialized result back, which is the canonical content for
-    // undo and must replace the model's pre-serialization output.
-    revision.afterMarkdown = afterMarkdown
-    revision.status = 'committed'
-    revision.committedAt = Date.now()
-    await writeJsonAtomic(this.revisionPath, state)
-    featureLog(
-      'revision committed revisionId=%s afterChars=%s',
-      revisionId,
-      afterMarkdown.length
-    )
+    return this.revisionStore.commit(revisionId, documentId, afterMarkdown)
   }
 
   async discardRevision(revisionId: string): Promise<void> {
-    const state = await this.readRevisions()
-    const nextRevisions = state.revisions.filter(item => item.revisionId !== revisionId || item.status !== 'prepared')
-    if (nextRevisions.length === state.revisions.length) return
-    await writeJsonAtomic(this.revisionPath, { revisions: nextRevisions })
-    featureLog('revision discarded revisionId=%s', revisionId)
+    return this.revisionStore.discard(revisionId)
   }
 
   async undoRevision(documentId: string, currentMarkdown: string): Promise<AiUndoResult | null> {
-    const state = await this.readRevisions()
-    const revision = [...state.revisions]
-      .reverse()
-      .find((item) => item.documentId === documentId && item.status === 'committed')
-    if (!revision || normalizeRevisionMarkdown(revision.afterMarkdown) !== normalizeRevisionMarkdown(currentMarkdown)) return null
-    const inverse: StoredRevision = {
-      revisionId: crypto.randomUUID(),
-      documentId,
-      beforeMarkdown: currentMarkdown,
-      afterMarkdown: revision.beforeMarkdown,
-      mode: 'edit',
-      preparedAt: Date.now(),
-      status: 'committed',
-      committedAt: Date.now()
-    }
-    state.revisions.push(inverse)
-    await writeJsonAtomic(this.revisionPath, state)
-    return {
-      revisionId: inverse.revisionId,
-      documentId,
-      beforeMarkdown: inverse.beforeMarkdown,
-      afterMarkdown: inverse.afterMarkdown
-    }
+    return this.revisionStore.undo(documentId, currentMarkdown)
   }
 
   async migrateDocumentIdentity(fromDocumentId: string, toDocumentId: string): Promise<void> {
-    if (!fromDocumentId || !toDocumentId || fromDocumentId === toDocumentId) return
-    return this.queueChatMutation(async() => {
-      const chats = await readJson<Record<string, unknown>>(this.chatPath, {})
-      if (chats[fromDocumentId] !== undefined) {
-        chats[toDocumentId] = chats[toDocumentId] ?? chats[fromDocumentId]
-        delete chats[fromDocumentId]
-        await writeJsonAtomic(this.chatPath, chats)
-      }
-      const state = await this.readRevisions()
-      let changed = false
-      for (const revision of state.revisions) {
-        if (revision.documentId === fromDocumentId) {
-          revision.documentId = toDocumentId
-          changed = true
-        }
-      }
-      if (changed) await writeJsonAtomic(this.revisionPath, state)
-      await this.pruneAttachments(0).catch(error => featureLog('attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
-    })
+    return this.chatStore.migrateDocumentIdentity(fromDocumentId, toDocumentId)
   }
 }
 
