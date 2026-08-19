@@ -10,6 +10,7 @@ import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useEditorStore } from '@/store/editor'
 import { usePreferencesStore } from '@/store/preferences'
 import { aiEditLocked, isAiEditLocked } from '@/store/aiEditSession'
+import { createAiEditorSurfaceController } from '@/store/aiEditorBridge'
 // import type { AiChangeMarker } from '@/store/aiChangeTracker'
 import { findMarkdownHeadingLine, scrollSourceEditorToLine } from '@/util/sourceModeToc'
 import { storeToRefs } from 'pinia'
@@ -56,7 +57,26 @@ const applyAiSourceLock = (locked: boolean): void => {
   editor.value?.setOption('readOnly', locked)
 }
 
-watch(aiEditLocked, locked => applyAiSourceLock(locked), { immediate: true })
+const aiSurfaceController = createAiEditorSurfaceController({
+  surface: 'source',
+  getTabId: () => tabId.value,
+  setLocked: applyAiSourceLock,
+  applyMarkdown: request => {
+    if (!editor.value) throw new Error('Source editor is unavailable.')
+    aiRawApplyInProgress = true
+    try {
+      const lastLine = editor.value.lineCount() - 1
+      const end = { line: lastLine, ch: editor.value.getLine(lastLine).length }
+      editor.value.replaceRange(request.markdown, { line: 0, ch: 0 }, end, 'ai-editor')
+      saveContent(editor.value)
+      return request.markdown
+    } finally {
+      aiRawApplyInProgress = false
+    }
+  }
+})
+
+watch(aiEditLocked, locked => aiSurfaceController.setLocked(locked), { immediate: true })
 
 const isValidMuyaIndexCursor = (cursor: unknown): cursor is MuyaIndexCursorLike => {
   const c = cursor as MuyaIndexCursorLike | null | undefined
@@ -133,35 +153,8 @@ interface FileChangePayloadLike {
   muyaIndexCursor?: unknown
 }
 
-interface AiApplyPayload {
-  tabId: string
-  surface: 'wysiwyg' | 'source'
-  mode: 'edit' | 'undo'
-  beforeMarkdown: string
-  markdown: string
-  onApplied: (success: boolean, markdown?: string) => void
-}
-
 const handleAiApply = (payload: unknown): void => {
-  const request = payload as AiApplyPayload
-  if (!request || request.surface !== 'source') return
-  if (!editor.value || tabId.value !== request.tabId) {
-    request?.onApplied(false)
-    return
-  }
-  try {
-    aiRawApplyInProgress = true
-    const lastLine = editor.value.lineCount() - 1
-    const end = { line: lastLine, ch: editor.value.getLine(lastLine).length }
-    editor.value.replaceRange(request.markdown, { line: 0, ch: 0 }, end, 'ai-editor')
-    saveContent(editor.value)
-    request.onApplied(true, request.markdown)
-  } catch (err) {
-    console.error('[ai-editor] source Markdown apply failed', err)
-    request.onApplied(false)
-  } finally {
-    aiRawApplyInProgress = false
-  }
+  aiSurfaceController.handleApply(payload)
 }
 
 const handleFileChange = (payload: unknown) => {

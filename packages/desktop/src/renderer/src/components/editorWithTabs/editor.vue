@@ -130,6 +130,7 @@ import { usePreferencesStore } from '@/store/preferences'
 import { useEditorStore } from '@/store/editor'
 import { useProjectStore } from '@/store/project'
 import { aiEditLocked, isAiEditLocked, pruneAiDocumentRevisions } from '@/store/aiEditSession'
+import { createAiEditorSurfaceController } from '@/store/aiEditorBridge'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { SyntheticHistory, type IFileHistoryLike } from './syntheticHistory'
@@ -1181,7 +1182,24 @@ const applyAiEditorLock = (locked: boolean): void => {
   root.setAttribute('aria-disabled', String(locked))
 }
 
-watch(aiEditLocked, locked => applyAiEditorLock(locked), { immediate: true })
+const aiSurfaceController = createAiEditorSurfaceController({
+  surface: 'wysiwyg',
+  getTabId: () => currentFile.value?.id,
+  setLocked: applyAiEditorLock,
+  applyMarkdown: request => {
+    if (!editor.value) throw new Error('WYSIWYG editor is unavailable.')
+    aiRawMarkdownOverride = request.markdown
+    try {
+      editor.value.replaceContent(request.markdown)
+      editorStore.UPDATE_TOC(editor.value.getTOC())
+      return request.markdown
+    } finally {
+      aiRawMarkdownOverride = null
+    }
+  }
+})
+
+watch(aiEditLocked, locked => aiSurfaceController.setLocked(locked), { immediate: true })
 
 // Viewport-relative caret rect (mirrors the engine's `Selection.getCursorCoords`
 // / legacy `cursorCoords`). Used for typewriter + keep-cursor-visible scrolling
@@ -1524,33 +1542,8 @@ interface FileChangePayload {
   isReload?: boolean
 }
 
-interface AiApplyPayload {
-  tabId: string
-  surface: 'wysiwyg' | 'source'
-  mode: 'edit' | 'undo'
-  beforeMarkdown: string
-  markdown: string
-  onApplied: (success: boolean, markdown?: string) => void
-}
-
 const handleAiApply = (payload: unknown): void => {
-  const request = payload as AiApplyPayload
-  if (!request || request.surface !== 'wysiwyg') return
-  if (!editor.value || currentFile.value?.id !== request.tabId) {
-    request?.onApplied(false)
-    return
-  }
-  try {
-    aiRawMarkdownOverride = request.markdown
-    editor.value.replaceContent(request.markdown)
-    editorStore.UPDATE_TOC(editor.value.getTOC())
-    request.onApplied(true, request.markdown)
-  } catch (err) {
-    log.error('[ai-editor] WYSIWYG Markdown apply failed', err)
-    request.onApplied(false)
-  } finally {
-    aiRawMarkdownOverride = null
-  }
+  aiSurfaceController.handleApply(payload)
 }
 
 const handleAiNavigate = (payload: unknown): void => {

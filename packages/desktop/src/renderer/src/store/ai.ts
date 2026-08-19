@@ -13,6 +13,7 @@ import {
   setAiEditSessionStatus,
   type AiEditorSurface
 } from './aiEditSession'
+import type { AiApplyPayload } from './aiEditorBridge'
 import type {
   AiChatMessage,
   AiChatSession,
@@ -52,15 +53,6 @@ import {
   PdfPageSelectionError,
   renderPdfPages
 } from './pdfRendering'
-
-export interface AiApplyPayload {
-  tabId: string
-  surface: AiEditorSurface
-  mode: 'edit' | 'undo'
-  beforeMarkdown: string
-  markdown: string
-  onApplied: (success: boolean, markdown?: string) => void
-}
 
 export type AiAttachmentError = '' | 'unsupported' | 'too-large' | 'pdf-too-large' | 'too-many' | 'total-too-large' | 'read-failed' | 'pdf-pages-required' | 'pdf-invalid-pages' | 'pdf-render-failed' | 'render-too-large'
 
