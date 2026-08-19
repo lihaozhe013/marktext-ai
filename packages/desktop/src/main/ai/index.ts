@@ -57,6 +57,8 @@ import { featureLog, connectionLog } from './logging'
 import { readJson, writeJsonAtomic } from './storage'
 import { AiChatStore } from './chatStore'
 import { AiRevisionStore } from './revisionStore'
+import { AiSettingsStore } from './settingsStore'
+import { resolveModelsEndpoint, resolveRequestEndpoint } from './providerClient'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
 const SETTINGS_SCHEMA_VERSION = 4
@@ -130,7 +132,7 @@ const makeFailureOutput = (rawContent: string, content: string, reasoning?: stri
   }
 }
 
-interface StoredConnection {
+export interface StoredConnection {
   id: string
   name: string
   protocol: AiProtocol
@@ -138,7 +140,7 @@ interface StoredConnection {
   models: AiModelProfile[]
 }
 
-interface StoredSettings {
+export interface StoredSettings {
   schemaVersion: typeof SETTINGS_SCHEMA_VERSION
   connections: StoredConnection[]
   defaultModel?: AiModelRef
@@ -147,7 +149,7 @@ interface StoredSettings {
   failureOutputAfter: number
 }
 
-type StoredKeys = Record<string, string>
+export type StoredKeys = Record<string, string>
 
 interface ResolvedModelTarget {
   connection: StoredConnection
@@ -374,38 +376,6 @@ const validateConnectionInput = (input: AiConnectionInput): {
     endpoint,
     models: dedupedModels
   }
-}
-
-const resolveRequestEndpoint = (settings: Pick<StoredConnection, 'protocol' | 'endpoint'>): string => {
-  const url = new URL(settings.endpoint)
-  const pathname = url.pathname.replace(/\/+$/, '')
-  if (settings.protocol === 'openai-chat-completions') {
-    if (!pathname.endsWith('/chat/completions')) {
-      url.pathname = `${pathname}/chat/completions`
-    }
-  } else if (!pathname.endsWith('/messages')) {
-    url.pathname = pathname.endsWith('/v1')
-      ? `${pathname}/messages`
-      : `${pathname}/v1/messages`
-  }
-  return url.toString()
-}
-
-const resolveModelsEndpoint = (settings: Pick<StoredConnection, 'protocol' | 'endpoint'>): string => {
-  const url = new URL(settings.endpoint)
-  const pathname = url.pathname.replace(/\/+$/, '')
-  if (settings.protocol === 'openai-chat-completions') {
-    url.pathname = pathname.endsWith('/chat/completions')
-      ? `${pathname.slice(0, -'/chat/completions'.length)}/models`
-      : `${pathname}/models`
-  } else {
-    url.pathname = pathname.endsWith('/messages')
-      ? `${pathname.slice(0, -'/messages'.length)}/models`
-      : pathname.endsWith('/v1')
-        ? `${pathname}/models`
-        : `${pathname}/v1/models`
-  }
-  return url.toString()
 }
 
 const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
@@ -673,6 +643,7 @@ export class AiService {
   private readonly attachmentStore: AiAttachmentStore
   private readonly chatStore: AiChatStore
   private readonly revisionStore: AiRevisionStore
+  private readonly settingsStore: AiSettingsStore
   private readonly pendingAttachmentIds = new Map<string, number>()
   private readonly pendingAttachmentDocuments = new Map<string, string>()
   private readonly attachmentMimeTypes = new Map<string, AiAttachment['mimeType']>()
@@ -685,6 +656,11 @@ export class AiService {
     this.keyPath = path.join(userDataPath, KEY_FILE)
     this.chatPath = path.join(userDataPath, CHAT_FILE)
     this.attachmentStore = new AiAttachmentStore(userDataPath)
+    this.settingsStore = new AiSettingsStore(this.settingsPath, this.keyPath, {
+      normalizeSettings: normalizeStoredSettings,
+      normalizeKeys: normalizeStoredKeys,
+      onMigration: connectionCount => featureLog('legacy connection settings migrated connectionCount=%s', connectionCount)
+    })
     this.revisionStore = new AiRevisionStore(path.join(userDataPath, REVISION_FILE))
     this.chatStore = new AiChatStore(this.chatPath, {
       normalizeMessages,
@@ -712,16 +688,7 @@ export class AiService {
   }
 
   private async readSettingsState(): Promise<{ settings: StoredSettings; keys: StoredKeys }> {
-    const rawSettings = await readJson<unknown>(this.settingsPath, undefined)
-    const normalizedSettings = normalizeStoredSettings(rawSettings)
-    const rawKeys = await readJson<unknown>(this.keyPath, undefined)
-    const normalizedKeys = normalizeStoredKeys(rawKeys, normalizedSettings.settings)
-    if (normalizedSettings.legacy || normalizedKeys.legacy) {
-      await writeJsonAtomic(this.settingsPath, normalizedSettings.settings)
-      await writeJsonAtomic(this.keyPath, normalizedKeys.keys)
-      featureLog('legacy connection settings migrated connectionCount=%s', normalizedSettings.settings.connections.length)
-    }
-    return { settings: normalizedSettings.settings, keys: normalizedKeys.keys }
+    return this.settingsStore.read()
   }
 
   private async resolveModelTarget(modelRef: AiModelRef, state?: { settings: StoredSettings; keys: StoredKeys }): Promise<ResolvedModelTarget> {
