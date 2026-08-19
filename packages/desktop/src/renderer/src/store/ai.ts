@@ -42,7 +42,8 @@ import {
   AI_MAX_PDF_TOTAL_BYTES,
   AI_PDF_MIME_TYPES
 } from '@shared/types/ai'
-import { AiChangeTracker, rangesFromSummary, fullDocumentRange, type AiChangeMarker } from './aiChangeTracker'
+import { AiChangeTracker, rangesFromSummary, fullDocumentRange } from './aiChangeTracker'
+import { createAiChangeController } from './aiChangeController'
 import { createAiChatPersistenceQueue } from './aiChatPersistence'
 import { toIpcChatMessages } from './aiChatSerialization'
 import {
@@ -142,8 +143,6 @@ export const useAiStore = defineStore('ai', () => {
   const expectedAgentMarkdown = new Map<string, string>()
   const changeTracker = new AiChangeTracker()
   const changeVersion = ref(0)
-  const lastSavedSequence = new Map<string, number>()
-  let saveSequence = 0
   let chatLoadSequence = 0
   let loadedChatDocumentId = ''
   const chatPersistence = createAiChatPersistenceQueue(error => {
@@ -255,73 +254,20 @@ export const useAiStore = defineStore('ai', () => {
     return file ? normalizeDocumentId(file.id, file.pathname) : ''
   })
 
-  const currentChangeMarker = computed<AiChangeMarker | undefined>(() => {
-    const version = changeVersion.value
-    const tabId = editorStore.currentFile?.id
-    return version >= 0 && tabId ? changeTracker.get(tabId) : undefined
+  const changeController = createAiChangeController({
+    tracker: changeTracker,
+    changeVersion,
+    getCurrentTabId: () => editorStore.currentFile?.id,
+    getSession: () => aiEditSession.value,
+    getExpectedMarkdown: requestId => expectedAgentMarkdown.get(requestId),
+    markSessionStale: requestId => setAiEditSessionStatus(requestId, 'stale')
   })
-
-  const publishChangeMarker = (tabId: string): void => {
-    const marker = changeTracker.get(tabId)
-    bus.emit('ai-change-marker-updated', {
-      tabId,
-      marker: marker
-        ? {
-          revisionId: marker.revisionId,
-          status: marker.status,
-          visible: marker.visible,
-          ranges: marker.ranges.map(range => ({ ...range }))
-        }
-        : undefined
-    })
-  }
-
-  const refreshChangeMarker = (tabId?: string): void => {
-    changeVersion.value += 1
-    if (tabId) publishChangeMarker(tabId)
-  }
-
-  bus.on('ai-request-change-marker', (tabId) => {
-    if (typeof tabId === 'string') publishChangeMarker(tabId)
-  })
-
-  bus.on('ai-document-content-changed', (payload) => {
-    const data = payload as { id?: string; markdown?: string } | undefined
-    if (!data?.id || typeof data.markdown !== 'string') return
-    changeTracker.updateDocument(data.id, data.markdown)
-    const session = aiEditSession.value
-    if (
-      session &&
-      session.tabId === data.id &&
-      session.status !== 'applying' &&
-      data.markdown !== session.beforeMarkdown
-    ) {
-      if (expectedAgentMarkdown.get(session.requestId) !== data.markdown) {
-        setAiEditSessionStatus(session.requestId, 'stale')
-      }
-    }
-    refreshChangeMarker(data.id)
-  })
-  bus.on('ai-document-saved', (tabId) => {
-    if (typeof tabId !== 'string') return
-    saveSequence += 1
-    lastSavedSequence.set(tabId, saveSequence)
-    changeTracker.markSaved(tabId)
-    refreshChangeMarker(tabId)
-  })
-  bus.on('file-loaded', (payload) => {
-    const data = payload as { id?: string; markdown?: string } | undefined
-    if (!data?.id || typeof data.markdown !== 'string') return
-    const session = aiEditSession.value
-    if (session?.tabId === data.id && data.markdown !== session.beforeMarkdown) {
-      setAiEditSessionStatus(session.requestId, 'stale')
-    }
-    const marker = changeTracker.get(data.id)
-    if (marker && data.markdown !== marker.currentMarkdown && data.markdown !== marker.beforeMarkdown && data.markdown !== marker.afterMarkdown) {
-      changeTracker.clear(data.id)
-      refreshChangeMarker(data.id)
-    }
-  })
+  const {
+    currentChangeMarker,
+    getSaveSequence,
+    getLastSavedSequence,
+    refreshChangeMarker
+  } = changeController
 
   const setVisible = (value: boolean): void => {
     visible.value = value
@@ -930,7 +876,7 @@ export const useAiStore = defineStore('ai', () => {
       error.value = 'The document changed while the AI was working. The edit was discarded.'
       return false
     }
-    const applySaveSequence = saveSequence
+    const applySaveSequence = getSaveSequence()
     await new Promise<void>((resolve) => {
       let settled = false
       const payload: AiApplyPayload = {
@@ -974,7 +920,7 @@ export const useAiStore = defineStore('ai', () => {
                 markdown,
                 ranges
               )
-              if ((lastSavedSequence.get(tabId) ?? 0) > applySaveSequence) {
+              if (getLastSavedSequence(tabId) > applySaveSequence) {
                 changeTracker.markSaved(tabId)
               }
               refreshChangeMarker(tabId)

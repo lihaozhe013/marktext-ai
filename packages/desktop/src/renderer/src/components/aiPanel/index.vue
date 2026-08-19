@@ -446,6 +446,9 @@ import { useAiStore } from '@/store/ai'
 import { getCurrentLanguage } from '@/i18n'
 import bus from '@/bus'
 import type { AiChatMessage, AiModelRef, AiProgressEvent, AiProgressInfo } from '@shared/types/ai'
+import { createAiPanelLabels } from './labels'
+import { hasFilePayload, isInsidePanel, stopPanelFileDrag } from './dragDrop'
+import { formatPages, makeUnifiedDiff } from './formatters'
 
 const ai = useAiStore()
 const { currentDocumentId } = storeToRefs(ai)
@@ -461,123 +464,7 @@ const followMessages = ref(true)
 let stopProgressListener: (() => void) | undefined
 
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
-const labels = computed(() => chinese.value
-  ? {
-      title: 'AI 编辑器',
-      settings: 'AI 设置',
-      model: '模型',
-      modelHint: '切换后从下一次请求生效；当前请求使用已选模型。',
-      noModels: '请先在 AI 设置中添加模型',
-      close: '关闭',
-      answer: '回答',
-      edit: '修改文档',
-      answerHelp: '回答模式只提供建议，不会修改当前文档。',
-      editHelp: '精确修改只应用模型指出的局部内容，可用 AI 撤销恢复。',
-      rewrite: '全文重写',
-      rewriteHelp: '全文重写会替换整篇 Markdown，请确认后再使用。',
-      empty: '在这里开始与当前文档对话。',
-      you: '你',
-      ai: 'AI',
-      failureOutputTitle: '查看模型原始输出（调试）',
-      copyFailureOutput: '复制原始输出',
-      copied: '已复制',
-      failureOutputTruncated: '输出过长，已截断显示。',
-      modelReasoning: '模型思考（仅供参考）',
-      placeholder: '输入问题或编辑指令…',
-      attachHint: '粘贴或拖入图片或 PDF，也可点击选择',
-      attachmentPrivacy: '附件会发送到当前配置的 AI 服务。',
-      removeAttachment: '移除附件',
-      attachmentUnsupported: '仅支持 PNG、JPEG、WebP、GIF 图片或 PDF。',
-      attachmentTooLarge: '单张图片不能超过 10 MB。',
-      attachmentPdfTooLarge: '单个 PDF 不能超过 20 MB。',
-      attachmentTooMany: '一次最多添加 10 个附件。',
-      attachmentTotalTooLarge: '一次附件总大小不能超过 30 MB。',
-      attachmentReadFailed: '无法读取附件。',
-      pdfPages: (count: number) => count ? `共 ${count} 页` : '正在读取页数…',
-      pdfPagePlaceholder: '例如 1,3,5-8',
-      pdfPageLabel: 'PDF 页面选择',
-      pdfPagesRequired: '超过 10 页的 PDF 必须选择页面。',
-      pdfInvalidPages: '页码格式无效，请使用如 1,3,5-8 的格式。',
-      pdfBudget: (remaining: number) => `本次请求还可发送 ${remaining} 张图片（PDF 页面共用上限）。`,
-      preparingPdf: '正在准备 PDF 页面…',
-      sendHint: '点击发送按钮提交',
-      working: 'AI 正在处理…',
-      stop: '停止',
-      thinking: '处理中…',
-      send: '发送',
-      clear: '清空对话',
-      undo: '撤销 AI 修改',
-      unconfigured: '未配置连接',
-      editApplied: (count: number, added: number, removed: number) => `已应用 ${count} 处修改（新增 ${added} 行，删除 ${removed} 行）`,
-      editPlan: '编辑计划',
-      planSteps: (count: number) => `共 ${count} 个步骤`,
-      stepDeleted: '删除',
-      stepAdded: '新增',
-      emptyDiff: '（空）',
-      noChanges: '文档无需修改',
-      rewriteApplied: '已重写全文',
-      recoveryWarning: '模型未能生成可靠的局部编辑，以下是整篇替代结果，请确认差异后应用。',
-      recoveryApply: '应用替代结果',
-      recoveryDiscard: '丢弃'
-    }
-  : {
-      title: 'AI Editor',
-      settings: 'AI settings',
-      model: 'Model',
-      modelHint: 'Changes apply to the next request; the current request keeps its model.',
-      noModels: 'Add a model in AI settings first',
-      close: 'Close',
-      answer: 'Answer',
-      edit: 'Edit document',
-      answerHelp: 'Answer mode provides suggestions only and never changes the document.',
-      editHelp: 'Precise edit applies only the requested local changes and supports AI undo.',
-      rewrite: 'Rewrite document',
-      rewriteHelp: 'Rewrite replaces the complete Markdown document. Use it intentionally.',
-      empty: 'Start a conversation about the current document.',
-      you: 'You',
-      ai: 'AI',
-      failureOutputTitle: 'View raw model output (debug)',
-      copyFailureOutput: 'Copy raw output',
-      copied: 'Copied',
-      failureOutputTruncated: 'The output was too long and has been truncated.',
-      modelReasoning: 'Model reasoning (informational)',
-      placeholder: 'Ask a question or describe an edit…',
-      attachHint: 'Paste, drop, or choose images or PDFs',
-      attachmentPrivacy: 'Attachments are sent to the configured AI service.',
-      removeAttachment: 'Remove attachment',
-      attachmentUnsupported: 'Only PNG, JPEG, WebP, GIF images, or PDF files are supported.',
-      attachmentTooLarge: 'Each image must be smaller than 10 MB.',
-      attachmentPdfTooLarge: 'Each PDF must be smaller than 20 MB.',
-      attachmentTooMany: 'You can attach up to 10 files at a time.',
-      attachmentTotalTooLarge: 'Attachments in one request must total less than 30 MB.',
-      attachmentReadFailed: 'The attachment could not be read.',
-      pdfPages: (count: number) => count ? `${count} pages` : 'Reading page count…',
-      pdfPagePlaceholder: 'For example 1,3,5-8',
-      pdfPageLabel: 'PDF page selection',
-      pdfPagesRequired: 'Select pages for PDFs with more than 10 pages.',
-      pdfInvalidPages: 'Invalid page selection. Use a format such as 1,3,5-8.',
-      pdfBudget: (remaining: number) => `${remaining} image slots remain in this request (PDF pages share the limit).`,
-      preparingPdf: 'Preparing PDF pages…',
-      sendHint: 'Click Send to submit',
-      working: 'AI is working…',
-      stop: 'Stop',
-      thinking: 'Working…',
-      send: 'Send',
-      clear: 'Clear chat',
-      undo: 'Undo AI edit',
-      unconfigured: 'Connection not configured',
-      editApplied: (count: number, added: number, removed: number) => `Applied ${count} edit${count === 1 ? '' : 's'} (+${added}/-${removed} lines)`,
-      editPlan: 'Edit plan',
-      planSteps: (count: number) => `${count} step${count === 1 ? '' : 's'}`,
-      stepDeleted: 'Deleted',
-      stepAdded: 'Added',
-      emptyDiff: '(empty)',
-      noChanges: 'No document changes were needed.',
-      rewriteApplied: 'The document was rewritten.',
-      recoveryWarning: 'The model could not produce a reliable local edit. Review the complete-document fallback before applying it.',
-      recoveryApply: 'Apply fallback',
-      recoveryDiscard: 'Discard'
-    })
+const labels = computed(() => createAiPanelLabels(chinese.value))
 const modeLabel = computed(() => {
   if (ai.mode === 'rewrite') return labels.value.rewrite
   return ai.mode === 'answer' ? labels.value.answer : labels.value.edit
@@ -822,56 +709,10 @@ const updatePdfPageSelection = (id: string, value: string): void => {
   ai.setPendingPdfPageSelection(id, value)
 }
 
-const formatPages = (pages: readonly number[]): string => {
-  const sorted = Array.from(new Set(pages)).sort((a, b) => a - b)
-  const parts: string[] = []
-  let start = sorted[0]
-  let end = sorted[0]
-  for (const page of sorted.slice(1)) {
-    if (page === end + 1) end = page
-    else {
-      parts.push(start === end ? `${start}` : `${start}-${end}`)
-      start = page
-      end = page
-    }
-  }
-  if (start !== undefined) parts.push(start === end ? `${start}` : `${start}-${end}`)
-  return `p. ${parts.join(',')}`
-}
-
 const selectModel = (event: Event): void => {
   const value = (event.target as HTMLSelectElement).value
   const option = ai.modelOptions.find(item => modelOptionValue(item.ref) === value)
   if (option) ai.selectModel(option.ref)
-}
-
-const makeUnifiedDiff = (before: string, after: string): string => {
-  const oldLines = before.replaceAll('\r\n', '\n').split('\n')
-  const newLines = after.replaceAll('\r\n', '\n').split('\n')
-  const prefix = (() => {
-    let index = 0
-    while (index < oldLines.length && index < newLines.length && oldLines[index] === newLines[index]) index += 1
-    return index
-  })()
-  let suffix = 0
-  while (
-    suffix < oldLines.length - prefix &&
-    suffix < newLines.length - prefix &&
-    oldLines[oldLines.length - suffix - 1] === newLines[newLines.length - suffix - 1]
-  ) suffix += 1
-  const oldChanged = oldLines.slice(prefix, oldLines.length - suffix)
-  const newChanged = newLines.slice(prefix, newLines.length - suffix)
-  const contextBefore = oldLines.slice(Math.max(0, prefix - 3), prefix).map(line => ` ${line}`)
-  const contextAfter = oldLines.slice(oldLines.length - suffix, Math.min(oldLines.length, oldLines.length - suffix + 3)).map(line => ` ${line}`)
-  const header = `@@ -${prefix + 1},${oldChanged.length} +${prefix + 1},${newChanged.length} @@`
-  const body = [
-    ...contextBefore,
-    ...oldChanged.map(line => `-${line}`),
-    ...newChanged.map(line => `+${line}`),
-    ...contextAfter
-  ]
-  const result = [header, ...body].join('\n')
-  return result.length > 12000 ? `${result.slice(0, 12000)}\n…` : result
 }
 
 const addFiles = (files: File[]): void => {
@@ -879,46 +720,20 @@ const addFiles = (files: File[]): void => {
   ai.addAttachmentFiles(files).catch(() => undefined)
 }
 
-// MarkText's window dragover listener can show a fixed import overlay before
-// a Panel target receives a bubbling event, so this boundary must stay at the
-// window capture phase and use coordinates instead of event.target.
-const hasFilePayload = (event: DragEvent): boolean => {
-  const dataTransfer = event.dataTransfer
-  if (!dataTransfer) return false
-  if (Array.from(dataTransfer.types).includes('Files')) return true
-  if (dataTransfer.files.length > 0) return true
-  return Array.from(dataTransfer.items).some(item => item.kind === 'file')
-}
-
-const isInsidePanel = (event: DragEvent): boolean => {
-  const panel = panelElement.value
-  if (!panel) return false
-  const rect = panel.getBoundingClientRect()
-  return event.clientX >= rect.left && event.clientX <= rect.right &&
-    event.clientY >= rect.top && event.clientY <= rect.bottom
-}
-
-const stopPanelFileDrag = (event: DragEvent): boolean => {
-  if (!hasFilePayload(event) || !isInsidePanel(event)) return false
-  event.preventDefault()
-  event.stopImmediatePropagation()
-  return true
-}
-
 const handleWindowDragOver = (event: DragEvent): void => {
   if (!hasFilePayload(event)) return
-  if (!isInsidePanel(event)) {
+  if (!isInsidePanel(event, panelElement.value)) {
     dragOver.value = false
     return
   }
-  stopPanelFileDrag(event)
+  stopPanelFileDrag(event, panelElement.value)
   bus.emit('importDialog', false)
   if (event.dataTransfer) event.dataTransfer.dropEffect = ai.loading || !hasDocument.value ? 'none' : 'copy'
   dragOver.value = true
 }
 
 const handleWindowDrop = (event: DragEvent): void => {
-  if (!stopPanelFileDrag(event)) return
+  if (!stopPanelFileDrag(event, panelElement.value)) return
   dragOver.value = false
   if (ai.loading || !hasDocument.value || !event.dataTransfer) return
   addFiles(Array.from(event.dataTransfer.files))

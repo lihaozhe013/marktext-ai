@@ -40,10 +40,9 @@ export const createAiEditorSurfaceController = (
     const request = payload as Partial<AiApplyPayload> | null | undefined
     if (!request || request.surface !== adapter.surface) return
 
-    const onApplied = typeof request.onApplied === 'function'
-      ? completeAiApply(request.onApplied)
-      : undefined
-    if (!onApplied || typeof request.tabId !== 'string' || typeof request.markdown !== 'string') return
+    const onApplied =
+      typeof request.onApplied === 'function' ? completeAiApply(request.onApplied) : undefined
+    if (!onApplied || typeof request.tabId !== 'string' || typeof request.markdown !== 'string') { return }
 
     if (adapter.getTabId() !== request.tabId) {
       onApplied(false)
