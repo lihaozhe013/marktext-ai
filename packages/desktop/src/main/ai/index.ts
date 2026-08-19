@@ -1,8 +1,6 @@
 import crypto from 'crypto'
 import path from 'path'
-import fsPromises from 'fs/promises'
-import { BrowserWindow, ipcMain } from 'electron'
-import log from 'electron-log'
+import { registerAiIpcHandlers as registerAiIpcHandlersForService } from './ipc'
 import type {
   AiChatMessage,
   AiChatSession,
@@ -55,6 +53,8 @@ import {
   renderedPdfImageRules
 } from './prompts'
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
+import { featureLog, connectionLog } from './logging'
+import { readJson, writeJsonAtomic } from './storage'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
 const SETTINGS_SCHEMA_VERSION = 4
@@ -166,14 +166,6 @@ interface StoredRevisionState {
   revisions: StoredRevision[]
 }
 
-const featureLog = (message: string, ...args: unknown[]): void => {
-  log.info(`[ai-editor] ${message}`, ...args)
-}
-
-const connectionLog = (message: string, ...args: unknown[]): void => {
-  log.info(`[ai-connection] ${message}`, ...args)
-}
-
 const normalizeAttachmentList = (value: unknown): AiAttachment[] | undefined => {
   if (!Array.isArray(value)) return undefined
   const attachments: AiAttachment[] = []
@@ -203,36 +195,6 @@ const collectAttachmentIds = (messages: AiChatMessage[]): Set<string> => {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value)
-
-const readJson = async <T>(filePath: string, fallback: T): Promise<T> => {
-  try {
-    const value: unknown = JSON.parse(await fsPromises.readFile(filePath, 'utf8'))
-    return value as T
-  } catch {
-    return fallback
-  }
-}
-
-const writeJsonAtomic = async(filePath: string, value: unknown): Promise<void> => {
-  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`
-  await fsPromises.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600
-  })
-  try {
-    await fsPromises.rename(tempPath, filePath)
-  } catch {
-    // Windows cannot replace an existing file with rename in every filesystem
-    // configuration; keep the same recoverable temp-file path and retry.
-    await fsPromises.unlink(filePath).catch(() => undefined)
-    await fsPromises.rename(tempPath, filePath)
-  }
-  try {
-    await fsPromises.chmod(filePath, 0o600)
-  } catch {
-    // chmod is best effort on filesystems that do not expose POSIX modes.
-  }
-}
 
 const validateEndpoint = (endpoint: string): string => {
   const value = endpoint.trim()
@@ -2052,62 +2014,6 @@ const normalizeEditAgentMaxSteps = (value: unknown): number => {
 
 export const registerAiIpcHandlers = (userDataPath: string): void => {
   const aiService = new AiService(userDataPath)
-  const broadcastSettings = (settings: AiSettings): void => {
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.isDestroyed()) window.webContents.send('mt::ai-settings-changed', settings)
-    }
-  }
-  ipcMain.handle('mt::ai::get-settings', () => aiService.getSettings())
-  ipcMain.handle('mt::ai::set-edit-retry-count', async(_event, retryCount: number) => {
-    const saved = await aiService.setEditAutoRetryCount(retryCount)
-    broadcastSettings(saved)
-    return saved
-  })
-  ipcMain.handle('mt::ai::set-edit-agent-max-steps', async(_event, maxSteps: number) => {
-    const saved = await aiService.setEditAgentMaxSteps(maxSteps)
-    broadcastSettings(saved)
-    return saved
-  })
-  ipcMain.handle('mt::ai::set-failure-output-after', async(_event, failureCount: number) => {
-    const saved = await aiService.setFailureOutputAfter(failureCount)
-    broadcastSettings(saved)
-    return saved
-  })
-  ipcMain.handle('mt::ai::save-connection', async(_event, connection: AiConnectionInput) => {
-    const saved = await aiService.saveConnection(connection)
-    broadcastSettings(saved)
-    return saved
-  })
-  ipcMain.handle('mt::ai::delete-connection', async(_event, connectionId: string) => {
-    const saved = await aiService.deleteConnection(connectionId)
-    broadcastSettings(saved)
-    return saved
-  })
-  ipcMain.handle('mt::ai::delete-connection-key', async(_event, connectionId: string) => {
-    const saved = await aiService.deleteConnectionKey(connectionId)
-    broadcastSettings(saved)
-    return saved
-  })
-  ipcMain.handle('mt::ai::set-default-model', async(_event, modelRef) => {
-    const saved = await aiService.setDefaultModel(modelRef)
-    broadcastSettings(saved)
-    return saved
-  })
-  ipcMain.handle('mt::ai::test-connection', (_event, connection: AiConnectionInput) => aiService.testConnection(connection))
-  ipcMain.handle('mt::ai::list-models', (_event, connection: AiModelListInput) => aiService.listModels(connection))
-  ipcMain.handle('mt::ai::request', (event, request: AiRequest) => aiService.request(request, progress => {
-    if (!event.sender.isDestroyed()) event.sender.send('mt::ai::progress', progress)
-  }))
-  ipcMain.on('mt::ai::cancel', (_event, requestId: string) => aiService.cancel(requestId))
-  ipcMain.handle('mt::ai::chat-load', (_event, documentId: string) => aiService.loadChat(documentId))
-  ipcMain.handle('mt::ai::chat-save', (_event, documentId: string, session: AiChatSession) => aiService.saveChat(documentId, session))
-  ipcMain.handle('mt::ai::chat-clear', (_event, documentId: string) => aiService.clearChat(documentId))
-  ipcMain.handle('mt::ai::attachment-read', (_event, documentId: string, attachmentId: string) => aiService.readAttachment(documentId, attachmentId))
-  ipcMain.handle('mt::ai::revision-prepare', (_event, request: AiRevisionRequest) => aiService.prepareRevision(request))
-  ipcMain.handle('mt::ai::revision-commit', (_event, revisionId: string, documentId: string, afterMarkdown: string) => aiService.commitRevision(revisionId, documentId, afterMarkdown))
-  ipcMain.handle('mt::ai::revision-discard', (_event, revisionId: string) => aiService.discardRevision(revisionId))
-  ipcMain.handle('mt::ai::revision-undo', (_event, documentId: string, currentMarkdown: string) => aiService.undoRevision(documentId, currentMarkdown))
-  ipcMain.handle('mt::ai::revision-migrate', (_event, fromDocumentId: string, toDocumentId: string) => aiService.migrateDocumentIdentity(fromDocumentId, toDocumentId))
+  registerAiIpcHandlersForService(aiService)
   aiService.cleanupAttachments().catch(error => featureLog('startup attachment cleanup skipped reason=%s', error instanceof Error ? error.message : String(error)))
-  featureLog('IPC handlers registered')
 }
