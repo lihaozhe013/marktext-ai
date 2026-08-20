@@ -26,7 +26,7 @@ describe('AI provider image message serialization', () => {
       'finish_markdown_edit'
     ])
     expect(preciseEditTools.find(tool => tool.name === 'apply_markdown_edit')?.parameters).toMatchObject({
-      required: ['version', 'planStepId', 'search', 'replace', 'description']
+      required: ['search', 'replace', 'description']
     })
   })
 

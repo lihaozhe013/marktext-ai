@@ -113,7 +113,7 @@ describe('AI connection profiles and model routing', () => {
     expect((await service.setContextMode(undefined)).contextMode).toBe('recent')
   })
 
-  it('exposes the final raw edit output after the configured failure threshold', async() => {
+  it('exposes raw edit output before the whole-document fallback', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-failure-output-'))
     directories.push(directory)
     const service = new AiService(directory)
@@ -122,10 +122,11 @@ describe('AI connection profiles and model routing', () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({ choices: [{ message: { content: '<think>tool plan</think>raw tool output' }, finish_reason: 'stop' }] }))
       .mockResolvedValueOnce(response({ choices: [{ message: { content: 'raw protocol output' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: '# Fallback title' }, finish_reason: 'stop' }] }))
     vi.stubGlobal('fetch', fetchMock)
     const progress: Array<{ phase: string; failureCount?: number; failureOutput?: string }> = []
 
-    await expect(service.request({
+    const result = await service.request({
       requestId: 'failure-output-request',
       documentId: 'tab:failure-output',
       mode: 'edit',
@@ -133,14 +134,12 @@ describe('AI connection profiles and model routing', () => {
       markdown: '# Original title',
       messages: [],
       modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
-    }, event => progress.push({ phase: event.phase, failureCount: event.failureCount, failureOutput: event.failureOutput }))).rejects.toThrow('after 2 attempts')
+    }, event => progress.push({ phase: event.phase, failureCount: event.failureCount, failureOutput: event.failureOutput }))
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(progress.at(-1)).toMatchObject({
-      phase: 'failed',
-      failureCount: 2,
-      failureOutput: 'raw protocol output'
-    })
+    expect(result.markdown).toBe('# Fallback title')
+    expect(result.recovery?.requiresConfirmation).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(progress).toContainEqual(expect.objectContaining({ phase: 'attempt-failed', failureCount: 2 }))
   })
 
   it('discovers models without putting the key in the returned list', async() => {

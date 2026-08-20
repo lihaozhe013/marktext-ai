@@ -84,7 +84,137 @@ describe('document edit agent', () => {
       { addedLines: 1, removedLines: 1, removedText: 'beta', addedText: 'gamma' }
     ])
     expect(generateAgent).toHaveBeenCalledTimes(4)
-    expect(generateAgent.mock.calls[1][0].messages.some(message => message.toolResults?.[0]?.content.includes('"version":1'))).toBe(true)
+    expect(generateAgent.mock.calls[1][0].phase).toBe('ready-to-apply')
+    expect(generateAgent.mock.calls[1][0].tools.map(tool => tool.name)).toEqual(['apply_markdown_edit'])
+    expect(generateAgent.mock.calls[1][0].messages.at(-1)?.content).toContain('"currentVersion":0')
+    expect(generateAgent.mock.calls[1][0].messages.at(-1)?.content.match(/\nalpha\n/g)).toHaveLength(1)
+  })
+
+  it('exposes only the tool allowed by the current phase and owns version state', async() => {
+    const calls: DocumentAgentGenerateRequest[] = []
+    const generateAgent = vi.fn(async(input: DocumentAgentGenerateRequest) => {
+      calls.push(input)
+      const turn = calls.length
+      if (turn === 1) return { content: '', toolCalls: [{ id: 'plan', name: 'create_markdown_edit_plan', input: { summary: 'Change the title.', steps: [{ id: 'title', description: 'Change the title.', intent: 'Change old to new.', startAnchor: 'old', dependsOn: [] }] } }] }
+      if (turn === 2) return { content: '', toolCalls: [{ id: 'apply', name: 'apply_markdown_edit', input: { version: 0, planStepId: 'stale-step', search: 'old', replace: 'new', description: 'Changed the title.' } }] }
+      return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { version: 99, summary: '' } }] }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: 'old',
+      instruction: 'Change the title.',
+      contextMessages: [],
+      requestId: 'phase-gating-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })
+
+    expect(result.markdown).toBe('new')
+    expect(calls.map(call => call.phase)).toEqual(['needs-plan', 'ready-to-apply', 'ready-to-finish'])
+    expect(calls.map(call => call.tools.map(tool => tool.name))).toEqual([
+      ['create_markdown_edit_plan'],
+      ['apply_markdown_edit'],
+      ['finish_markdown_edit']
+    ])
+    expect(calls[1].messages.at(-1)?.content).toContain('"currentVersion":0')
+    expect(calls[2].messages.at(-1)?.content).toContain('"currentVersion":1')
+    expect(calls.every(call => call.messages.every(message => !message.toolCalls && !message.toolResults))).toBe(true)
+  })
+
+  it('does not expose revise after an invalid initial plan', async() => {
+    const calls: DocumentAgentGenerateRequest[] = []
+    const generateAgent = vi.fn(async(input: DocumentAgentGenerateRequest) => {
+      calls.push(input)
+      return {
+        content: '',
+        toolCalls: [{
+          id: `bad-${calls.length}`,
+          name: calls.length === 1 ? 'create_markdown_edit_plan' : 'revise_markdown_edit_plan',
+          input: calls.length === 1
+            ? { summary: 'Missing anchor.', steps: [{ id: 'bad', description: 'Bad step.', intent: 'Change old.', startAnchor: '', dependsOn: [] }] }
+            : { reason: 'Retry as a revision.', remainingSteps: [] }
+        }]
+      }
+    })
+
+    await expect(runDocumentEditAgent({
+      markdown: 'old',
+      instruction: 'Change old.',
+      contextMessages: [],
+      requestId: 'no-revise-before-plan-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })).rejects.toThrow('could not create a valid initial plan')
+    expect(calls.every(call => call.tools.map(tool => tool.name).join(',') === 'create_markdown_edit_plan')).toBe(true)
+  })
+
+  it('allows deferred anchors and forces revision when the step becomes active', async() => {
+    let turn = 0
+    const phases: string[] = []
+    const generateAgent = vi.fn(async(input: DocumentAgentGenerateRequest) => {
+      phases.push(input.phase)
+      turn += 1
+      if (turn === 1) {
+        return {
+          content: '',
+          toolCalls: [{
+            id: 'plan',
+            name: 'create_markdown_edit_plan',
+            input: {
+              summary: 'Update both words.',
+              steps: [
+                { id: 'first', description: 'Update first.', intent: 'Change first to done.', startAnchor: 'first', dependsOn: [] },
+                { id: 'second', description: 'Update second.', intent: 'Change the generated word.', startAnchor: '', dependsOn: ['first'] }
+              ]
+            }
+          }]
+        }
+      }
+      if (turn === 2) {
+        return { content: '', toolCalls: [{ id: 'apply-1', name: 'apply_markdown_edit', input: { search: 'first', replace: 'generated', description: 'Updated first.' } }] }
+      }
+      if (turn === 3) {
+        return { content: '', toolCalls: [{ id: 'revise', name: 'revise_markdown_edit_plan', input: { reason: 'Resolve the generated target.', remainingSteps: [{ id: 'second', description: 'Update second.', intent: 'Change generated to done.', startAnchor: 'generated', dependsOn: [] }] } }] }
+      }
+      if (turn === 4) {
+        return { content: '', toolCalls: [{ id: 'apply-2', name: 'apply_markdown_edit', input: { search: 'generated', replace: 'done', description: 'Updated second.' } }] }
+      }
+      return { content: '', toolCalls: [{ id: 'finish', name: 'finish_markdown_edit', input: { summary: '' } }] }
+    })
+
+    const result = await runDocumentEditAgent({
+      markdown: 'first',
+      instruction: 'Update both words.',
+      contextMessages: [],
+      requestId: 'deferred-anchor-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })
+
+    expect(result.markdown).toBe('done')
+    expect(phases).toEqual(['needs-plan', 'ready-to-apply', 'needs-revision', 'ready-to-apply', 'ready-to-finish'])
+  })
+
+  it('uses a confirmation fallback after two invalid initial plans', async() => {
+    let turn = 0
+    const generateAgent = vi.fn(async() => {
+      turn += 1
+      return { content: '', toolCalls: [{ id: `bad-${turn}`, name: 'create_markdown_edit_plan', input: { summary: 'Invalid.', steps: [{ id: `bad-${turn}`, description: 'Invalid.', intent: 'Change old.', startAnchor: '', dependsOn: [] }] } }] }
+    })
+    const generateWhole = vi.fn(async() => ({ content: 'new' }))
+    const result = await runDocumentEditAgent({
+      markdown: 'old',
+      instruction: 'Change old.',
+      contextMessages: [],
+      requestId: 'initial-plan-fallback-request',
+      signal: new AbortController().signal,
+      generateAgent,
+      generateWhole
+    })
+
+    expect(result.markdown).toBe('new')
+    expect(result.requiresConfirmation).toBe(true)
+    expect(result.recovery?.strategy).toBe('whole-document-fallback')
+    expect(generateWhole).toHaveBeenCalledTimes(1)
   })
 
   it('returns exact-match tool errors and preserves completed steps', async() => {

@@ -42,13 +42,11 @@ export const applyMarkdownEditTool: ProviderToolDefinition = {
     type: 'object',
     additionalProperties: false,
     properties: {
-      version: { type: 'integer', minimum: 0 },
-      planStepId: { type: 'string', minLength: 1, maxLength: 80 },
       search: { type: 'string' },
       replace: { type: 'string' },
       description: { type: 'string', maxLength: 160 }
     },
-    required: ['version', 'planStepId', 'search', 'replace', 'description']
+    required: ['search', 'replace', 'description']
   }
 }
 
@@ -59,7 +57,6 @@ export const createMarkdownEditPlanTool: ProviderToolDefinition = {
     type: 'object',
     additionalProperties: false,
     properties: {
-      version: { type: 'integer', minimum: 0 },
       summary: { type: 'string', minLength: 1, maxLength: 240 },
       steps: {
         type: 'array',
@@ -79,7 +76,7 @@ export const createMarkdownEditPlanTool: ProviderToolDefinition = {
         }
       }
     },
-    required: ['version', 'summary', 'steps']
+    required: ['summary', 'steps']
   }
 }
 
@@ -90,7 +87,6 @@ export const reviseMarkdownEditPlanTool: ProviderToolDefinition = {
     type: 'object',
     additionalProperties: false,
     properties: {
-      version: { type: 'integer', minimum: 0 },
       reason: { type: 'string', minLength: 1, maxLength: 240 },
       remainingSteps: {
         type: 'array',
@@ -110,7 +106,7 @@ export const reviseMarkdownEditPlanTool: ProviderToolDefinition = {
         }
       }
     },
-    required: ['version', 'reason', 'remainingSteps']
+    required: ['reason', 'remainingSteps']
   }
 }
 
@@ -121,10 +117,9 @@ export const finishMarkdownEditTool: ProviderToolDefinition = {
     type: 'object',
     additionalProperties: false,
     properties: {
-      version: { type: 'integer', minimum: 0 },
       summary: { type: 'string', maxLength: 240 }
     },
-    required: ['version', 'summary']
+    required: ['summary']
   }
 }
 

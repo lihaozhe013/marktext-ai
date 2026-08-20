@@ -73,13 +73,13 @@ The precise Agent is implemented by `runDocumentEditAgent()`.
 No plan
   │ create_markdown_edit_plan
   ├─ valid ─────────────────────► Planned
-  └─ invalid ─► validation failure ─► retry
+  └─ invalid ─► validation failure ─► create-only retry
 
 Planned
   │ apply_markdown_edit for first unfinished step
   ├─ valid ─────────────────────► Step applied ─► Planned
-  ├─ location/scope failures ──► Plan revision required
-  └─ invalid tool/version/etc. ► validation failure ─► retry
+  ├─ location/scope failures ──► Plan revision required ─► revise-only turn
+  └─ invalid tool/arguments etc. ► validation failure ─► retry
 
 Plan revision required
   │ revise_markdown_edit_plan
@@ -87,24 +87,35 @@ Plan revision required
   └─ invalid ───────────────────► validation failure ─► retry
 
 Planned with all steps complete
-  │ finish_markdown_edit(non-empty summary)
+  │ finish_markdown_edit(summary)
   └────────────────────────────► Agent complete
 ```
+
+The main process owns this state machine and exposes exactly one editing tool
+per provider turn: create while no plan exists, apply while the active step is
+valid, revise when the plan needs repair, and finish after all steps complete.
+The current document version and active plan-step ID are host-owned fields and
+are not requested from the model. Each turn is rebuilt from a compact
+checkpoint containing the task, current Markdown, plan state, completed steps,
+and the latest validation error; prior Agent tool calls, results, and reasoning
+are not replayed. This keeps one Agent request bounded by the current document
+and plan rather than by every prior step.
 
 ### Plan creation
 
 The model must create exactly one plan before applying an edit. Each plan step
 has an ID, description, intent, `startAnchor`, optional `endAnchor`, and
-dependencies. Plan versions must match the current document version.
+dependencies. The host owns the current document version and does not ask the
+model to repeat it.
 
 The initial plan is checked against the current document immediately:
 
 - A non-empty document requires a valid `startAnchor` for the first step.
 - An empty document requires the first step to use `startAnchor: ''` and to
   omit `endAnchor`. Its edit uses the empty `SEARCH` insertion path.
-- Later steps are allowed to reference text created by earlier steps. Their
-  anchors are checked when that step is applied, not when the initial plan is
-  created.
+- Later dependent steps may use an empty `startAnchor` when their target will
+  be created by an earlier step. Before that step becomes active, the host
+  requires a revised plan with a current anchor.
 
 The main process emits `agent-plan` after a plan is accepted. Plan revisions
 also emit `agent-plan`, with `planRevisionCount` and `successfulSteps` showing
@@ -115,8 +126,7 @@ that the remaining plan changed rather than starting a new request.
 Only the first unfinished plan step may be applied. Each
 `apply_markdown_edit` call must:
 
-- use the current document `version`;
-- name an unfinished `planStepId`;
+- target the host-selected first unfinished plan step;
 - provide exact string `search` and `replace` values;
 - match exactly once in the current Markdown;
 - remain within the step's anchor scope; and
@@ -133,14 +143,19 @@ match failures require `revise_markdown_edit_plan`; the model must not keep
 applying edits against a stale plan. Completed steps are immutable and cannot
 be returned in a revised plan.
 
+Two invalid initial plans trigger the existing complete-document fallback. The
+fallback is validated and returned for user confirmation; it is never applied
+silently. After progressive steps have been applied, repeated revision
+failures terminate the request while preserving those successful steps.
+
 ### Completion and limits
 
 The model can call `finish_markdown_edit` only when:
 
-- the requested version equals the current version;
 - a plan exists;
 - every plan step is complete; and
-- the summary is a non-empty, concise string.
+- the summary is a concise string (the host supplies a local fallback if it is
+  empty).
 
 The result carries the final Markdown, edit summary, recovery metadata, and
 the model's summary message. The Agent also enforces bounded successful steps,
@@ -193,6 +208,11 @@ committed only after an answer is saved or an edit/rewrite is successfully
 applied. Empty or failed compaction falls back to a bounded local summary and
 never turns an otherwise successful request into a failure. Cancelled, stale,
 failed, and discarded recovery results keep the previous memory.
+
+Agent checkpoint logs use the `[ai-editor]` prefix and record only phase,
+allowed tool, document version, plan/step counts, checkpoint size, validation
+category, and fallback reason. They never include Markdown, attachment bytes,
+attachment paths, API keys, or reasoning content.
 
 ## Renderer application states
 

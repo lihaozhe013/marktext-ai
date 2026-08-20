@@ -1774,6 +1774,16 @@ export class AiService {
             throw new Error('The selected model or gateway does not support Agent precise editing tools.')
           }
           const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
+          featureLog(
+            'edit agent checkpoint phase=%s allowedTool=%s version=%s planSteps=%s completedSteps=%s checkpointChars=%s requestId=%s',
+            agentRequest.phase,
+            agentRequest.tools[0]?.name ?? 'none',
+            agentRequest.currentVersion,
+            agentRequest.planStepCount,
+            agentRequest.completedPlanStepCount,
+            agentRequest.checkpointChars,
+            request.requestId
+          )
           try {
             const generated = await this.requestProvider(
               target,
@@ -1799,6 +1809,34 @@ export class AiService {
               throw new Error('The selected model or gateway does not support Agent precise editing tools.')
             }
             throw error
+          }
+        },
+        generateWhole: async(agentRequest) => {
+          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
+          featureLog(
+            'edit agent whole fallback attempt=%s messageChars=%s requestId=%s',
+            agentRequest.attempt ?? 1,
+            messages.reduce((total, message) => total + message.content.length, 0),
+            request.requestId
+          )
+          const generated = await this.requestProvider(
+            target,
+            agentRequest.system,
+            messages,
+            agentRequest.requestId,
+            agentRequest.signal,
+            {
+              stream: true,
+              attempt: agentRequest.attempt ?? 1,
+              ...makeProviderProgress(agentRequest.attempt ?? 1)
+            }
+          )
+          rememberProviderResponse(generated)
+          return {
+            content: generated.content,
+            rawContent: generated.rawContent,
+            reasoning: generated.reasoning,
+            truncated: generated.truncated
           }
         },
         requestId: request.requestId,
@@ -1869,6 +1907,9 @@ export class AiService {
             diagnostic.replaceMarkers,
             request.requestId
           )
+        },
+        onAgentFallback: (reason, attempt) => {
+          featureLog('edit agent fallback reason=%s attempt=%s requestId=%s', reason, attempt, request.requestId)
         }
       })
       featureLog(
