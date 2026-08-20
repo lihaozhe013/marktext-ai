@@ -199,7 +199,7 @@ AI-specific files under that root are:
 
 | Path | Contents |
 |---|---|
-| `ai-chat.json` | Per-document conversation history and attachment metadata |
+| `ai-chat.json` | Per-document conversation history, rolling context summaries, and attachment metadata |
 | `ai-attachments/` | Random-ID source PNG/JPEG/WebP/GIF/PDF attachment files; PDF page images are rendered in memory for requests |
 | `ai-connection.json` | Provider, endpoint, and model settings |
 | `ai-connection-key.json` | The locally stored API key; main-process only |

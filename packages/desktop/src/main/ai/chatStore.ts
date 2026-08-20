@@ -33,9 +33,13 @@ export class AiChatStore {
   async save(documentId: string, session: AiChatSession): Promise<void> {
     return this.queueMutation(async() => {
       const all = await readJson<Record<string, unknown>>(this.chatPath, {})
+      const normalized = this.dependencies.normalizeSession(session)
       all[documentId] = {
-        messages: this.dependencies.normalizeMessages(session.messages),
-        selectedModel: this.dependencies.normalizeModel(session.selectedModel)
+        messages: normalized.messages,
+        selectedModel: this.dependencies.normalizeModel(normalized.selectedModel),
+        ...(normalized.contextSummary
+          ? { contextSummary: normalized.contextSummary }
+          : {})
       }
       this.dependencies.clearPendingAttachments(documentId)
       await writeJsonAtomic(this.chatPath, all)

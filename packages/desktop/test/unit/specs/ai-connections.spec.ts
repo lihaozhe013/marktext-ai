@@ -102,6 +102,17 @@ describe('AI connection profiles and model routing', () => {
     expect((await service.getSettings()).failureOutputAfter).toBe(3)
   })
 
+  it('defaults to recent context and persists the summary mode', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-context-mode-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+
+    expect((await service.getSettings()).contextMode).toBe('recent')
+    expect((await service.setContextMode('summary')).contextMode).toBe('summary')
+    expect((await service.getSettings()).contextMode).toBe('summary')
+    expect((await service.setContextMode(undefined)).contextMode).toBe('recent')
+  })
+
   it('exposes the final raw edit output after the configured failure threshold', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-failure-output-'))
     directories.push(directory)
@@ -221,6 +232,36 @@ describe('AI connection profiles and model routing', () => {
     expect(body).not.toHaveProperty('reasoning_effort')
     expect(body).not.toHaveProperty('thinking')
     expect(body).not.toHaveProperty('budget_tokens')
+  })
+
+  it('uses the compact output budget for Anthropic summaries', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-summary-anthropic-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Anthropic summary',
+      protocol: 'anthropic-messages',
+      endpoint: 'https://anthropic.example',
+      models: [{ model: 'claude-summary', label: 'Claude summary' }],
+      apiKey: 'anthropic-summary-key'
+    })
+    await service.setContextMode('summary')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ content: [{ type: 'text', text: 'Answer' }], stop_reason: 'end_turn' }))
+      .mockResolvedValueOnce(response({ content: [{ type: 'text', text: 'Memory' }], stop_reason: 'end_turn' }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await service.request({
+      requestId: 'anthropic-summary-request',
+      documentId: 'tab:anthropic-summary',
+      mode: 'answer',
+      prompt: 'Summarize this.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).max_tokens).toBe(512)
   })
 
   it('streams answer responses and reports live progress without changing the final response', async() => {
@@ -529,5 +570,62 @@ describe('AI connection profiles and model routing', () => {
     })
     const stored = JSON.parse(await readFile(path.join(directory, 'ai-chat.json'), 'utf8'))
     expect(stored['tab:test']).toMatchObject({ selectedModel: { connectionId: 'connection-a', modelId: 'model-a' } })
+  })
+
+  it('uses only rolling memory in summary context mode and persists it', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-summary-request-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Summary', 'https://summary.example/v1', 'summary-model', 'summary-key'))
+    await service.setContextMode('summary')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Current answer' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Remember the answer.' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'summary-request',
+      documentId: 'tab:summary',
+      mode: 'answer',
+      prompt: 'Follow up',
+      markdown: '# Current document',
+      messages: [{ id: 'old', role: 'user', mode: 'answer', content: 'Old image context', createdAt: 1, attachments: [{ id: 'old-image', name: 'old.png', mimeType: 'image/png', byteSize: 10 }] }],
+      contextSummary: 'Earlier decision',
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.contextSummaryCandidate).toBe('Remember the answer.')
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(JSON.stringify(body)).toContain('Earlier decision')
+    expect(JSON.stringify(body)).not.toContain('Old image context')
+    expect(JSON.stringify(body)).not.toContain('old-image')
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).messages).toHaveLength(2)
+
+    await service.saveChat('tab:summary', { messages: [], contextSummary: result.contextSummaryCandidate })
+    expect((await service.loadChat('tab:summary')).contextSummary).toBe('Remember the answer.')
+  })
+
+  it('falls back locally when the summary provider response is empty', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-summary-fallback-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Summary', 'https://summary.example/v1', 'summary-model', 'summary-key'))
+    await service.setContextMode('summary')
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Answer body' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: '' }, finish_reason: 'stop' }] })))
+
+    const result = await service.request({
+      requestId: 'summary-fallback-request',
+      documentId: 'tab:summary-fallback',
+      mode: 'answer',
+      prompt: 'Remember this request.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.contextSummaryCandidate).toContain('Remember this request.')
+    expect(result.contextSummaryCandidate).toContain('Answer body')
   })
 })

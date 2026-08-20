@@ -572,6 +572,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'sending': return '正在发送给模型…'
       case 'sent': return '已发送给模型'
       case 'waiting': return '正在等待模型响应…'
+      case 'compacting': return '正在压缩对话上下文…'
       case 'streaming': return tokenUsage ? `模型已开始输出 · ${tokenUsage}` : '模型已开始输出'
       case 'responded': return '模型已响应'
       case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
@@ -594,6 +595,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'sending': return 'Sending to model…'
     case 'sent': return 'Sent to model'
     case 'waiting': return 'Waiting for model response…'
+    case 'compacting': return 'Compacting conversation context…'
     case 'streaming': return tokenUsage ? `Model is responding · ${tokenUsage}` : 'Model is responding'
     case 'responded': return 'Model responded'
     case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
@@ -629,6 +631,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
   if (chinese.value) {
     switch (progress.phase) {
       case 'waiting': return `正在等待模型响应… · ${elapsed}`
+      case 'compacting': return `正在压缩对话上下文… · ${elapsed}`
       case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
       case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
       case 'agent-plan': return `${progress.planRevisionCount ? '正在修订剩余编辑计划' : '正在制定编辑计划'}… · ${elapsed}`
@@ -644,6 +647,7 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
   }
   switch (progress.phase) {
     case 'waiting': return `Waiting for model response… · ${elapsed}`
+    case 'compacting': return `Compacting conversation context… · ${elapsed}`
     case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
     case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
     case 'agent-plan': return `${progress.planRevisionCount ? 'Revising remaining edit plan' : 'Creating edit plan'}… · ${elapsed}`

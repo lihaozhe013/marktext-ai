@@ -53,6 +53,14 @@ Before an `edit` or `rewrite` request starts, the renderer:
    `kind: status` progress messages are deliberately excluded from model
    context.
 
+When the global AI context mode is `summary`, the main process deliberately
+ignores historical messages and sends at most one bounded, document-scoped
+rolling summary. The current task, full raw Markdown snapshot, and current
+attachments are still sent normally, and every mode receives its complete
+system prompt again. Historical images, PDFs, reasoning, status messages, and
+Agent tool transcripts are not replayed in this mode. The full chat remains
+available for renderer display.
+
 The renderer then records `sending`, `sent`, and `waiting` progress. The main
 process emits provider and Agent progress through `mt::ai::progress` while the
 request is running.
@@ -152,6 +160,7 @@ The relevant phases are:
 
 ```text
 waiting → streaming → validating
+                     ├─ compacting → responded
                      ├─ agent-plan → agent-step → validating …
                      ├─ attempt-failed → retrying → validating …
                      ├─ fallback → validating …
@@ -177,6 +186,13 @@ read-modify-write of `ai-chat.json`. A persistence failure is logged with the
 `[ai-editor]` prefix and does not turn an already applied document edit into a
 request failure. IPC payloads must contain plain cloneable data; in particular,
 Vue reactive proxies must not cross the renderer/main boundary.
+
+In summary mode, `compacting` represents one short, non-streaming call using
+the selected model. Its output is returned as a candidate memory value and is
+committed only after an answer is saved or an edit/rewrite is successfully
+applied. Empty or failed compaction falls back to a bounded local summary and
+never turns an otherwise successful request into a failure. Cancelled, stale,
+failed, and discarded recovery results keep the previous memory.
 
 ## Renderer application states
 

@@ -59,9 +59,16 @@ import { AiChatStore } from './chatStore'
 import { AiRevisionStore } from './revisionStore'
 import { AiSettingsStore } from './settingsStore'
 import { resolveModelsEndpoint, resolveRequestEndpoint } from './providerClient'
+import {
+  buildContextSummaryPrompt,
+  buildLocalContextSummary,
+  buildContextMemoryMessage,
+  normalizeContextSummary,
+  MAX_CONTEXT_SUMMARY_CHARS
+} from './contextCompaction'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
-const SETTINGS_SCHEMA_VERSION = 4
+const SETTINGS_SCHEMA_VERSION = 5
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
 const CHAT_FILE = 'ai-chat.json'
@@ -78,6 +85,7 @@ const MAX_FAILURE_OUTPUT_AFTER = 3
 const MAX_FAILURE_OUTPUT_CHARS = 200_000
 const MAX_AGENT_DIFF_CHARS = 16_000
 const MAX_STORED_CHAT_MESSAGES = 100
+const DEFAULT_CONTEXT_MODE = 'recent' as const
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
 
@@ -94,6 +102,7 @@ interface ProviderRequestOptions {
   tools?: ProviderToolDefinition[]
   toolChoice?: 'required' | 'auto'
   stream?: boolean
+  maxTokens?: number
   attempt?: number
   onWaiting?: () => void
   onProgress?: (progress: ProviderStreamProgress) => void
@@ -147,6 +156,7 @@ export interface StoredSettings {
   editAutoRetryCount: number
   editAgentMaxSteps: number
   failureOutputAfter: number
+  contextMode: 'recent' | 'summary'
 }
 
 export type StoredKeys = Record<string, string>
@@ -231,6 +241,9 @@ const normalizeFailureOutputAfter = (value: unknown): number => {
   return Math.min(MAX_FAILURE_OUTPUT_AFTER, Math.max(0, Math.floor(value)))
 }
 
+const normalizeContextMode = (value: unknown): StoredSettings['contextMode'] =>
+  value === 'summary' ? 'summary' : DEFAULT_CONTEXT_MODE
+
 const normalizeModelCapabilities = (value: unknown): AiModelProfile['capabilities'] => {
   if (!isRecord(value)) return undefined
   const reasoningControl = value.reasoningControl
@@ -290,7 +303,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         connections: [],
         editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
         editAgentMaxSteps: DEFAULT_EDIT_AGENT_MAX_STEPS,
-        failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
+        failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER,
+        contextMode: DEFAULT_CONTEXT_MODE
       },
       legacy: false
     }
@@ -306,7 +320,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         defaultModel: normalizeModelRef(value.defaultModel),
         editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
         editAgentMaxSteps: normalizeEditAgentMaxSteps(value.editAgentMaxSteps),
-        failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter)
+        failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter),
+        contextMode: normalizeContextMode(value.contextMode)
       },
       legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION
     }
@@ -332,7 +347,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         : undefined,
       editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
       editAgentMaxSteps: DEFAULT_EDIT_AGENT_MAX_STEPS,
-      failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
+      failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER,
+      contextMode: DEFAULT_CONTEXT_MODE
     },
     legacy: true
   }
@@ -380,6 +396,7 @@ const validateConnectionInput = (input: AiConnectionInput): {
 
 const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
   defaultModel: settings.defaultModel,
+  contextMode: settings.contextMode,
   editAutoRetryCount: settings.editAutoRetryCount,
   editAgentMaxSteps: settings.editAgentMaxSteps,
   failureOutputAfter: settings.failureOutputAfter,
@@ -418,6 +435,7 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     'sending',
     'sent',
     'waiting',
+    'compacting',
     'streaming',
     'responded',
     'validating',
@@ -538,7 +556,10 @@ const normalizeChatSession = (value: unknown): AiChatSession => {
   if (!isRecord(value)) return { messages: [] }
   return {
     messages: normalizeMessages(value.messages),
-    selectedModel: normalizeModelRef(value.selectedModel)
+    selectedModel: normalizeModelRef(value.selectedModel),
+    contextSummary: typeof value.contextSummary === 'string'
+      ? value.contextSummary.trim().slice(0, MAX_CONTEXT_SUMMARY_CHARS) || undefined
+      : undefined
   }
 }
 
@@ -851,6 +872,19 @@ export class AiService {
     })
   }
 
+  async setContextMode(contextMode: AiSettings['contextMode']): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        contextMode: normalizeContextMode(contextMode)
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('context mode updated mode=%s', settings.contextMode)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
   async testConnection(input: AiConnectionInput): Promise<AiTestResult> {
     connectionLog(
       'test start connectionId=%s protocol=%s endpoint=%s modelCount=%s',
@@ -996,7 +1030,7 @@ export class AiService {
           headers['anthropic-version'] = ANTHROPIC_VERSION
           body = {
             model,
-            max_tokens: 4096,
+            max_tokens: options.maxTokens ?? 4096,
             system: effectiveSystem,
             messages: serializeProviderMessages(
               settings.protocol,
@@ -1017,7 +1051,7 @@ export class AiService {
           headers['api-key'] = apiKey
           body = {
             model,
-            max_tokens: 8192,
+            max_tokens: options.maxTokens ?? 8192,
             messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(
               settings.protocol,
               messages,
@@ -1389,6 +1423,55 @@ export class AiService {
     return this.attachmentStore.read(attachmentId, mimeType)
   }
 
+  private async createContextSummary(
+    target: ResolvedModelTarget,
+    previousSummary: string | undefined,
+    prompt: string,
+    mode: AiRequest['mode'],
+    outcome: string,
+    requestId: string,
+    signal: AbortSignal | undefined,
+    onResponse: (response: ProviderResponse) => void,
+    onProgress: () => void
+  ): Promise<string> {
+    const fallback = buildLocalContextSummary(previousSummary, prompt, mode, outcome)
+    const summaryPrompt = buildContextSummaryPrompt(previousSummary, prompt, mode, outcome)
+    let usedFallback = false
+    let summaryLength = 0
+    onProgress()
+    try {
+      const generated = await this.requestProvider(
+        target,
+        summaryPrompt.system,
+        [{ role: 'user', content: summaryPrompt.content }],
+        requestId,
+        signal,
+        { stream: false, maxTokens: 512, attempt: 2 }
+      )
+      onResponse(generated)
+      const summary = normalizeContextSummary(generated.content)
+      if (!summary) throw new Error('The context summary response was empty.')
+      summaryLength = summary.length
+      return summary
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && /cancelled|canceled/i.test(error.message))) throw error
+      usedFallback = true
+      summaryLength = fallback.length
+      featureLog('context summary fallback reason=%s requestId=%s', error instanceof Error ? error.message : String(error), requestId)
+      return fallback
+    } finally {
+      featureLog(
+        'context summary generated mode=%s sourceChars=%s previousSummaryChars=%s summaryChars=%s fallback=%s requestId=%s',
+        mode,
+        outcome.length,
+        previousSummary?.length ?? 0,
+        summaryLength,
+        usedFallback,
+        requestId
+      )
+    }
+  }
+
   async request(request: AiRequest, progressSink?: AiProgressSink): Promise<AiResponse> {
     if (!request.requestId || !request.documentId) throw new Error('Invalid AI request.')
     const state = await this.readSettingsState()
@@ -1396,15 +1479,23 @@ export class AiService {
     const settings = target.connection
     const currentAttachments = await this.saveRequestAttachments(request.attachments, request.documentId)
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))
-    const recentMessages = normalizeMessages(request.messages)
-      .filter(message => message.kind !== 'status')
-      .slice(-(request.mode === 'edit' ? MAX_EDIT_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES))
-      .map(({ role, mode, content, reasoning, attachments }) => ({
-        role,
-        content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
-        reasoning,
-        attachments
-      }))
+    const contextSummary = normalizeContextSummary(request.contextSummary)
+    const normalizedRequestMessages = normalizeMessages(request.messages)
+    const historicalMessages = normalizedRequestMessages.filter(message => message.kind !== 'status')
+    const historicalAttachmentCount = historicalMessages.reduce((total, message) => total + (message.attachments?.length ?? 0), 0)
+    const recentMessages = state.settings.contextMode === 'summary'
+      ? (contextSummary
+        ? [{ role: 'user' as const, content: buildContextMemoryMessage(contextSummary) }]
+        : [])
+      : normalizedRequestMessages
+        .filter(message => message.kind !== 'status')
+        .slice(-(request.mode === 'edit' ? MAX_EDIT_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES))
+        .map(({ role, mode, content, reasoning, attachments }) => ({
+          role,
+          content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
+          reasoning,
+          attachments
+        }))
     let documentKind = 'unknown'
     if (request.documentId.startsWith('path:')) documentKind = 'path'
     else if (request.documentId.startsWith('tab:')) documentKind = 'tab'
@@ -1417,6 +1508,17 @@ export class AiService {
       currentAttachments.length,
       currentAttachments.reduce((total, attachment) => total + attachment.byteSize, 0),
       request.renderedPdfPages?.reduce((total, item) => total + item.pages.length, 0) ?? 0,
+      request.requestId
+    )
+    featureLog(
+      'context selected mode=%s historicalMessages=%s historicalAttachments=%s providerContextMessages=%s summaryPresent=%s summaryChars=%s historicalContextSuppressed=%s requestId=%s',
+      state.settings.contextMode,
+      historicalMessages.length,
+      historicalAttachmentCount,
+      recentMessages.length,
+      !!contextSummary,
+      contextSummary?.length ?? 0,
+      state.settings.contextMode === 'summary',
       request.requestId
     )
     const requestStartedAt = Date.now()
@@ -1553,6 +1655,19 @@ export class AiService {
         false,
         { stream: true, attempt: 2, ...makeProviderProgress(2) }
       )
+      const contextSummaryCandidate = state.settings.contextMode === 'summary'
+        ? await this.createContextSummary(
+          target,
+          contextSummary,
+          request.prompt,
+          request.mode,
+          repaired.content,
+          request.requestId,
+          undefined,
+          rememberProviderResponse,
+          () => emitProgress('compacting', 2, { streaming: false })
+        )
+        : undefined
       featureLog(
         'request content received mode=%s contentChars=%s elapsedMs=%s requestId=%s',
         request.mode,
@@ -1565,6 +1680,7 @@ export class AiService {
         mode: request.mode,
         content: repaired.content,
         reasoning: repaired.reasoning,
+        contextSummaryCandidate,
         recovery: repaired.recovery,
         documentId: request.documentId,
         baseMarkdown: request.markdown,
@@ -1610,6 +1726,19 @@ export class AiService {
           { stream: true, attempt: 2, ...makeProviderProgress(2) }
         )
         const markdown = repaired.content
+        const contextSummaryCandidate = state.settings.contextMode === 'summary'
+          ? await this.createContextSummary(
+            target,
+            contextSummary,
+            request.prompt,
+            request.mode,
+            'The requested Markdown rewrite was validated successfully.',
+            request.requestId,
+            controller.signal,
+            rememberProviderResponse,
+            () => emitProgress('compacting', 2, { streaming: false })
+          )
+          : undefined
         featureLog(
           'request content received mode=%s contentChars=%s elapsedMs=%s requestId=%s',
           request.mode,
@@ -1622,6 +1751,7 @@ export class AiService {
           mode: request.mode,
           content: '',
           reasoning: repaired.reasoning,
+          contextSummaryCandidate,
           markdown,
           recovery: repaired.recovery,
           documentId: request.documentId,
@@ -1751,11 +1881,25 @@ export class AiService {
         Date.now() - requestStartedAt,
         request.requestId
       )
+      const contextSummaryCandidate = state.settings.contextMode === 'summary'
+        ? await this.createContextSummary(
+          target,
+          contextSummary,
+          request.prompt,
+          request.mode,
+          result.message || `The requested Markdown edit completed with ${result.summary.operationCount} operation(s).`,
+          request.requestId,
+          controller.signal,
+          rememberProviderResponse,
+          () => emitProgress('compacting', result.attempts + 1, { streaming: false })
+        )
+        : undefined
       return {
         requestId: request.requestId,
         mode: request.mode,
         content: '',
         reasoning: result.reasoning,
+        contextSummaryCandidate,
         summary: result.message,
         markdown: result.markdown,
         editSummary: result.summary,

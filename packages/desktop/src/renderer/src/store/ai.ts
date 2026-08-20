@@ -119,12 +119,14 @@ export const useAiStore = defineStore('ai', () => {
   const editorStore = useEditorStore()
   const preferencesStore = usePreferencesStore()
   const settings = ref<AiConnectionSettings>({
-    connections: []
+    connections: [],
+    contextMode: 'recent'
   })
   const mode = ref<AiInteractionMode>((localStorage.getItem('ai-mode') as AiInteractionMode) || 'answer')
   const visible = ref(localStorage.getItem('ai-panel-visible') !== 'false')
   const width = ref(Number(localStorage.getItem('ai-panel-width')) || 380)
   const messages = ref<AiChatMessage[]>([])
+  const contextSummary = ref<string | undefined>()
   const selectedModel = ref<AiModelRef | undefined>()
   const pendingAttachments = ref<PendingAiAttachment[]>([])
   const attachmentError = ref<AiAttachmentError>('')
@@ -326,6 +328,7 @@ export const useAiStore = defineStore('ai', () => {
       const loadedSession: AiChatSession = await window.electron.ipcRenderer.invoke('mt::ai::chat-load', documentId)
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
       messages.value = loadedSession.messages
+      contextSummary.value = loadedSession.contextSummary
       selectedModel.value = loadedSession.selectedModel
       resolveSelectedModel()
       loadedChatDocumentId = documentId
@@ -333,6 +336,7 @@ export const useAiStore = defineStore('ai', () => {
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
       error.value = err instanceof Error ? err.message : String(err)
       messages.value = []
+      contextSummary.value = undefined
       resolveSelectedModel()
       loadedChatDocumentId = documentId
     }
@@ -347,7 +351,8 @@ export const useAiStore = defineStore('ai', () => {
     if (!documentId) return Promise.resolve()
     const session: AiChatSession = {
       messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
-      selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined
+      selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined,
+      contextSummary: contextSummary.value
     }
     return enqueueChatPersistence(() => window.electron.ipcRenderer.invoke('mt::ai::chat-save', documentId, session))
   }
@@ -355,6 +360,7 @@ export const useAiStore = defineStore('ai', () => {
   const clearChat = async(): Promise<void> => {
     clearPendingAttachments()
     messages.value = []
+    contextSummary.value = undefined
     selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
     currentProgress.value = undefined
@@ -488,7 +494,7 @@ export const useAiStore = defineStore('ai', () => {
     liveProgress.value = event
     liveProgressElapsedMs.value = Math.max(event.elapsedMs, Date.now() - liveProgressStartedAt)
     applyAgentStep(event)
-    if (!['agent-plan', 'agent-step', 'attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
+    if (!['agent-plan', 'agent-step', 'attempt-failed', 'retrying', 'fallback', 'compacting', 'failed', 'cancelled'].includes(event.phase)) return
     const progress: AiProgressInfo = {
       phase: event.phase,
       attempt: event.attempt,
@@ -714,7 +720,7 @@ export const useAiStore = defineStore('ai', () => {
       if (renderingPdf.value) await enqueueProgress('pdf-rendering')
       const renderedPdfPages = await prepareRenderedPdfPages(
         requestDocumentId,
-        contextMessages,
+        settings.value.contextMode === 'summary' ? [] : contextMessages,
         pending,
         async(current, total) => enqueueProgress('pdf-rendering', { current, total })
       )
@@ -746,11 +752,13 @@ export const useAiStore = defineStore('ai', () => {
         modelRef: requestModel,
         attachments: uploads,
         messages: toIpcChatMessages(contextMessages),
+        contextSummary: contextSummary.value,
         renderedPdfPages
       })
       if (requestId !== activeRequestId.value || documentId !== currentDocumentId.value) return
       await enqueueProgress('responded')
       if (requestMode === 'answer') {
+        commitContextSummary(response)
         appendMessage('assistant', response.content, requestMode, { model: response.model, reasoning: response.reasoning })
         lastAnswer.value = response.content
         await saveChat()
@@ -816,6 +824,15 @@ export const useAiStore = defineStore('ai', () => {
     return `Applied ${operationCount} local edit${operationCount === 1 ? '' : 's'}.`
   }
 
+  const commitContextSummary = (response: AiResponse): void => {
+    if (settings.value.contextMode !== 'summary') return
+    const candidate = response.contextSummaryCandidate?.trim()
+    if (candidate) {
+      contextSummary.value = candidate
+      featureLog('context summary committed chars=%s requestId=%s', candidate.length, response.requestId)
+    }
+  }
+
   const applyEdit = async(
     response: AiResponse,
     requestId: string,
@@ -844,6 +861,7 @@ export const useAiStore = defineStore('ai', () => {
       return false
     }
     if (nextMarkdown === beforeMarkdown) {
+      commitContextSummary(response)
       appendMessage('assistant', responseSummary(response), response.mode, {
         editSummary: response.editSummary,
         reasoning: response.reasoning
@@ -924,6 +942,7 @@ export const useAiStore = defineStore('ai', () => {
                 changeTracker.markSaved(tabId)
               }
               refreshChangeMarker(tabId)
+              commitContextSummary(response)
               appendMessage('assistant', responseSummary(response), response.mode, {
                 revisionId,
                 editSummary: response.editSummary,
@@ -989,6 +1008,7 @@ export const useAiStore = defineStore('ai', () => {
       response.editSummary ? rangesFromSummary(currentMarkdown, response.editSummary) : fullDocumentRange(currentMarkdown)
     )
     refreshChangeMarker(tabId)
+    commitContextSummary(response)
     appendMessage('assistant', responseSummary(response), response.mode, {
       editSummary: response.editSummary,
       model: response.model,

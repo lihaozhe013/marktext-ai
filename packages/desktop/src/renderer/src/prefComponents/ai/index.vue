@@ -5,6 +5,22 @@
       {{ labels.description }}
     </p>
 
+    <section class="ai-setting-group context-mode-setting">
+      <label>{{ labels.contextMode }}</label>
+      <select
+        v-model="contextMode"
+        @change="saveContextMode"
+      >
+        <option value="recent">
+          {{ labels.contextModeRecent }}
+        </option>
+        <option value="summary">
+          {{ labels.contextModeSummary }}
+        </option>
+      </select>
+      <small>{{ labels.contextModeHint }}</small>
+    </section>
+
     <section class="ai-setting-group retry-setting">
       <label>{{ labels.editAgentMaxSteps }}</label>
       <select
@@ -278,6 +294,7 @@ import type {
   AiConnectionInput,
   AiConnectionProfile,
   AiConnectionSettings,
+  AiContextMode,
   AiDiscoveredModel
 } from '@shared/types/ai'
 
@@ -299,6 +316,7 @@ const discoveredModels = ref<AiDiscoveredModel[]>([])
 const defaultModelId = ref('')
 const editAgentMaxSteps = ref(64)
 const failureOutputAfter = ref(1)
+const contextMode = ref<AiContextMode>('recent')
 const chinese = computed(() => getCurrentLanguage().toLowerCase().startsWith('zh'))
 const connectionLog = (message: string, ...args: unknown[]): void => {
   log.info(`[ai-connection] ${message}`, ...args)
@@ -309,6 +327,10 @@ const labels = computed(() =>
         title: 'AI 连接与模型',
         description:
           '配置多个兼容 OpenAI Chat Completions 或 Anthropic Messages 的连接。密钥只保存在本机用户数据目录，不会发送到渲染进程。',
+        contextMode: '上下文模式',
+        contextModeRecent: '保留最近对话',
+        contextModeSummary: '自动摘要（适合便宜模型）',
+        contextModeHint: '摘要模式只向模型发送滚动摘要、本轮任务和当前文档；界面历史仍会保留。',
         addConnection: '新增连接',
         noConnections: '还没有配置 AI 连接。',
         newConnection: '新连接',
@@ -352,6 +374,10 @@ const labels = computed(() =>
         title: 'AI Connections & Models',
         description:
           'Configure multiple connections compatible with OpenAI Chat Completions or Anthropic Messages. Keys stay in local user data and never enter the renderer.',
+        contextMode: 'Context mode',
+        contextModeRecent: 'Keep recent messages',
+        contextModeSummary: 'Automatic summary (for cheaper models)',
+        contextModeHint: 'Summary mode sends only rolling memory, the current task, and the current document; UI history is retained.',
         addConnection: 'Add connection',
         noConnections: 'No AI connections configured yet.',
         newConnection: 'New connection',
@@ -474,6 +500,7 @@ const applySettings = (value: AiConnectionSettings): void => {
   settings.value = value
   editAgentMaxSteps.value = value.editAgentMaxSteps ?? 64
   failureOutputAfter.value = value.failureOutputAfter ?? 1
+  contextMode.value = value.contextMode ?? 'recent'
   ai.setSettings(value)
   if (value.connections.some((connection) => connection.id === form.id)) { selectConnection(form.id as string) } else if (value.connections[0]) selectConnection(value.connections[0].id)
   else resetForm()
@@ -503,6 +530,18 @@ const saveFailureOutputAfter = async (): Promise<void> => {
     applySettings(value)
     statusOk.value = true
     status.value = chinese.value ? '失败输出设置已保存。' : 'Failure output setting saved.'
+  } catch (err) {
+    statusOk.value = false
+    status.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+const saveContextMode = async (): Promise<void> => {
+  try {
+    const value = await window.electron.ipcRenderer.invoke('mt::ai::set-context-mode', contextMode.value)
+    applySettings(value)
+    statusOk.value = true
+    status.value = chinese.value ? '上下文模式已保存。' : 'Context mode saved.'
   } catch (err) {
     statusOk.value = false
     status.value = err instanceof Error ? err.message : String(err)
