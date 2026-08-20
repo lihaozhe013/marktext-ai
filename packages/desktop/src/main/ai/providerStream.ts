@@ -29,6 +29,7 @@ export interface ProviderStreamResult {
   toolCalls: ProviderToolCall[]
   usage?: ProviderUsage
   truncated: boolean
+  finishReason?: string
 }
 
 interface SseEvent {
@@ -46,6 +47,11 @@ interface AnthropicToolAccumulator {
   id: string
   name: string
   input: string
+}
+
+interface ProviderStreamState {
+  truncated: boolean
+  finishReason?: string
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -151,7 +157,7 @@ const readOpenAiDelta = (
   reasoning: { value: string },
   tools: Map<number, OpenAiToolAccumulator>,
   usage: { value?: ProviderUsage },
-  state: { truncated: boolean },
+  state: ProviderStreamState,
   compatibility: ProviderReasoningCompatibility
 ): { content: string; reasoning: string } => {
   const choices = Array.isArray(payload.choices) ? payload.choices : []
@@ -173,6 +179,7 @@ const readOpenAiDelta = (
     }
   }
   const finishReason = choice?.finish_reason
+  if (typeof finishReason === 'string') state.finishReason = finishReason
   if (finishReason === 'length' || finishReason === 'max_tokens') state.truncated = true
   const payloadUsage = isRecord(payload.usage) ? payload.usage : undefined
   const inputTokens = asNumber(payloadUsage?.prompt_tokens)
@@ -199,7 +206,7 @@ const readAnthropicDelta = (
   reasoning: { value: string },
   tools: Map<number, AnthropicToolAccumulator>,
   usage: { value?: ProviderUsage },
-  state: { truncated: boolean }
+  state: ProviderStreamState
 ): { content: string; reasoning: string } => {
   const eventType = event.event ?? (typeof payload.type === 'string' ? payload.type : '')
   if (eventType === 'message_start') {
@@ -245,6 +252,7 @@ const readAnthropicDelta = (
     }
   } else if (eventType === 'message_delta') {
     const delta = isRecord(payload.delta) ? payload.delta : undefined
+    if (typeof delta?.stop_reason === 'string') state.finishReason = delta.stop_reason
     if (delta?.stop_reason === 'max_tokens') state.truncated = true
     const deltaUsage = isRecord(payload.usage) ? payload.usage : undefined
     const outputTokens = asNumber(deltaUsage?.output_tokens)
@@ -274,7 +282,7 @@ export const consumeProviderStream = async(
   const usage: { value?: ProviderUsage } = {}
   const openAiTools = new Map<number, OpenAiToolAccumulator>()
   const anthropicTools = new Map<number, AnthropicToolAccumulator>()
-  const state = { truncated: false }
+  const state: ProviderStreamState = { truncated: false }
   let outputCharacters = 0
   let reasoningCharacters = 0
   let firstEvent = true
@@ -353,6 +361,7 @@ export const consumeProviderStream = async(
     reasoning: normalized.reasoning,
     toolCalls,
     usage: usage.value,
-    truncated: state.truncated
+    truncated: state.truncated,
+    finishReason: state.finishReason
   }
 }

@@ -1,6 +1,7 @@
 export type AiProtocol = 'openai-chat-completions' | 'anthropic-messages'
 export type AiInteractionMode = 'answer' | 'edit' | 'rewrite'
-export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback'
+export type AiContextMode = 'recent' | 'summary'
+export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback' | 'partial-agent'
 export type AiModelSource = 'manual' | 'discovered'
 export type AiReasoningControl = 'unknown' | 'effort' | 'budget'
 export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_content' | 'reasoning_text'
@@ -112,6 +113,8 @@ export interface AiModelRef {
 export interface AiSettings {
   connections: AiConnectionProfile[]
   defaultModel?: AiModelRef
+  /** Selects whether provider requests use recent chat messages or a rolling summary. */
+  contextMode?: AiContextMode
   /** Number of protocol repair attempts after the initial edit generation. */
   editAutoRetryCount?: number
   /** Maximum number of successful local agent edits per precise-edit request. */
@@ -165,9 +168,11 @@ export interface AiMessageModel {
 export type AiProgressPhase =
   | 'pdf-rendering'
   | 'pdf-rendered'
+  | 'attachment-extracting'
   | 'sending'
   | 'sent'
   | 'waiting'
+  | 'compacting'
   | 'streaming'
   | 'responded'
   | 'validating'
@@ -179,6 +184,7 @@ export type AiProgressPhase =
   | 'local-processing'
   | 'completed'
   | 'failed'
+  | 'partial'
   | 'cancelled'
 
 export interface AiProgressInfo {
@@ -212,11 +218,15 @@ export interface AiProgressInfo {
   stepAddedText?: string
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
+  totalInputTokens?: number
+  totalOutputTokens?: number
+  totalCachedInputTokens?: number
+  totalCacheWriteInputTokens?: number
 }
 
 export type AiFailureReason = 'format' | 'exact-match' | 'scope' | 'truncated' | 'provider' | 'capability' | 'unknown'
 
-export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'validating' | 'agent-plan' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
+export type AiLiveProgressPhase = 'waiting' | 'attachment-extracting' | 'streaming' | 'compacting' | 'validating' | 'agent-plan' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'partial' | 'completed' | 'failed' | 'cancelled'
 
 export interface AiProgressEvent {
   requestId: string
@@ -250,6 +260,10 @@ export interface AiProgressEvent {
   stepAddedText?: string
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
+  totalInputTokens?: number
+  totalOutputTokens?: number
+  totalCachedInputTokens?: number
+  totalCacheWriteInputTokens?: number
   /** The validated agent step snapshot to apply immediately in the renderer. */
   documentId?: string
   stepBaseMarkdown?: string
@@ -275,6 +289,8 @@ export interface AiChatMessage {
 export interface AiChatSession {
   messages: AiChatMessage[]
   selectedModel?: AiModelRef
+  /** Bounded document-scoped memory used when contextMode is summary. */
+  contextSummary?: string
 }
 
 export interface AiRequest {
@@ -284,6 +300,7 @@ export interface AiRequest {
   prompt: string
   markdown: string
   messages: AiChatMessage[]
+  contextSummary?: string
   modelRef: AiModelRef
   attachments?: AiAttachmentUpload[]
   renderedPdfPages?: AiRenderedPdfPages[]
@@ -317,6 +334,11 @@ export interface AiResponse {
   markdown?: string
   editSummary?: AiEditSummary
   recovery?: AiRecoveryInfo
+  agentCompletion?: 'complete' | 'partial'
+  agentCompletedSteps?: number
+  agentTotalSteps?: number
+  /** Generated before renderer-side apply; committed only after a successful turn. */
+  contextSummaryCandidate?: string
   documentId: string
   baseMarkdown: string
   model: AiMessageModel

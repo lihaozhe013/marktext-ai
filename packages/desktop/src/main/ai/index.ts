@@ -42,6 +42,7 @@ import { consumeProviderStream, estimateTokenCount, type ProviderStreamProgress,
 import { extractProviderContentParts, normalizeProviderContent, readReasoningField, type ProviderReasoningCompatibility } from './providerReasoning'
 import {
   buildAnswerSystemPrompt,
+  buildAttachmentSourceBriefSystemPrompt,
   buildDocumentPrompt,
   buildMarkdownFormatRepairPrompt,
   buildRewriteSystemPrompt,
@@ -59,9 +60,16 @@ import { AiChatStore } from './chatStore'
 import { AiRevisionStore } from './revisionStore'
 import { AiSettingsStore } from './settingsStore'
 import { resolveModelsEndpoint, resolveRequestEndpoint } from './providerClient'
+import {
+  buildContextSummaryPrompt,
+  buildLocalContextSummary,
+  buildContextMemoryMessage,
+  normalizeContextSummary,
+  MAX_CONTEXT_SUMMARY_CHARS
+} from './contextCompaction'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
-const SETTINGS_SCHEMA_VERSION = 4
+const SETTINGS_SCHEMA_VERSION = 5
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
 const CHAT_FILE = 'ai-chat.json'
@@ -78,6 +86,7 @@ const MAX_FAILURE_OUTPUT_AFTER = 3
 const MAX_FAILURE_OUTPUT_CHARS = 200_000
 const MAX_AGENT_DIFF_CHARS = 16_000
 const MAX_STORED_CHAT_MESSAGES = 100
+const DEFAULT_CONTEXT_MODE = 'recent' as const
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
 
@@ -88,16 +97,25 @@ interface ProviderResponse {
   truncated: boolean
   toolCalls?: ProviderToolCall[]
   usage?: ProviderUsage
+  finishReason?: string
 }
+
+export type ProviderToolChoice = 'required' | 'auto' | { name: string }
 
 interface ProviderRequestOptions {
   tools?: ProviderToolDefinition[]
-  toolChoice?: 'required' | 'auto'
+  toolChoice?: ProviderToolChoice
+  parallelToolCalls?: boolean
+  allowEmptyToolResponse?: boolean
+  disableStreamFallback?: boolean
   stream?: boolean
+  maxTokens?: number
   attempt?: number
   onWaiting?: () => void
   onProgress?: (progress: ProviderStreamProgress) => void
 }
+
+type AgentTransportMode = 'native-strict' | 'native-compatible' | 'json-envelope'
 
 type AiProgressSink = (event: AiProgressEvent) => void
 
@@ -147,6 +165,7 @@ export interface StoredSettings {
   editAutoRetryCount: number
   editAgentMaxSteps: number
   failureOutputAfter: number
+  contextMode: 'recent' | 'summary'
 }
 
 export type StoredKeys = Record<string, string>
@@ -231,6 +250,9 @@ const normalizeFailureOutputAfter = (value: unknown): number => {
   return Math.min(MAX_FAILURE_OUTPUT_AFTER, Math.max(0, Math.floor(value)))
 }
 
+const normalizeContextMode = (value: unknown): StoredSettings['contextMode'] =>
+  value === 'summary' ? 'summary' : DEFAULT_CONTEXT_MODE
+
 const normalizeModelCapabilities = (value: unknown): AiModelProfile['capabilities'] => {
   if (!isRecord(value)) return undefined
   const reasoningControl = value.reasoningControl
@@ -290,7 +312,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         connections: [],
         editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
         editAgentMaxSteps: DEFAULT_EDIT_AGENT_MAX_STEPS,
-        failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
+        failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER,
+        contextMode: DEFAULT_CONTEXT_MODE
       },
       legacy: false
     }
@@ -306,7 +329,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         defaultModel: normalizeModelRef(value.defaultModel),
         editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
         editAgentMaxSteps: normalizeEditAgentMaxSteps(value.editAgentMaxSteps),
-        failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter)
+        failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter),
+        contextMode: normalizeContextMode(value.contextMode)
       },
       legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION
     }
@@ -332,7 +356,8 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
         : undefined,
       editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
       editAgentMaxSteps: DEFAULT_EDIT_AGENT_MAX_STEPS,
-      failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER
+      failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER,
+      contextMode: DEFAULT_CONTEXT_MODE
     },
     legacy: true
   }
@@ -380,6 +405,7 @@ const validateConnectionInput = (input: AiConnectionInput): {
 
 const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
   defaultModel: settings.defaultModel,
+  contextMode: settings.contextMode,
   editAutoRetryCount: settings.editAutoRetryCount,
   editAgentMaxSteps: settings.editAgentMaxSteps,
   failureOutputAfter: settings.failureOutputAfter,
@@ -415,9 +441,11 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
   const phases: AiProgressPhase[] = [
     'pdf-rendering',
     'pdf-rendered',
+    'attachment-extracting',
     'sending',
     'sent',
     'waiting',
+    'compacting',
     'streaming',
     'responded',
     'validating',
@@ -429,6 +457,7 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     'local-processing',
     'completed',
     'failed',
+    'partial',
     'cancelled'
   ]
   if (!phases.includes(value.phase as AiProgressPhase)) return undefined
@@ -464,6 +493,10 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     stepAddedText: typeof value.stepAddedText === 'string' ? value.stepAddedText.slice(0, 16000) : undefined,
     cachedInputTokens: typeof value.cachedInputTokens === 'number' ? value.cachedInputTokens : undefined,
     cacheWriteInputTokens: typeof value.cacheWriteInputTokens === 'number' ? value.cacheWriteInputTokens : undefined,
+    totalInputTokens: typeof value.totalInputTokens === 'number' ? value.totalInputTokens : undefined,
+    totalOutputTokens: typeof value.totalOutputTokens === 'number' ? value.totalOutputTokens : undefined,
+    totalCachedInputTokens: typeof value.totalCachedInputTokens === 'number' ? value.totalCachedInputTokens : undefined,
+    totalCacheWriteInputTokens: typeof value.totalCacheWriteInputTokens === 'number' ? value.totalCacheWriteInputTokens : undefined,
     failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'scope' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'capability' || value.failureReason === 'unknown'
       ? value.failureReason
       : undefined
@@ -538,7 +571,10 @@ const normalizeChatSession = (value: unknown): AiChatSession => {
   if (!isRecord(value)) return { messages: [] }
   return {
     messages: normalizeMessages(value.messages),
-    selectedModel: normalizeModelRef(value.selectedModel)
+    selectedModel: normalizeModelRef(value.selectedModel),
+    contextSummary: typeof value.contextSummary === 'string'
+      ? value.contextSummary.trim().slice(0, MAX_CONTEXT_SUMMARY_CHARS) || undefined
+      : undefined
   }
 }
 
@@ -604,6 +640,14 @@ const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean =>
   return choices[0].finish_reason === 'length'
 }
 
+const extractFinishReason = (payload: unknown, protocol: AiProtocol): string | undefined => {
+  if (!isRecord(payload)) return undefined
+  if (protocol === 'anthropic-messages') return typeof payload.stop_reason === 'string' ? payload.stop_reason : undefined
+  const choices = payload.choices
+  if (!Array.isArray(choices) || !isRecord(choices[0])) return undefined
+  return typeof choices[0].finish_reason === 'string' ? choices[0].finish_reason : undefined
+}
+
 const extractUsage = (payload: unknown, protocol: AiProtocol): ProviderUsage | undefined => {
   if (!isRecord(payload)) return undefined
   const usage = isRecord(payload.usage)
@@ -648,7 +692,7 @@ export class AiService {
   private readonly pendingAttachmentDocuments = new Map<string, string>()
   private readonly attachmentMimeTypes = new Map<string, AiAttachment['mimeType']>()
   private readonly controllers = new Map<string, AbortController>()
-  private readonly toolCapabilities = new Map<string, boolean>()
+  private readonly toolCapabilities = new Map<string, AgentTransportMode>()
   private settingsMutation: Promise<void> = Promise.resolve()
 
   constructor(userDataPath: string) {
@@ -851,6 +895,19 @@ export class AiService {
     })
   }
 
+  async setContextMode(contextMode: AiSettings['contextMode']): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        contextMode: normalizeContextMode(contextMode)
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('context mode updated mode=%s', settings.contextMode)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
   async testConnection(input: AiConnectionInput): Promise<AiTestResult> {
     connectionLog(
       'test start connectionId=%s protocol=%s endpoint=%s modelCount=%s',
@@ -996,7 +1053,7 @@ export class AiService {
           headers['anthropic-version'] = ANTHROPIC_VERSION
           body = {
             model,
-            max_tokens: 4096,
+            max_tokens: options.maxTokens ?? 4096,
             system: effectiveSystem,
             messages: serializeProviderMessages(
               settings.protocol,
@@ -1008,7 +1065,11 @@ export class AiService {
           }
           if (options.tools?.length) {
             body.tools = options.tools.map(tool => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }))
-            body.tool_choice = options.toolChoice === 'auto' ? { type: 'auto' } : { type: 'any' }
+            body.tool_choice = options.toolChoice === 'auto'
+              ? { type: 'auto' }
+              : typeof options.toolChoice === 'object'
+                ? { type: 'tool', name: options.toolChoice.name }
+                : { type: 'any' }
           }
         } else {
           headers.authorization = `Bearer ${apiKey}`
@@ -1017,7 +1078,7 @@ export class AiService {
           headers['api-key'] = apiKey
           body = {
             model,
-            max_tokens: 8192,
+            max_tokens: options.maxTokens ?? 8192,
             messages: [{ role: 'system', content: effectiveSystem }, ...serializeProviderMessages(
               settings.protocol,
               messages,
@@ -1030,8 +1091,13 @@ export class AiService {
           }
           if (includeStreamUsage) body.stream_options = { include_usage: true }
           if (options.tools?.length) {
-            body.tools = options.tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))
-            body.tool_choice = options.toolChoice === 'auto' ? 'auto' : 'required'
+            body.tools = options.tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters, ...(tool.strict !== undefined ? { strict: tool.strict } : {}) } }))
+            body.tool_choice = options.toolChoice === 'auto'
+              ? 'auto'
+              : typeof options.toolChoice === 'object'
+                ? { type: 'function', function: { name: options.toolChoice.name } }
+                : 'required'
+            if (options.parallelToolCalls !== undefined) body.parallel_tool_calls = options.parallelToolCalls
           }
         }
         featureLog(
@@ -1074,7 +1140,7 @@ export class AiService {
             Date.now() - requestStartedAt,
             requestId
           )
-          if (!streamed.content && !streamed.toolCalls.length) throw new Error('The provider returned no text content.')
+          if (!streamed.content && !streamed.toolCalls.length && !options.allowEmptyToolResponse) throw new Error('The provider returned no text content.')
           return streamed
         }
         const text = await response.text()
@@ -1094,12 +1160,12 @@ export class AiService {
         }
         if (!response.ok) {
           const unsupportedStreamStatus = streaming && [400, 404, 405, 415, 422].includes(response.status)
-          if (unsupportedStreamStatus && includeStreamUsage) {
+          if (unsupportedStreamStatus && !options.disableStreamFallback && includeStreamUsage) {
             includeStreamUsage = false
             featureLog('stream usage option rejected; retrying without usage option requestId=%s', requestId)
             continue
           }
-          if (unsupportedStreamStatus && !streamFallbackAttempted) {
+          if (unsupportedStreamStatus && !options.disableStreamFallback && !streamFallbackAttempted) {
             streaming = false
             streamFallbackAttempted = true
             featureLog('stream unsupported; falling back to JSON requestId=%s', requestId)
@@ -1116,7 +1182,7 @@ export class AiService {
         const extracted = extractResponseContent(payload, settings.protocol, compatibility)
         const content = extracted.content
         const toolCalls = extractToolCalls(payload, settings.protocol)
-        if (!content && !toolCalls.length) throw new Error('The provider returned no text content.')
+        if (!content && !toolCalls.length && !options.allowEmptyToolResponse) throw new Error('The provider returned no text content.')
         const usage = extractUsage(payload, settings.protocol)
         options.onProgress?.({
           outputCharacters: content.length + (extracted.reasoning?.length ?? 0),
@@ -1131,7 +1197,8 @@ export class AiService {
           reasoning: extracted.reasoning,
           toolCalls,
           usage,
-          truncated: isTruncatedResponse(payload, settings.protocol)
+          truncated: isTruncatedResponse(payload, settings.protocol),
+          finishReason: extractFinishReason(payload, settings.protocol)
         }
       }
     } catch (error) {
@@ -1389,6 +1456,55 @@ export class AiService {
     return this.attachmentStore.read(attachmentId, mimeType)
   }
 
+  private async createContextSummary(
+    target: ResolvedModelTarget,
+    previousSummary: string | undefined,
+    prompt: string,
+    mode: AiRequest['mode'],
+    outcome: string,
+    requestId: string,
+    signal: AbortSignal | undefined,
+    onResponse: (response: ProviderResponse) => void,
+    onProgress: () => void
+  ): Promise<string> {
+    const fallback = buildLocalContextSummary(previousSummary, prompt, mode, outcome)
+    const summaryPrompt = buildContextSummaryPrompt(previousSummary, prompt, mode, outcome)
+    let usedFallback = false
+    let summaryLength = 0
+    onProgress()
+    try {
+      const generated = await this.requestProvider(
+        target,
+        summaryPrompt.system,
+        [{ role: 'user', content: summaryPrompt.content }],
+        requestId,
+        signal,
+        { stream: false, maxTokens: 512, attempt: 2 }
+      )
+      onResponse(generated)
+      const summary = normalizeContextSummary(generated.content)
+      if (!summary) throw new Error('The context summary response was empty.')
+      summaryLength = summary.length
+      return summary
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && /cancelled|canceled/i.test(error.message))) throw error
+      usedFallback = true
+      summaryLength = fallback.length
+      featureLog('context summary fallback reason=%s requestId=%s', error instanceof Error ? error.message : String(error), requestId)
+      return fallback
+    } finally {
+      featureLog(
+        'context summary generated mode=%s sourceChars=%s previousSummaryChars=%s summaryChars=%s fallback=%s requestId=%s',
+        mode,
+        outcome.length,
+        previousSummary?.length ?? 0,
+        summaryLength,
+        usedFallback,
+        requestId
+      )
+    }
+  }
+
   async request(request: AiRequest, progressSink?: AiProgressSink): Promise<AiResponse> {
     if (!request.requestId || !request.documentId) throw new Error('Invalid AI request.')
     const state = await this.readSettingsState()
@@ -1396,15 +1512,23 @@ export class AiService {
     const settings = target.connection
     const currentAttachments = await this.saveRequestAttachments(request.attachments, request.documentId)
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))
-    const recentMessages = normalizeMessages(request.messages)
-      .filter(message => message.kind !== 'status')
-      .slice(-(request.mode === 'edit' ? MAX_EDIT_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES))
-      .map(({ role, mode, content, reasoning, attachments }) => ({
-        role,
-        content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
-        reasoning,
-        attachments
-      }))
+    const contextSummary = normalizeContextSummary(request.contextSummary)
+    const normalizedRequestMessages = normalizeMessages(request.messages)
+    const historicalMessages = normalizedRequestMessages.filter(message => message.kind !== 'status')
+    const historicalAttachmentCount = historicalMessages.reduce((total, message) => total + (message.attachments?.length ?? 0), 0)
+    const recentMessages = state.settings.contextMode === 'summary'
+      ? (contextSummary
+        ? [{ role: 'user' as const, content: buildContextMemoryMessage(contextSummary) }]
+        : [])
+      : normalizedRequestMessages
+        .filter(message => message.kind !== 'status')
+        .slice(-(request.mode === 'edit' ? MAX_EDIT_CONTEXT_MESSAGES : MAX_CONTEXT_MESSAGES))
+        .map(({ role, mode, content, reasoning, attachments }) => ({
+          role,
+          content: content || (mode === 'rewrite' ? previousRewriteContextMessage : previousPreciseEditContextMessage),
+          reasoning,
+          attachments
+        }))
     let documentKind = 'unknown'
     if (request.documentId.startsWith('path:')) documentKind = 'path'
     else if (request.documentId.startsWith('tab:')) documentKind = 'tab'
@@ -1419,6 +1543,17 @@ export class AiService {
       request.renderedPdfPages?.reduce((total, item) => total + item.pages.length, 0) ?? 0,
       request.requestId
     )
+    featureLog(
+      'context selected mode=%s historicalMessages=%s historicalAttachments=%s providerContextMessages=%s summaryPresent=%s summaryChars=%s historicalContextSuppressed=%s requestId=%s',
+      state.settings.contextMode,
+      historicalMessages.length,
+      historicalAttachmentCount,
+      recentMessages.length,
+      !!contextSummary,
+      contextSummary?.length ?? 0,
+      state.settings.contextMode === 'summary',
+      request.requestId
+    )
     const requestStartedAt = Date.now()
     let lastAttempt = 1
     let lastFailureReason: AiFailureReason | undefined
@@ -1429,7 +1564,7 @@ export class AiService {
     let totalOutputTokens = 0
     let totalCachedInputTokens = 0
     let totalCacheWriteInputTokens = 0
-    let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'cachedInputTokens' | 'cacheWriteInputTokens'> = {
+    let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'totalInputTokens' | 'totalOutputTokens' | 'totalCachedInputTokens' | 'totalCacheWriteInputTokens'> = {
       outputTokens: 0,
       outputTokensEstimated: true,
       streaming: false
@@ -1437,7 +1572,7 @@ export class AiService {
     const emitProgress = (
       phase: AiProgressEvent['phase'],
       attempt: number,
-      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
+      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'totalInputTokens' | 'totalOutputTokens' | 'totalCachedInputTokens' | 'totalCacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
     ): void => {
       lastAttempt = Math.max(lastAttempt, attempt)
       const {
@@ -1479,11 +1614,13 @@ export class AiService {
       if (response.usage?.cacheWriteInputTokens !== undefined) totalCacheWriteInputTokens += response.usage.cacheWriteInputTokens
       lastProgressStats = {
         ...lastProgressStats,
-        inputTokens: totalInputTokens || undefined,
-        outputTokens: totalOutputTokens || lastProgressStats.outputTokens,
-        outputTokensEstimated: false,
-        cachedInputTokens: totalCachedInputTokens || undefined,
-        cacheWriteInputTokens: totalCacheWriteInputTokens || undefined,
+        inputTokens: response.usage?.inputTokens ?? lastProgressStats.inputTokens,
+        outputTokens: response.usage?.outputTokens ?? lastProgressStats.outputTokens,
+        outputTokensEstimated: response.usage?.outputTokens === undefined,
+        totalInputTokens: totalInputTokens || undefined,
+        totalOutputTokens: totalOutputTokens || undefined,
+        totalCachedInputTokens: totalCachedInputTokens || undefined,
+        totalCacheWriteInputTokens: totalCacheWriteInputTokens || undefined,
         streaming: false
       }
       const output = makeFailureOutput(response.rawContent, response.content, response.reasoning)
@@ -1520,6 +1657,49 @@ export class AiService {
         }
       }
     }
+    const extractAttachmentSourceBrief = async(signal: AbortSignal): Promise<string> => {
+      const delimiter = makePromptToken('MT_SOURCE')
+      const extractionMessages = await this.hydrateProviderMessages([
+        {
+          role: 'user',
+          content: `TASK ${delimiter}\n${request.prompt}\nEND_TASK ${delimiter}`,
+          attachments: currentAttachments
+        }
+      ], priorityAttachmentIds, request.renderedPdfPages)
+      let lastError = 'The attachment source brief was empty.'
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        emitProgress('attachment-extracting', attempt, { streaming: false })
+        const result = await this.requestProvider(
+          target,
+          buildAttachmentSourceBriefSystemPrompt(delimiter),
+          extractionMessages,
+          request.requestId,
+          signal,
+          {
+            stream: true,
+            maxTokens: 3072,
+            allowEmptyToolResponse: true,
+            attempt,
+            ...makeProviderProgress(attempt)
+          }
+        )
+        rememberProviderResponse(result)
+        if (!result.truncated && result.content.trim()) {
+          const brief = result.content.trim().slice(0, 12000)
+          featureLog(
+            'attachment source brief ready attempt=%s attachmentCount=%s pageCount=%s chars=%s requestId=%s',
+            attempt,
+            currentAttachments.length,
+            request.renderedPdfPages?.reduce((total, item) => total + item.pages.length, 0) ?? 0,
+            brief.length,
+            request.requestId
+          )
+          return brief
+        }
+        lastError = result.truncated ? 'The attachment source brief was truncated.' : 'The attachment source brief was empty.'
+      }
+      throw new Error(lastError)
+    }
     if (request.mode === 'answer') {
       const promptToken = makePromptToken('MT_CONTEXT')
       const messages = await this.hydrateProviderMessages([
@@ -1553,6 +1733,19 @@ export class AiService {
         false,
         { stream: true, attempt: 2, ...makeProviderProgress(2) }
       )
+      const contextSummaryCandidate = state.settings.contextMode === 'summary'
+        ? await this.createContextSummary(
+          target,
+          contextSummary,
+          request.prompt,
+          request.mode,
+          repaired.content,
+          request.requestId,
+          undefined,
+          rememberProviderResponse,
+          () => emitProgress('compacting', 2, { streaming: false })
+        )
+        : undefined
       featureLog(
         'request content received mode=%s contentChars=%s elapsedMs=%s requestId=%s',
         request.mode,
@@ -1565,6 +1758,7 @@ export class AiService {
         mode: request.mode,
         content: repaired.content,
         reasoning: repaired.reasoning,
+        contextSummaryCandidate,
         recovery: repaired.recovery,
         documentId: request.documentId,
         baseMarkdown: request.markdown,
@@ -1575,6 +1769,9 @@ export class AiService {
     const controller = new AbortController()
     this.controllers.set(request.requestId, controller)
     try {
+      const sourceBrief = request.mode === 'edit' && currentAttachments.length
+        ? await extractAttachmentSourceBrief(controller.signal)
+        : undefined
       if (request.mode === 'rewrite') {
         const promptToken = makePromptToken('MT_CONTEXT')
         const messages = await this.hydrateProviderMessages([
@@ -1610,6 +1807,19 @@ export class AiService {
           { stream: true, attempt: 2, ...makeProviderProgress(2) }
         )
         const markdown = repaired.content
+        const contextSummaryCandidate = state.settings.contextMode === 'summary'
+          ? await this.createContextSummary(
+            target,
+            contextSummary,
+            request.prompt,
+            request.mode,
+            'The requested Markdown rewrite was validated successfully.',
+            request.requestId,
+            controller.signal,
+            rememberProviderResponse,
+            () => emitProgress('compacting', 2, { streaming: false })
+          )
+          : undefined
         featureLog(
           'request content received mode=%s contentChars=%s elapsedMs=%s requestId=%s',
           request.mode,
@@ -1622,6 +1832,7 @@ export class AiService {
           mode: request.mode,
           content: '',
           reasoning: repaired.reasoning,
+          contextSummaryCandidate,
           markdown,
           recovery: repaired.recovery,
           documentId: request.documentId,
@@ -1633,48 +1844,160 @@ export class AiService {
       const result = await runDocumentEditAgent({
         markdown: request.markdown,
         instruction: request.prompt,
-        contextMessages: recentMessages,
-        attachments: currentAttachments,
+        sourceBrief,
+        contextMessages: recentMessages.map(message => ({ role: message.role, content: message.content, reasoning: 'reasoning' in message ? message.reasoning : undefined })),
+        attachments: sourceBrief ? undefined : currentAttachments,
         generateAgent: async(agentRequest) => {
-          const attachmentKinds = Array.from(new Set(agentRequest.messages.flatMap(message =>
-            (message.attachments ?? []).map(() => 'image')
-          ))).sort().join('+') || 'text'
-          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}|${attachmentKinds}`
-          if (this.toolCapabilities.get(capabilityKey) === false) {
-            throw new Error('The selected model or gateway does not support Agent precise editing tools.')
-          }
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
-          try {
-            const generated = await this.requestProvider(
-              target,
-              `${agentRequest.system}\nCall exactly one of the supplied editing tools on every turn.`,
-              messages,
-              agentRequest.requestId,
-              agentRequest.signal,
-              {
-                tools: agentRequest.tools,
-                toolChoice: 'required',
-                stream: true,
-                attempt: agentRequest.attempt ?? 1,
-                ...makeProviderProgress(agentRequest.attempt ?? 1)
-              }
-            )
-            rememberProviderResponse(generated)
-            this.toolCapabilities.set(capabilityKey, true)
-            return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, toolCalls: generated.toolCalls, truncated: generated.truncated }
-          } catch (error) {
-            if (error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)) {
-              this.toolCapabilities.set(capabilityKey, false)
-              featureLog('agent tool capability unavailable protocol=%s model=%s requestId=%s', settings.protocol, target.model.model, agentRequest.requestId)
-              throw new Error('The selected model or gateway does not support Agent precise editing tools.')
+          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}`
+          const expectedTool = agentRequest.tools[0]?.name ?? 'none'
+          const cachedTransport = this.toolCapabilities.get(capabilityKey)
+          const maxTokens = expectedTool === 'create_markdown_edit_plan' || expectedTool === 'revise_markdown_edit_plan'
+            ? 2048
+            : expectedTool === 'apply_markdown_edit' && agentRequest.activeScopeChars > 6000 ? 8192 : 4096
+          const messages = await this.hydrateProviderMessages(
+            agentRequest.messages,
+            sourceBrief ? new Set<string>() : priorityAttachmentIds,
+            sourceBrief ? [] : request.renderedPdfPages
+          )
+          featureLog(
+            'edit agent checkpoint phase=%s allowedTool=%s transport=%s version=%s planSteps=%s completedSteps=%s checkpointChars=%s sourceBriefChars=%s activeScopeChars=%s planFingerprint=%s attachmentPages=%s requestId=%s',
+            agentRequest.phase,
+            expectedTool,
+            cachedTransport ?? 'native-strict',
+            agentRequest.currentVersion,
+            agentRequest.planStepCount,
+            agentRequest.completedPlanStepCount,
+            agentRequest.checkpointChars,
+            agentRequest.sourceBriefChars,
+            agentRequest.activeScopeChars,
+            agentRequest.planFingerprint ? agentRequest.planFingerprint.length : 0,
+            messages.reduce((total, message) => total + (message.images?.length ?? 0), 0),
+            request.requestId
+          )
+          const providerOptions = (transport: AgentTransportMode): ProviderRequestOptions => ({
+            stream: true,
+            maxTokens,
+            allowEmptyToolResponse: true,
+            disableStreamFallback: true,
+            attempt: agentRequest.attempt ?? 1,
+            ...makeProviderProgress(agentRequest.attempt ?? 1),
+            ...(transport === 'native-strict'
+              ? { tools: agentRequest.tools, toolChoice: { name: expectedTool }, parallelToolCalls: false }
+              : transport === 'native-compatible'
+                ? { tools: withoutStrictToolSchemas(agentRequest.tools), toolChoice: 'required' as const }
+                : {})
+          })
+          const system = `${agentRequest.system}\nCall exactly one of the supplied editing tools on every turn.`
+          const invoke = async(transport: AgentTransportMode): Promise<ProviderResponse> => {
+            if (transport === 'json-envelope') {
+              const jsonSystem = `${system}\nThe native tool transport is unavailable. Return exactly one JSON object matching this schema, with no Markdown fence, explanation, or extra text:\n${JSON.stringify(agentRequest.tools[0]?.parameters ?? {})}`
+              return this.requestProvider(target, jsonSystem, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
             }
-            throw error
+            return this.requestProvider(target, system, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
+          }
+          let transport = cachedTransport ?? 'native-strict'
+          const unsupportedTransport = (error: unknown): boolean =>
+            error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)
+          const invokeWithFallback = async(start: AgentTransportMode): Promise<{ transport: AgentTransportMode, response: ProviderResponse }> => {
+            try {
+              return { transport: start, response: await invoke(start) }
+            } catch (error) {
+              if (start === 'native-strict' && unsupportedTransport(error)) {
+                featureLog('edit agent transport downgrade strict->compatible requestId=%s', request.requestId)
+                try {
+                  return { transport: 'native-compatible', response: await invoke('native-compatible') }
+                } catch (compatibleError) {
+                  if (!unsupportedTransport(compatibleError)) throw compatibleError
+                  featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
+                  return { transport: 'json-envelope', response: await invoke('json-envelope') }
+                }
+              }
+              if (start === 'native-compatible' && unsupportedTransport(error)) {
+                featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
+                return { transport: 'json-envelope', response: await invoke('json-envelope') }
+              }
+              throw error
+            }
+          }
+          const invoked = await invokeWithFallback(transport)
+          transport = invoked.transport
+          let generated = invoked.response
+          rememberProviderResponse(generated)
+          let toolCalls = generated.toolCalls ?? []
+          if ((transport === 'native-strict' || transport === 'native-compatible') && (!toolCalls.length || generated.truncated)) {
+            transport = 'json-envelope'
+            const jsonGenerated = await invoke(transport)
+            rememberProviderResponse(jsonGenerated)
+            generated = jsonGenerated
+            toolCalls = generated.toolCalls ?? []
+          }
+          if (transport === 'json-envelope' && !toolCalls.length) {
+            toolCalls = parseStrictAgentEnvelope(generated.content, expectedTool)
+          }
+          this.toolCapabilities.set(capabilityKey, transport)
+          featureLog(
+            'edit agent response phase=%s transport=%s returnedTools=%s returnedNames=%s finishReason=%s truncated=%s reasoningChars=%s inputTokens=%s outputTokens=%s totalInputTokens=%s totalOutputTokens=%s totalCachedInputTokens=%s requestId=%s',
+            agentRequest.phase,
+            transport,
+            toolCalls.length,
+            toolCalls.map(call => call.name).join(',') || 'none',
+            generated.finishReason ?? 'none',
+            generated.truncated ?? false,
+            generated.reasoning?.length ?? 0,
+            generated.usage?.inputTokens ?? 'unknown',
+            generated.usage?.outputTokens ?? 'unknown',
+            lastProgressStats.totalInputTokens ?? 'unknown',
+            lastProgressStats.totalOutputTokens ?? 'unknown',
+            lastProgressStats.totalCachedInputTokens ?? 'unknown',
+            request.requestId
+          )
+          return {
+            content: generated.content,
+            rawContent: generated.rawContent,
+            reasoning: generated.reasoning,
+            toolCalls,
+            truncated: generated.truncated,
+            finishReason: generated.finishReason,
+            usage: generated.usage
+          }
+        },
+        generateWhole: async(agentRequest) => {
+          const messages = await this.hydrateProviderMessages(
+            agentRequest.messages,
+            sourceBrief ? new Set<string>() : priorityAttachmentIds,
+            sourceBrief ? [] : request.renderedPdfPages
+          )
+          featureLog(
+            'edit agent whole fallback attempt=%s messageChars=%s requestId=%s',
+            agentRequest.attempt ?? 1,
+            messages.reduce((total, message) => total + message.content.length, 0),
+            request.requestId
+          )
+          const generated = await this.requestProvider(
+            target,
+            agentRequest.system,
+            messages,
+            agentRequest.requestId,
+            agentRequest.signal,
+            {
+              stream: true,
+              attempt: agentRequest.attempt ?? 1,
+              ...makeProviderProgress(agentRequest.attempt ?? 1)
+            }
+          )
+          rememberProviderResponse(generated)
+          return {
+            content: generated.content,
+            rawContent: generated.rawContent,
+            reasoning: generated.reasoning,
+            truncated: generated.truncated
           }
         },
         requestId: request.requestId,
         signal: controller.signal,
         maxSteps: state.settings.editAgentMaxSteps,
         onPhase: (phase, attempt) => {
+          featureLog('edit agent state transition phase=%s attempt=%s requestId=%s', phase, attempt, request.requestId)
           emitProgress(phase, attempt, {
             streaming: false
           })
@@ -1739,11 +2062,17 @@ export class AiService {
             diagnostic.replaceMarkers,
             request.requestId
           )
+        },
+        onAgentFallback: (reason, attempt) => {
+          featureLog('edit agent fallback reason=%s attempt=%s requestId=%s', reason, attempt, request.requestId)
         }
       })
       featureLog(
-        'edit agent applied mode=%s attempts=%s operations=%s addedLines=%s removedLines=%s elapsedMs=%s requestId=%s',
+        'edit agent applied mode=%s completion=%s completedSteps=%s totalSteps=%s attempts=%s operations=%s addedLines=%s removedLines=%s elapsedMs=%s requestId=%s',
         request.mode,
+        result.agentCompletion ?? 'complete',
+        result.agentCompletedSteps ?? 0,
+        result.agentTotalSteps ?? 0,
         result.attempts,
         result.summary.operationCount,
         result.summary.addedLines,
@@ -1751,15 +2080,32 @@ export class AiService {
         Date.now() - requestStartedAt,
         request.requestId
       )
+      const contextSummaryCandidate = state.settings.contextMode === 'summary' && result.agentCompletion !== 'partial'
+        ? await this.createContextSummary(
+          target,
+          contextSummary,
+          request.prompt,
+          request.mode,
+          result.message || `The requested Markdown edit completed with ${result.summary.operationCount} operation(s).`,
+          request.requestId,
+          controller.signal,
+          rememberProviderResponse,
+          () => emitProgress('compacting', result.attempts + 1, { streaming: false })
+        )
+        : undefined
       return {
         requestId: request.requestId,
         mode: request.mode,
         content: '',
         reasoning: result.reasoning,
+        contextSummaryCandidate,
         summary: result.message,
         markdown: result.markdown,
         editSummary: result.summary,
         recovery: result.recovery,
+        agentCompletion: result.agentCompletion,
+        agentCompletedSteps: result.agentCompletedSteps,
+        agentTotalSteps: result.agentTotalSteps,
         documentId: request.documentId,
         baseMarkdown: request.markdown,
         model: toMessageModel(target)
@@ -1883,6 +2229,26 @@ const extractToolCalls = (payload: unknown, protocol: AiProtocol): ProviderToolC
     })
     .filter(call => !!call.name)
 }
+
+const parseStrictAgentEnvelope = (content: string, expectedTool: string): ProviderToolCall[] => {
+  const normalized = content.trim()
+  if (!normalized) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(normalized)
+  } catch {
+    return []
+  }
+  if (!isRecord(parsed) || Array.isArray(parsed)) return []
+  return [{
+    id: `json-agent-${expectedTool}`,
+    name: expectedTool,
+    input: parsed,
+    rawInput: normalized
+  }]
+}
+
+const withoutStrictToolSchemas = (tools: ProviderToolDefinition[]): ProviderToolDefinition[] => tools.map(({ strict: _strict, ...tool }) => tool)
 
 const normalizeEditAgentMaxSteps = (value: unknown): number => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_EDIT_AGENT_MAX_STEPS

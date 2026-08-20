@@ -34,6 +34,7 @@ import type { BufferedState as BufferedStateType } from './bufferedState'
 import type { MenuTemplate, MenuPopupPosition } from './menu'
 import type {
   AiChatSession,
+  AiContextMode,
   AiConnectionInput,
   AiAttachmentData,
   AiDiscoveredModel,
@@ -58,6 +59,7 @@ export interface IpcInvokeChannels {
   'mt::ai::set-edit-retry-count': { args: [retryCount: number]; ret: AiSettings }
   'mt::ai::set-edit-agent-max-steps': { args: [maxSteps: number]; ret: AiSettings }
   'mt::ai::set-failure-output-after': { args: [failureCount: number]; ret: AiSettings }
+  'mt::ai::set-context-mode': { args: [contextMode: AiContextMode]; ret: AiSettings }
   'mt::ai::save-connection': { args: [connection: AiConnectionInput]; ret: AiSettings }
   'mt::ai::delete-connection': { args: [connectionId: string]; ret: AiSettings }
   'mt::ai::delete-connection-key': { args: [connectionId: string]; ret: AiSettings }

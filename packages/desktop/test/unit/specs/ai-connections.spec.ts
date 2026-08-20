@@ -102,19 +102,37 @@ describe('AI connection profiles and model routing', () => {
     expect((await service.getSettings()).failureOutputAfter).toBe(3)
   })
 
-  it('exposes the final raw edit output after the configured failure threshold', async() => {
+  it('defaults to recent context and persists the summary mode', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-context-mode-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+
+    expect((await service.getSettings()).contextMode).toBe('recent')
+    expect((await service.setContextMode('summary')).contextMode).toBe('summary')
+    expect((await service.getSettings()).contextMode).toBe('summary')
+    expect((await service.setContextMode(undefined)).contextMode).toBe('recent')
+  })
+
+  it('exposes raw edit output before the whole-document fallback', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-failure-output-'))
     directories.push(directory)
     const service = new AiService(directory)
     const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'failure-model', 'openai-key'))
     await service.setEditAutoRetryCount(0)
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response({ choices: [{ message: { content: '<think>tool plan</think>raw tool output' }, finish_reason: 'stop' }] }))
-      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'raw protocol output' }, finish_reason: 'stop' }] }))
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { messages?: Array<{ role?: string; content?: string }> }
+      const system = body.messages?.find(message => message.role === 'system')?.content ?? ''
+      const content = system.includes('recovering a failed Markdown edit')
+        ? '# Fallback title'
+        : system.includes('native tool transport is unavailable')
+          ? 'raw protocol output'
+          : '<think>tool plan</think>raw tool output'
+      return response({ choices: [{ message: { content }, finish_reason: 'stop' }] })
+    })
     vi.stubGlobal('fetch', fetchMock)
     const progress: Array<{ phase: string; failureCount?: number; failureOutput?: string }> = []
 
-    await expect(service.request({
+    const result = await service.request({
       requestId: 'failure-output-request',
       documentId: 'tab:failure-output',
       mode: 'edit',
@@ -122,14 +140,84 @@ describe('AI connection profiles and model routing', () => {
       markdown: '# Original title',
       messages: [],
       modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
-    }, event => progress.push({ phase: event.phase, failureCount: event.failureCount, failureOutput: event.failureOutput }))).rejects.toThrow('after 2 attempts')
+    }, event => progress.push({ phase: event.phase, failureCount: event.failureCount, failureOutput: event.failureOutput }))
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(progress.at(-1)).toMatchObject({
-      phase: 'failed',
-      failureCount: 2,
-      failureOutput: 'raw protocol output'
+    expect(result.markdown).toBe('# Fallback title')
+    expect(result.recovery?.requiresConfirmation).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(progress).toContainEqual(expect.objectContaining({ phase: 'attempt-failed', failureCount: 2 }))
+  })
+
+  it('forces the single strict Agent tool and disables parallel calls', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-strict-agent-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'strict-model', 'openai-key'))
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const tools = body.tools as Array<{ function?: { name?: string } }> | undefined
+      const toolName = tools?.[0]?.function?.name
+      if (toolName === 'create_markdown_edit_plan') {
+        return response({ choices: [{ message: { tool_calls: [{ id: 'plan', type: 'function', function: { name: toolName, arguments: JSON.stringify({ summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }) } }] }, finish_reason: 'tool_calls' }] })
+      }
+      return response({ choices: [{ message: { tool_calls: [{ id: 'append', type: 'function', function: { name: toolName, arguments: JSON.stringify({ markdown: 'Notes', description: 'Appended notes.' }) } }] }, finish_reason: 'tool_calls' }] })
     })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'strict-agent-request',
+      documentId: 'tab:strict-agent',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(requests).toHaveLength(2)
+    expect(requests.every(body => body.parallel_tool_calls === false)).toBe(true)
+    expect(requests.map(body => (body.tool_choice as { function: { name: string } }).function.name)).toEqual(['create_markdown_edit_plan', 'append_markdown'])
+    expect((requests[0].tools as Array<{ function: { strict?: boolean } }>)[0].function.strict).toBe(true)
+  })
+
+  it('falls back to a complete JSON envelope when native tool transport is unsupported', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-json-agent-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Gateway', 'https://gateway.example/v1', 'json-model', 'gateway-key'))
+    const requests: Array<Record<string, unknown>> = []
+    let jsonCalls = 0
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const tools = body.tools as Array<{ function?: { name?: string } }> | undefined
+      const toolName = tools?.[0]?.function?.name
+      if (toolName) return response({ error: { message: 'tools unsupported' } }, 422)
+      jsonCalls += 1
+      const payload = jsonCalls === 1
+        ? { summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }
+        : { markdown: 'Notes', description: 'Appended notes.' }
+      return response({ choices: [{ message: { content: JSON.stringify(payload) }, finish_reason: 'stop' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'json-agent-request',
+      documentId: 'tab:json-agent',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(requests[2].tools).toBeUndefined()
+    expect(requests[3].tools).toBeUndefined()
   })
 
   it('discovers models without putting the key in the returned list', async() => {
@@ -221,6 +309,36 @@ describe('AI connection profiles and model routing', () => {
     expect(body).not.toHaveProperty('reasoning_effort')
     expect(body).not.toHaveProperty('thinking')
     expect(body).not.toHaveProperty('budget_tokens')
+  })
+
+  it('uses the compact output budget for Anthropic summaries', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-summary-anthropic-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Anthropic summary',
+      protocol: 'anthropic-messages',
+      endpoint: 'https://anthropic.example',
+      models: [{ model: 'claude-summary', label: 'Claude summary' }],
+      apiKey: 'anthropic-summary-key'
+    })
+    await service.setContextMode('summary')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ content: [{ type: 'text', text: 'Answer' }], stop_reason: 'end_turn' }))
+      .mockResolvedValueOnce(response({ content: [{ type: 'text', text: 'Memory' }], stop_reason: 'end_turn' }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await service.request({
+      requestId: 'anthropic-summary-request',
+      documentId: 'tab:anthropic-summary',
+      mode: 'answer',
+      prompt: 'Summarize this.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).max_tokens).toBe(512)
   })
 
   it('streams answer responses and reports live progress without changing the final response', async() => {
@@ -390,6 +508,45 @@ describe('AI connection profiles and model routing', () => {
     })
   })
 
+  it('extracts current image context once and reuses only the source brief in Agent turns', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-source-brief-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'brief-model', 'openai-key'))
+    const imageData = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const tools = body.tools as Array<{ function?: { name?: string } }> | undefined
+      const toolName = tools?.[0]?.function?.name
+      if (!toolName) return response({ choices: [{ message: { content: '## Extracted facts\n- SCAN scheduling' }, finish_reason: 'stop' }] })
+      if (toolName === 'create_markdown_edit_plan') {
+        return response({ choices: [{ message: { tool_calls: [{ id: 'plan', type: 'function', function: { name: toolName, arguments: JSON.stringify({ summary: 'Append facts.', steps: [{ id: 'append', description: 'Append facts.', intent: 'Append extracted facts.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }) } }] }, finish_reason: 'tool_calls' }] })
+      }
+      return response({ choices: [{ message: { tool_calls: [{ id: 'append', type: 'function', function: { name: toolName, arguments: JSON.stringify({ markdown: '## Notes\n\n- SCAN scheduling', description: 'Appended facts.' }) } }] }, finish_reason: 'tool_calls' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'source-brief-request',
+      documentId: 'tab:source-brief',
+      mode: 'edit',
+      prompt: 'Turn the image into notes.',
+      markdown: '# Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id },
+      attachments: [{ id: 'image-brief-0001', name: 'notes.png', mimeType: 'image/png', byteSize: imageData.byteLength, data: imageData }]
+    })
+
+    expect(result.markdown).toContain('SCAN scheduling')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(JSON.stringify(requests[0])).toContain('data:image/png;base64')
+    expect(JSON.stringify(requests[1])).not.toContain('data:image/png;base64')
+    expect(JSON.stringify(requests[2])).not.toContain('data:image/png;base64')
+    expect(JSON.stringify(requests[1])).toContain('Extracted facts')
+  })
+
   it('persists progress entries without sending them to the model', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-progress-'))
     directories.push(directory)
@@ -529,5 +686,62 @@ describe('AI connection profiles and model routing', () => {
     })
     const stored = JSON.parse(await readFile(path.join(directory, 'ai-chat.json'), 'utf8'))
     expect(stored['tab:test']).toMatchObject({ selectedModel: { connectionId: 'connection-a', modelId: 'model-a' } })
+  })
+
+  it('uses only rolling memory in summary context mode and persists it', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-summary-request-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Summary', 'https://summary.example/v1', 'summary-model', 'summary-key'))
+    await service.setContextMode('summary')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Current answer' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Remember the answer.' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'summary-request',
+      documentId: 'tab:summary',
+      mode: 'answer',
+      prompt: 'Follow up',
+      markdown: '# Current document',
+      messages: [{ id: 'old', role: 'user', mode: 'answer', content: 'Old image context', createdAt: 1, attachments: [{ id: 'old-image', name: 'old.png', mimeType: 'image/png', byteSize: 10 }] }],
+      contextSummary: 'Earlier decision',
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.contextSummaryCandidate).toBe('Remember the answer.')
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(JSON.stringify(body)).toContain('Earlier decision')
+    expect(JSON.stringify(body)).not.toContain('Old image context')
+    expect(JSON.stringify(body)).not.toContain('old-image')
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).messages).toHaveLength(2)
+
+    await service.saveChat('tab:summary', { messages: [], contextSummary: result.contextSummaryCandidate })
+    expect((await service.loadChat('tab:summary')).contextSummary).toBe('Remember the answer.')
+  })
+
+  it('falls back locally when the summary provider response is empty', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-summary-fallback-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Summary', 'https://summary.example/v1', 'summary-model', 'summary-key'))
+    await service.setContextMode('summary')
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Answer body' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: '' }, finish_reason: 'stop' }] })))
+
+    const result = await service.request({
+      requestId: 'summary-fallback-request',
+      documentId: 'tab:summary-fallback',
+      mode: 'answer',
+      prompt: 'Remember this request.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.contextSummaryCandidate).toContain('Remember this request.')
+    expect(result.contextSummaryCandidate).toContain('Answer body')
   })
 })

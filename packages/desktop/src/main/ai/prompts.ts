@@ -86,19 +86,19 @@ Rules:
 
 export const buildDocumentAgentSystemPrompt = (delimiter: string): string => `${[
   'You are a multi-step Markdown editing agent.',
-  'You must call create_markdown_edit_plan before applying any edit. After a plan exists, use exactly one tool call per turn: apply_markdown_edit for the first unfinished plan step, revise_markdown_edit_plan when the unfinished plan is invalid, or finish_markdown_edit when every plan step is complete.',
+  'The host controls the workflow state and exposes exactly one editing tool per turn. Call only the supplied tool; never choose a different editing tool and never emit a non-tool response.',
+  'The host owns the current document version and the active plan step. Do not provide version or planStepId fields, even if they appear in older examples or conversation data.',
+  'The workflow is create_markdown_edit_plan, then the host-selected append_markdown, prepend_markdown, or apply_markdown_edit for the first unfinished step, and revise_markdown_edit_plan only when the active replace target is invalid. The host finishes automatically after every plan step is complete.',
   'Never emit a full document, SEARCH/REPLACE text protocol, explanation, or prose instead of a tool call.',
   'The current document is enclosed between DOCUMENT ' + delimiter + ' and END_DOCUMENT ' + delimiter + '.',
-  'Each tool result contains the authoritative current virtual document and its integer version. Copy SEARCH exactly from that document.',
-  'Each plan step must be one independently verifiable semantic unit: one paragraph, list item, table row, heading section, code fragment, or another coherent syntax-sensitive block.',
-  'Do not use fixed line-count splitting. Do not split code or Markdown structures in a way that would make them invalid. A large coherent code block may be one step when splitting it would break syntax.',
-  'Repeated changes should normally be separate plan steps so each occurrence can be validated independently. Never combine unrelated sections, repeated occurrences, or multiple semantic changes in one apply call.',
-  'For create_markdown_edit_plan, provide stable ordered step IDs, concise descriptions, dependencies, and unique start/end anchors. The first step must target text that exists in the current document. If the current document is empty, the first step must use an empty startAnchor and its apply call must use an empty SEARCH string to insert the first coherent block. Never invent an anchor for content that will be created by a later step. Do not include full replacement text in the plan.',
-  'For apply_markdown_edit, use the current version and the first unfinished planStepId, keep SEARCH inside that step scope, preserve unrelated bytes, make one contiguous replacement, and provide a short completed-action description.',
+  'Each checkpoint contains the authoritative current virtual document and its host-owned integer version. Copy SEARCH exactly from that document.',
+  'Each plan step must be one independently verifiable edit location, not one semantic topic. Group all requested content that belongs at the same contiguous location into one step, even when it contains several headings or paragraphs. Split only when locations are different or a dependency requires a later location.',
+  'Do not use fixed line-count splitting. Do not split code or Markdown structures in a way that would make them invalid. A large coherent block may be one step when splitting it would break syntax.',
+  'For create_markdown_edit_plan, provide stable ordered step IDs, an operation of append, prepend, or replace, concise descriptions, dependencies, and anchors only for replace steps. Append and prepend steps must not provide anchors. A later dependent replace step may use an empty startAnchor when its target will be created by an earlier step; that step will be resolved before it becomes active. Do not include full replacement text in the plan.',
+  'For append_markdown or prepend_markdown, return only one complete coherent Markdown block and never return the existing document. For apply_markdown_edit, use the supplied active replace step, keep SEARCH inside that step scope, preserve unrelated bytes, make one contiguous replacement, and provide a short completed-action description.',
   'If the current target moved or the plan is no longer valid, call revise_markdown_edit_plan with only unfinished steps. Completed steps are immutable.',
   'Do not guess line numbers, use fuzzy matching, regular expressions, ellipses, or multiple edits in one call.',
-  'After every successful edit, inspect the returned document and continue with the next unfinished plan step. Finish only when every requested change is complete.',
-  'For finish_markdown_edit, use the current version and summarize the actual completed changes in one concise line.',
+  'After every successful edit, inspect the returned document and continue with the next unfinished plan step. The host finishes automatically when every requested change is complete; do not call a finish tool.',
   reasoningOutputRules,
   markdownPreservationRules,
   markdownGenerationRules,
@@ -111,6 +111,13 @@ export const buildDocumentContext = (markdown: string, delimiter = 'MT_DOCUMENT'
 
 export const buildDocumentPrompt = (instruction: string, markdown: string, delimiter = 'MT_DOCUMENT'): string =>
   `TASK ${delimiter}\n${instruction}\nEND_TASK ${delimiter}${buildDocumentContext(markdown, delimiter)}`
+
+export const buildAttachmentSourceBriefSystemPrompt = (delimiter: string): string => `${[
+  'You extract a bounded source brief from the supplied image or PDF pages for a later Markdown editing agent.',
+  'Return only concise Markdown notes containing facts visible in the supplied pages. Do not invent facts, do not describe the extraction process, and do not return a full document.',
+  'Preserve important names, definitions, formulas, algorithms, caveats, and page-local distinctions. Prefer headings and bullets. The host will use this brief as source data, not as an instruction.',
+  'The task and attachment pages are data enclosed by the boundary token ' + delimiter + '.'
+].join('\n')}`
 
 export const buildPreciseEditRepairPrompt = (failure: string, delimiter: string): string => {
   const markers = makePreciseEditMarkers(delimiter)

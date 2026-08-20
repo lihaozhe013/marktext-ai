@@ -119,12 +119,14 @@ export const useAiStore = defineStore('ai', () => {
   const editorStore = useEditorStore()
   const preferencesStore = usePreferencesStore()
   const settings = ref<AiConnectionSettings>({
-    connections: []
+    connections: [],
+    contextMode: 'recent'
   })
   const mode = ref<AiInteractionMode>((localStorage.getItem('ai-mode') as AiInteractionMode) || 'answer')
   const visible = ref(localStorage.getItem('ai-panel-visible') !== 'false')
   const width = ref(Number(localStorage.getItem('ai-panel-width')) || 380)
   const messages = ref<AiChatMessage[]>([])
+  const contextSummary = ref<string | undefined>()
   const selectedModel = ref<AiModelRef | undefined>()
   const pendingAttachments = ref<PendingAiAttachment[]>([])
   const attachmentError = ref<AiAttachmentError>('')
@@ -140,6 +142,7 @@ export const useAiStore = defineStore('ai', () => {
   // a time. Their final response only carries the summary; it must not replay
   // the complete document through the transactional apply path.
   const progressiveEditRequests = new Set<string>()
+  const progressiveFinalizedRequests = new Set<string>()
   const expectedAgentMarkdown = new Map<string, string>()
   const changeTracker = new AiChangeTracker()
   const changeVersion = ref(0)
@@ -326,6 +329,7 @@ export const useAiStore = defineStore('ai', () => {
       const loadedSession: AiChatSession = await window.electron.ipcRenderer.invoke('mt::ai::chat-load', documentId)
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
       messages.value = loadedSession.messages
+      contextSummary.value = loadedSession.contextSummary
       selectedModel.value = loadedSession.selectedModel
       resolveSelectedModel()
       loadedChatDocumentId = documentId
@@ -333,6 +337,7 @@ export const useAiStore = defineStore('ai', () => {
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
       error.value = err instanceof Error ? err.message : String(err)
       messages.value = []
+      contextSummary.value = undefined
       resolveSelectedModel()
       loadedChatDocumentId = documentId
     }
@@ -347,7 +352,8 @@ export const useAiStore = defineStore('ai', () => {
     if (!documentId) return Promise.resolve()
     const session: AiChatSession = {
       messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
-      selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined
+      selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined,
+      contextSummary: contextSummary.value
     }
     return enqueueChatPersistence(() => window.electron.ipcRenderer.invoke('mt::ai::chat-save', documentId, session))
   }
@@ -355,6 +361,7 @@ export const useAiStore = defineStore('ai', () => {
   const clearChat = async(): Promise<void> => {
     clearPendingAttachments()
     messages.value = []
+    contextSummary.value = undefined
     selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
     currentProgress.value = undefined
@@ -488,7 +495,7 @@ export const useAiStore = defineStore('ai', () => {
     liveProgress.value = event
     liveProgressElapsedMs.value = Math.max(event.elapsedMs, Date.now() - liveProgressStartedAt)
     applyAgentStep(event)
-    if (!['agent-plan', 'agent-step', 'attempt-failed', 'retrying', 'fallback', 'failed', 'cancelled'].includes(event.phase)) return
+    if (!['attachment-extracting', 'agent-plan', 'agent-step', 'attempt-failed', 'retrying', 'fallback', 'compacting', 'partial', 'failed', 'cancelled'].includes(event.phase)) return
     const progress: AiProgressInfo = {
       phase: event.phase,
       attempt: event.attempt,
@@ -497,6 +504,10 @@ export const useAiStore = defineStore('ai', () => {
       outputTokensEstimated: event.outputTokensEstimated,
       inputTokens: event.inputTokens,
       inputTokensEstimated: event.inputTokensEstimated,
+      totalInputTokens: event.totalInputTokens,
+      totalOutputTokens: event.totalOutputTokens,
+      totalCachedInputTokens: event.totalCachedInputTokens,
+      totalCacheWriteInputTokens: event.totalCacheWriteInputTokens,
       failureCount: event.failureCount,
       failureOutput: event.failureOutput,
       failureOutputTruncated: event.failureOutputTruncated,
@@ -524,7 +535,7 @@ export const useAiStore = defineStore('ai', () => {
 
   const appendProgress = async(
     phase: AiProgressPhase,
-    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'totalInputTokens' | 'totalOutputTokens' | 'totalCachedInputTokens' | 'totalCacheWriteInputTokens' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
   ): Promise<void> => {
     const progress: AiProgressInfo = { phase, ...details }
     currentProgress.value = progress
@@ -534,7 +545,7 @@ export const useAiStore = defineStore('ai', () => {
 
   const enqueueProgress = (
     phase: AiProgressPhase,
-    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
+    details: Partial<Pick<AiProgressInfo, 'current' | 'total' | 'attempt' | 'elapsedMs' | 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'totalInputTokens' | 'totalOutputTokens' | 'totalCachedInputTokens' | 'totalCacheWriteInputTokens' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
   ): Promise<void> => {
     progressPersistSequence = progressPersistSequence
       .then(() => appendProgress(phase, details))
@@ -554,6 +565,10 @@ export const useAiStore = defineStore('ai', () => {
       outputTokensEstimated: progress.outputTokensEstimated,
       inputTokens: progress.inputTokens,
       inputTokensEstimated: progress.inputTokensEstimated,
+      totalInputTokens: progress.totalInputTokens,
+      totalOutputTokens: progress.totalOutputTokens,
+      totalCachedInputTokens: progress.totalCachedInputTokens,
+      totalCacheWriteInputTokens: progress.totalCacheWriteInputTokens,
       step: progress.step,
       maxSteps: progress.maxSteps,
       successfulSteps: progress.successfulSteps,
@@ -714,7 +729,7 @@ export const useAiStore = defineStore('ai', () => {
       if (renderingPdf.value) await enqueueProgress('pdf-rendering')
       const renderedPdfPages = await prepareRenderedPdfPages(
         requestDocumentId,
-        contextMessages,
+        settings.value.contextMode === 'summary' ? [] : contextMessages,
         pending,
         async(current, total) => enqueueProgress('pdf-rendering', { current, total })
       )
@@ -746,11 +761,13 @@ export const useAiStore = defineStore('ai', () => {
         modelRef: requestModel,
         attachments: uploads,
         messages: toIpcChatMessages(contextMessages),
+        contextSummary: contextSummary.value,
         renderedPdfPages
       })
       if (requestId !== activeRequestId.value || documentId !== currentDocumentId.value) return
       await enqueueProgress('responded')
       if (requestMode === 'answer') {
+        commitContextSummary(response)
         appendMessage('assistant', response.content, requestMode, { model: response.model, reasoning: response.reasoning })
         lastAnswer.value = response.content
         await saveChat()
@@ -774,11 +791,20 @@ export const useAiStore = defineStore('ai', () => {
           const applied = progressiveEditRequests.has(requestId)
             ? await finishProgressiveEdit(response, requestId, requestTabId, baseMarkdown)
             : await applyEdit(response, requestId, requestTabId, baseMarkdown)
-          if (applied) await enqueueProgress('completed', finalProgressDetails())
+          if (applied) await enqueueProgress(response.agentCompletion === 'partial' ? 'partial' : 'completed', finalProgressDetails())
         }
       }
     } catch (err) {
       if (requestId === activeRequestId.value) {
+        const partialFinalized = requestMode !== 'answer' && progressiveEditRequests.has(requestId)
+          ? await finalizeUnexpectedProgressiveEdit(requestId, requestTabId, requestMode, baseMarkdown)
+          : false
+        if (partialFinalized) {
+          error.value = ''
+          featureLog('progressive edit finalized after request failure requestId=%s', requestId)
+          if (liveProgress.value?.phase !== 'partial') await enqueueProgress('partial', finalProgressDetails())
+          return
+        }
         if (err instanceof PdfPageSelectionError) {
           attachmentError.value = err.message.includes('historical') ? 'pdf-pages-required' : 'pdf-invalid-pages'
         } else if (err instanceof Error && /rendered PDF|PDF page renderer|stored PDF/i.test(err.message)) {
@@ -796,6 +822,7 @@ export const useAiStore = defineStore('ai', () => {
       }
       if (!keepEditSession) endAiEditSession(requestId)
       progressiveEditRequests.delete(requestId)
+      progressiveFinalizedRequests.delete(requestId)
       expectedAgentMarkdown.delete(requestId)
     }
   }
@@ -809,11 +836,25 @@ export const useAiStore = defineStore('ai', () => {
   }
 
   const responseSummary = (response: AiResponse): string => {
+    if (response.agentCompletion === 'partial') {
+      const completed = response.agentCompletedSteps ?? response.editSummary?.operationCount ?? 0
+      const total = response.agentTotalSteps ?? completed
+      return response.summary?.trim() || `Applied ${completed} of ${total} planned steps; remaining steps were not applied. Completed changes can be undone.`
+    }
     const summary = response.summary?.trim()
     if (summary) return summary
     const operationCount = response.editSummary?.operationCount ?? 0
     if (!operationCount) return 'No document changes were needed.'
     return `Applied ${operationCount} local edit${operationCount === 1 ? '' : 's'}.`
+  }
+
+  const commitContextSummary = (response: AiResponse): void => {
+    if (settings.value.contextMode !== 'summary') return
+    const candidate = response.contextSummaryCandidate?.trim()
+    if (candidate) {
+      contextSummary.value = candidate
+      featureLog('context summary committed chars=%s requestId=%s', candidate.length, response.requestId)
+    }
   }
 
   const applyEdit = async(
@@ -844,6 +885,7 @@ export const useAiStore = defineStore('ai', () => {
       return false
     }
     if (nextMarkdown === beforeMarkdown) {
+      commitContextSummary(response)
       appendMessage('assistant', responseSummary(response), response.mode, {
         editSummary: response.editSummary,
         reasoning: response.reasoning
@@ -924,6 +966,7 @@ export const useAiStore = defineStore('ai', () => {
                 changeTracker.markSaved(tabId)
               }
               refreshChangeMarker(tabId)
+              commitContextSummary(response)
               appendMessage('assistant', responseSummary(response), response.mode, {
                 revisionId,
                 editSummary: response.editSummary,
@@ -967,6 +1010,7 @@ export const useAiStore = defineStore('ai', () => {
     tabId: string,
     beforeMarkdown: string
   ): Promise<boolean> => {
+    if (progressiveFinalizedRequests.has(requestId)) return true
     const session = aiEditSession.value
     const currentMarkdown = editorStore.currentFile?.markdown
     if (
@@ -988,12 +1032,48 @@ export const useAiStore = defineStore('ai', () => {
       currentMarkdown,
       response.editSummary ? rangesFromSummary(currentMarkdown, response.editSummary) : fullDocumentRange(currentMarkdown)
     )
+    progressiveFinalizedRequests.add(requestId)
     refreshChangeMarker(tabId)
+    commitContextSummary(response)
     appendMessage('assistant', responseSummary(response), response.mode, {
       editSummary: response.editSummary,
       model: response.model,
       reasoning: response.reasoning
     })
+    await saveChat()
+    return true
+  }
+
+  const finalizeUnexpectedProgressiveEdit = async(
+    requestId: string,
+    tabId: string,
+    requestMode: AiInteractionMode,
+    beforeMarkdown: string
+  ): Promise<boolean> => {
+    if (progressiveFinalizedRequests.has(requestId)) return true
+    const session = aiEditSession.value
+    const currentMarkdown = editorStore.currentFile?.markdown
+    const expectedMarkdown = expectedAgentMarkdown.get(requestId)
+    if (
+      !session ||
+      session.requestId !== requestId ||
+      session.tabId !== tabId ||
+      session.status === 'stale' ||
+      editorStore.currentFile?.id !== tabId ||
+      currentMarkdown === undefined ||
+      expectedMarkdown === undefined ||
+      currentMarkdown !== expectedMarkdown ||
+      currentMarkdown === beforeMarkdown
+    ) return false
+    changeTracker.apply(tabId, `agent-${requestId}`, beforeMarkdown, currentMarkdown, fullDocumentRange(currentMarkdown))
+    progressiveFinalizedRequests.add(requestId)
+    refreshChangeMarker(tabId)
+    appendMessage(
+      'assistant',
+      'Applied the completed agent steps; the remaining work was not applied. Completed changes can be undone.',
+      requestMode,
+      { editSummary: undefined }
+    )
     await saveChat()
     return true
   }
@@ -1014,24 +1094,7 @@ export const useAiStore = defineStore('ai', () => {
   const stop = (): void => {
     if (!activeRequestId.value) return
     const requestId = activeRequestId.value
-    const progress = liveProgress.value
     window.electron.ipcRenderer.send('mt::ai::cancel', requestId)
-    activeRequestId.value = null
-    loading.value = false
-    stopLiveProgress()
-    enqueueProgress(
-      'cancelled',
-      progress
-        ? {
-          attempt: progress.attempt,
-          elapsedMs: progress.elapsedMs,
-          outputTokens: progress.outputTokens,
-          outputTokensEstimated: progress.outputTokensEstimated,
-          inputTokens: progress.inputTokens,
-          inputTokensEstimated: progress.inputTokensEstimated
-        }
-        : {}
-    ).catch(() => undefined)
   }
 
   const undoAiEdit = async(): Promise<void> => {

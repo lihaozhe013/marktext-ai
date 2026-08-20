@@ -17,6 +17,7 @@ type AiIpcService = Pick<
   | 'setEditAutoRetryCount'
   | 'setEditAgentMaxSteps'
   | 'setFailureOutputAfter'
+  | 'setContextMode'
   | 'saveConnection'
   | 'deleteConnection'
   | 'deleteConnectionKey'
@@ -56,6 +57,11 @@ export const registerAiIpcHandlers = (aiService: AiIpcService): void => {
   })
   ipcMain.handle('mt::ai::set-failure-output-after', async(_event, failureCount: number) => {
     const saved = await aiService.setFailureOutputAfter(failureCount)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-context-mode', async(_event, contextMode: AiSettings['contextMode']) => {
+    const saved = await aiService.setContextMode(contextMode)
     broadcastSettings(saved)
     return saved
   })
