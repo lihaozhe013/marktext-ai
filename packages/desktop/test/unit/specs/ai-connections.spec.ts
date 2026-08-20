@@ -119,10 +119,16 @@ describe('AI connection profiles and model routing', () => {
     const service = new AiService(directory)
     const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'failure-model', 'openai-key'))
     await service.setEditAutoRetryCount(0)
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response({ choices: [{ message: { content: '<think>tool plan</think>raw tool output' }, finish_reason: 'stop' }] }))
-      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'raw protocol output' }, finish_reason: 'stop' }] }))
-      .mockResolvedValueOnce(response({ choices: [{ message: { content: '# Fallback title' }, finish_reason: 'stop' }] }))
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { messages?: Array<{ role?: string; content?: string }> }
+      const system = body.messages?.find(message => message.role === 'system')?.content ?? ''
+      const content = system.includes('recovering a failed Markdown edit')
+        ? '# Fallback title'
+        : system.includes('native tool transport is unavailable')
+          ? 'raw protocol output'
+          : '<think>tool plan</think>raw tool output'
+      return response({ choices: [{ message: { content }, finish_reason: 'stop' }] })
+    })
     vi.stubGlobal('fetch', fetchMock)
     const progress: Array<{ phase: string; failureCount?: number; failureOutput?: string }> = []
 
@@ -138,8 +144,80 @@ describe('AI connection profiles and model routing', () => {
 
     expect(result.markdown).toBe('# Fallback title')
     expect(result.recovery?.requiresConfirmation).toBe(true)
-    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
     expect(progress).toContainEqual(expect.objectContaining({ phase: 'attempt-failed', failureCount: 2 }))
+  })
+
+  it('forces the single strict Agent tool and disables parallel calls', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-strict-agent-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'strict-model', 'openai-key'))
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const tools = body.tools as Array<{ function?: { name?: string } }> | undefined
+      const toolName = tools?.[0]?.function?.name
+      if (toolName === 'create_markdown_edit_plan') {
+        return response({ choices: [{ message: { tool_calls: [{ id: 'plan', type: 'function', function: { name: toolName, arguments: JSON.stringify({ summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }) } }] }, finish_reason: 'tool_calls' }] })
+      }
+      return response({ choices: [{ message: { tool_calls: [{ id: 'append', type: 'function', function: { name: toolName, arguments: JSON.stringify({ markdown: 'Notes', description: 'Appended notes.' }) } }] }, finish_reason: 'tool_calls' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'strict-agent-request',
+      documentId: 'tab:strict-agent',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(requests).toHaveLength(2)
+    expect(requests.every(body => body.parallel_tool_calls === false)).toBe(true)
+    expect(requests.map(body => (body.tool_choice as { function: { name: string } }).function.name)).toEqual(['create_markdown_edit_plan', 'append_markdown'])
+    expect((requests[0].tools as Array<{ function: { strict?: boolean } }>)[0].function.strict).toBe(true)
+  })
+
+  it('falls back to a complete JSON envelope when native tool transport is unsupported', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-json-agent-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Gateway', 'https://gateway.example/v1', 'json-model', 'gateway-key'))
+    const requests: Array<Record<string, unknown>> = []
+    let jsonCalls = 0
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const tools = body.tools as Array<{ function?: { name?: string } }> | undefined
+      const toolName = tools?.[0]?.function?.name
+      if (toolName) return response({ error: { message: 'tools unsupported' } }, 422)
+      jsonCalls += 1
+      const payload = jsonCalls === 1
+        ? { summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }
+        : { markdown: 'Notes', description: 'Appended notes.' }
+      return response({ choices: [{ message: { content: JSON.stringify(payload) }, finish_reason: 'stop' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'json-agent-request',
+      documentId: 'tab:json-agent',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(requests[2].tools).toBeUndefined()
+    expect(requests[3].tools).toBeUndefined()
   })
 
   it('discovers models without putting the key in the returned list', async() => {
@@ -428,6 +506,45 @@ describe('AI connection profiles and model routing', () => {
       mimeType: 'application/pdf',
       pages: [1]
     })
+  })
+
+  it('extracts current image context once and reuses only the source brief in Agent turns', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-source-brief-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('OpenAI', 'https://openai.example/v1', 'brief-model', 'openai-key'))
+    const imageData = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const tools = body.tools as Array<{ function?: { name?: string } }> | undefined
+      const toolName = tools?.[0]?.function?.name
+      if (!toolName) return response({ choices: [{ message: { content: '## Extracted facts\n- SCAN scheduling' }, finish_reason: 'stop' }] })
+      if (toolName === 'create_markdown_edit_plan') {
+        return response({ choices: [{ message: { tool_calls: [{ id: 'plan', type: 'function', function: { name: toolName, arguments: JSON.stringify({ summary: 'Append facts.', steps: [{ id: 'append', description: 'Append facts.', intent: 'Append extracted facts.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }) } }] }, finish_reason: 'tool_calls' }] })
+      }
+      return response({ choices: [{ message: { tool_calls: [{ id: 'append', type: 'function', function: { name: toolName, arguments: JSON.stringify({ markdown: '## Notes\n\n- SCAN scheduling', description: 'Appended facts.' }) } }] }, finish_reason: 'tool_calls' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'source-brief-request',
+      documentId: 'tab:source-brief',
+      mode: 'edit',
+      prompt: 'Turn the image into notes.',
+      markdown: '# Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id },
+      attachments: [{ id: 'image-brief-0001', name: 'notes.png', mimeType: 'image/png', byteSize: imageData.byteLength, data: imageData }]
+    })
+
+    expect(result.markdown).toContain('SCAN scheduling')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(JSON.stringify(requests[0])).toContain('data:image/png;base64')
+    expect(JSON.stringify(requests[1])).not.toContain('data:image/png;base64')
+    expect(JSON.stringify(requests[2])).not.toContain('data:image/png;base64')
+    expect(JSON.stringify(requests[1])).toContain('Extracted facts')
   })
 
   it('persists progress entries without sending them to the model', async() => {

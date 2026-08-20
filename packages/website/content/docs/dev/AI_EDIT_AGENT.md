@@ -33,9 +33,9 @@ idle
   │
   ├─ rewrite ──────────────────────────────► Markdown repair ► transactional apply ► completed
   │
-  └─ edit ─► precise Agent ─► plan/steps ─► final summary
+  └─ edit ─► attachment brief? ─► precise Agent ─► plan/steps ─► local summary
                          │                    │
-                         │                    ├─ progressive apply ► completed
+                         │                    ├─ progressive apply ► completed/partial
                          │                    └─ recovery proposal ► confirmation
                          │
                          └─ validation/provider/cancel failure ► failed or cancelled
@@ -76,7 +76,7 @@ No plan
   └─ invalid ─► validation failure ─► create-only retry
 
 Planned
-  │ apply_markdown_edit for first unfinished step
+  │ append_markdown / prepend_markdown / apply_markdown_edit
   ├─ valid ─────────────────────► Step applied ─► Planned
   ├─ location/scope failures ──► Plan revision required ─► revise-only turn
   └─ invalid tool/arguments etc. ► validation failure ─► retry
@@ -87,13 +87,15 @@ Plan revision required
   └─ invalid ───────────────────► validation failure ─► retry
 
 Planned with all steps complete
-  │ finish_markdown_edit(summary)
+  │ host builds a local summary
   └────────────────────────────► Agent complete
 ```
 
 The main process owns this state machine and exposes exactly one editing tool
-per provider turn: create while no plan exists, apply while the active step is
-valid, revise when the plan needs repair, and finish after all steps complete.
+per provider turn: create while no plan exists, append/prepend for insertion
+steps, apply for replacement steps, and revise when the plan needs repair.
+There is no completion model call after the last step; the host creates the
+final summary.
 The current document version and active plan-step ID are host-owned fields and
 are not requested from the model. Each turn is rebuilt from a compact
 checkpoint containing the task, current Markdown, plan state, completed steps,
@@ -108,11 +110,23 @@ has an ID, description, intent, `startAnchor`, optional `endAnchor`, and
 dependencies. The host owns the current document version and does not ask the
 model to repeat it.
 
-The initial plan is checked against the current document immediately:
+The initial plan is checked against the current document immediately. Steps are
+organized by edit location rather than semantic topic; adjacent insertions are
+one `append` or `prepend` step. A plan is capped at 16 steps.
 
-- A non-empty document requires a valid `startAnchor` for the first step.
-- An empty document requires the first step to use `startAnchor: ''` and to
-  omit `endAnchor`. Its edit uses the empty `SEARCH` insertion path.
+Each step declares `operation: append | prepend | replace`:
+
+- `append` and `prepend` return only new Markdown. The host owns paragraph
+  separators and never simulates insertion by replacing the last line.
+- `replace` is the only operation that uses anchors and exact SEARCH/REPLACE.
+
+The anchor rules are:
+
+- A non-empty document requires a valid `startAnchor` for the first
+  replacement step. Append and prepend steps do not use anchors.
+- An empty document's first replacement step uses `startAnchor: ''` and omits
+  `endAnchor`; append and prepend steps still omit anchors. Its replacement
+  uses the empty `SEARCH` insertion path.
 - Later dependent steps may use an empty `startAnchor` when their target will
   be created by an earlier step. Before that step becomes active, the host
   requires a revised plan with a current anchor.
@@ -123,7 +137,7 @@ that the remaining plan changed rather than starting a new request.
 
 ### Incremental step application
 
-Only the first unfinished plan step may be applied. Each
+Only the first unfinished plan step may be applied. Each replacement
 `apply_markdown_edit` call must:
 
 - target the host-selected first unfinished plan step;
@@ -150,15 +164,8 @@ failures terminate the request while preserving those successful steps.
 
 ### Completion and limits
 
-The model can call `finish_markdown_edit` only when:
-
-- a plan exists;
-- every plan step is complete; and
-- the summary is a concise string (the host supplies a local fallback if it is
-  empty).
-
-The result carries the final Markdown, edit summary, recovery metadata, and
-the model's summary message. The Agent also enforces bounded successful steps,
+The result carries the final Markdown, edit summary, recovery metadata, and a
+host-generated summary. The Agent also enforces bounded successful steps,
 invalid turns, plan revisions, and total runtime. These limits are safety
 boundaries, not additional model retries.
 
@@ -179,7 +186,7 @@ waiting → streaming → validating
                      ├─ agent-plan → agent-step → validating …
                      ├─ attempt-failed → retrying → validating …
                      ├─ fallback → validating …
-                     └─ responded → local-processing → completed
+                     └─ responded → local-processing → completed/partial
 
 Any active request may end in failed or cancelled.
 ```
@@ -209,10 +216,25 @@ applied. Empty or failed compaction falls back to a bounded local summary and
 never turns an otherwise successful request into a failure. Cancelled, stale,
 failed, and discarded recovery results keep the previous memory.
 
+When the request has current images or PDF pages, the main process first makes
+one `attachment-extracting` call containing only the task and those images.
+The resulting bounded Markdown `sourceBrief` is used by every Agent checkpoint;
+the pages are not resent on later turns. Extraction retries once on empty,
+reasoning-only, or truncated output and aborts before any document change if it
+still fails.
+
+Native Agent calls use a named tool choice, strict schemas, and
+`parallel_tool_calls: false` when supported. A 400/404/422 compatibility error
+downgrades to a non-strict native request, then to a strict JSON envelope. The
+JSON fallback accepts only a complete JSON object and never extracts fragments
+from prose or fences. The selected transport is cached per provider/model.
+
 Agent checkpoint logs use the `[ai-editor]` prefix and record only phase,
-allowed tool, document version, plan/step counts, checkpoint size, validation
-category, and fallback reason. They never include Markdown, attachment bytes,
-attachment paths, API keys, or reasoning content.
+transport, allowed tool, document version, plan/step counts, checkpoint and
+source-brief sizes, plan-fingerprint size, attachment page count, token usage,
+validation category, state transition, and fallback/partial reason. They never
+include Markdown, attachment bytes, attachment paths, API keys, or reasoning
+content.
 
 ## Renderer application states
 
@@ -250,6 +272,14 @@ changes. The progressive path is not silently rolled back when a later Agent
 turn fails; successful steps remain visible and can be undone through the AI
 revision mechanism.
 
+If a provider, network, cancellation, or later validation failure arrives after
+one or more successful steps, the renderer verifies that the raw document still
+equals the last confirmed step snapshot, records one base-to-current change in
+the AI change tracker, and emits terminal `partial`. The summary candidate is
+not committed. The UI reports the completed/total plan steps and the retained
+change remains available to AI undo. If no step succeeded, the request remains
+eligible for the confirmation-only whole-document fallback.
+
 ### Transactional edit and recovery
 
 If no Agent step was applied, `applyEdit()` uses the revision journal:
@@ -272,6 +302,9 @@ discarding removes the prepared revision and unlocks the editor.
   exhausted Agent limits, stale application failure, or another request error.
 - `cancelled` is terminal and is emitted when the user stops an active request
   or the main process observes cancellation.
+- `partial` is terminal: at least one precise step was committed, later work
+  stopped, the retained changes are undoable, and no whole-document overwrite
+  was attempted.
 - A chat persistence error is not an AI request failure. It must not overwrite
   a successful document result with `failed`.
 - A stale document result is never applied. The request is cancelled or

@@ -19,6 +19,7 @@ export interface ProviderToolDefinition {
   name: string
   description: string
   parameters: Record<string, unknown>
+  strict?: boolean
 }
 
 export interface ProviderToolCall {
@@ -35,9 +36,12 @@ export interface ProviderToolResult {
   isError?: boolean
 }
 
+export type AgentPlanOperation = 'append' | 'prepend' | 'replace'
+
 export const applyMarkdownEditTool: ProviderToolDefinition = {
   name: 'apply_markdown_edit',
   description: 'Apply exactly one planned, precise Markdown replacement inside the current plan step. SEARCH must be copied exactly and uniquely from the current virtual document.',
+  strict: true,
   parameters: {
     type: 'object',
     additionalProperties: false,
@@ -50,9 +54,40 @@ export const applyMarkdownEditTool: ProviderToolDefinition = {
   }
 }
 
+export const appendMarkdownTool: ProviderToolDefinition = {
+  name: 'append_markdown',
+  description: 'Append one complete, coherent Markdown block to the end of the current document. Return only the new block, not the existing document.',
+  strict: true,
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      markdown: { type: 'string', minLength: 1, maxLength: 16000 },
+      description: { type: 'string', maxLength: 160 }
+    },
+    required: ['markdown', 'description']
+  }
+}
+
+export const prependMarkdownTool: ProviderToolDefinition = {
+  name: 'prepend_markdown',
+  description: 'Prepend one complete, coherent Markdown block to the beginning of the current document. Return only the new block, not the existing document.',
+  strict: true,
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      markdown: { type: 'string', minLength: 1, maxLength: 16000 },
+      description: { type: 'string', maxLength: 160 }
+    },
+    required: ['markdown', 'description']
+  }
+}
+
 export const createMarkdownEditPlanTool: ProviderToolDefinition = {
   name: 'create_markdown_edit_plan',
   description: 'Create an ordered plan of independently verifiable Markdown edit steps before applying any edit.',
+  strict: true,
   parameters: {
     type: 'object',
     additionalProperties: false,
@@ -60,7 +95,7 @@ export const createMarkdownEditPlanTool: ProviderToolDefinition = {
       summary: { type: 'string', minLength: 1, maxLength: 240 },
       steps: {
         type: 'array',
-        maxItems: 128,
+        maxItems: 16,
         items: {
           type: 'object',
           additionalProperties: false,
@@ -68,11 +103,12 @@ export const createMarkdownEditPlanTool: ProviderToolDefinition = {
             id: { type: 'string', minLength: 1, maxLength: 80 },
             description: { type: 'string', minLength: 1, maxLength: 160 },
             intent: { type: 'string', minLength: 1, maxLength: 400 },
-            startAnchor: { type: 'string', maxLength: 1000 },
-            endAnchor: { type: 'string', maxLength: 1000 },
+            operation: { type: 'string', enum: ['append', 'prepend', 'replace'] },
+            startAnchor: { type: ['string', 'null'], maxLength: 1000 },
+            endAnchor: { type: ['string', 'null'], maxLength: 1000 },
             dependsOn: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 80 } }
           },
-          required: ['id', 'description', 'intent', 'startAnchor', 'dependsOn']
+          required: ['id', 'description', 'intent', 'operation', 'startAnchor', 'endAnchor', 'dependsOn']
         }
       }
     },
@@ -83,6 +119,7 @@ export const createMarkdownEditPlanTool: ProviderToolDefinition = {
 export const reviseMarkdownEditPlanTool: ProviderToolDefinition = {
   name: 'revise_markdown_edit_plan',
   description: 'Revise only unfinished Markdown edit steps after the current target or plan becomes invalid; completed steps are immutable.',
+  strict: true,
   parameters: {
     type: 'object',
     additionalProperties: false,
@@ -90,7 +127,7 @@ export const reviseMarkdownEditPlanTool: ProviderToolDefinition = {
       reason: { type: 'string', minLength: 1, maxLength: 240 },
       remainingSteps: {
         type: 'array',
-        maxItems: 128,
+        maxItems: 16,
         items: {
           type: 'object',
           additionalProperties: false,
@@ -98,11 +135,12 @@ export const reviseMarkdownEditPlanTool: ProviderToolDefinition = {
             id: { type: 'string', minLength: 1, maxLength: 80 },
             description: { type: 'string', minLength: 1, maxLength: 160 },
             intent: { type: 'string', minLength: 1, maxLength: 400 },
-            startAnchor: { type: 'string', maxLength: 1000 },
-            endAnchor: { type: 'string', maxLength: 1000 },
+            operation: { type: 'string', enum: ['append', 'prepend', 'replace'] },
+            startAnchor: { type: ['string', 'null'], maxLength: 1000 },
+            endAnchor: { type: ['string', 'null'], maxLength: 1000 },
             dependsOn: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 80 } }
           },
-          required: ['id', 'description', 'intent', 'startAnchor', 'dependsOn']
+          required: ['id', 'description', 'intent', 'operation', 'startAnchor', 'endAnchor', 'dependsOn']
         }
       }
     },
@@ -113,6 +151,7 @@ export const reviseMarkdownEditPlanTool: ProviderToolDefinition = {
 export const finishMarkdownEditTool: ProviderToolDefinition = {
   name: 'finish_markdown_edit',
   description: 'Finish the Markdown editing task after all requested changes have been applied to the virtual document.',
+  strict: true,
   parameters: {
     type: 'object',
     additionalProperties: false,
@@ -123,7 +162,7 @@ export const finishMarkdownEditTool: ProviderToolDefinition = {
   }
 }
 
-export const preciseEditTools: ProviderToolDefinition[] = [createMarkdownEditPlanTool, applyMarkdownEditTool, reviseMarkdownEditPlanTool, finishMarkdownEditTool]
+export const preciseEditTools: ProviderToolDefinition[] = [createMarkdownEditPlanTool, applyMarkdownEditTool, appendMarkdownTool, prependMarkdownTool, reviseMarkdownEditPlanTool, finishMarkdownEditTool]
 
 /** @deprecated Kept for persisted/test callers; the agent uses preciseEditTools. */
 export const preciseEditTool: ProviderToolDefinition = {

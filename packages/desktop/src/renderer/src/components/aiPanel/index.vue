@@ -549,7 +549,15 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
   const cacheUsage = progress?.cachedInputTokens !== undefined
     ? chinese.value ? `缓存输入 ${progress.cachedInputTokens}` : `cached input ${progress.cachedInputTokens}`
     : ''
+  const totalTokenUsage = progress?.totalInputTokens !== undefined || progress?.totalOutputTokens !== undefined
+    ? chinese.value
+      ? `累计 ${(progress.totalInputTokens ?? 0) + (progress.totalOutputTokens ?? 0)} tokens（输入 ${progress.totalInputTokens ?? 0} / 输出 ${progress.totalOutputTokens ?? 0}）`
+      : `total ${(progress.totalInputTokens ?? 0) + (progress.totalOutputTokens ?? 0)} tokens (input ${progress.totalInputTokens ?? 0} / output ${progress.totalOutputTokens ?? 0})`
+    : ''
   const tokenUsage = [baseTokenUsage, cacheUsage].filter(Boolean).join(' · ')
+  const displayedTokenUsage = ['completed', 'failed', 'partial', 'cancelled'].includes(progress?.phase ?? '')
+    ? [totalTokenUsage, cacheUsage].filter(Boolean).join(' · ')
+    : tokenUsage
   const attempt = progress?.attempt
     ? chinese.value ? `第 ${progress.attempt} 次尝试` : `attempt ${progress.attempt}`
     : ''
@@ -569,6 +577,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'pdf-rendering':
         return current && total ? `正在将 PDF 转换为图片（第 ${current}/${total} 张）` : '正在将 PDF 转换为图片…'
       case 'pdf-rendered': return `PDF 已转换为 ${total ?? current ?? 0} 张图片`
+      case 'attachment-extracting': return '正在提取附件来源笔记…'
       case 'sending': return '正在发送给模型…'
       case 'sent': return '已发送给模型'
       case 'waiting': return '正在等待模型响应…'
@@ -577,14 +586,15 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       case 'responded': return '模型已响应'
       case 'validating': return attempt ? `正在校验编辑指令… · ${attempt}` : '正在校验编辑指令…'
       case 'agent-plan': return `${progress?.planRevisionCount ? '正在修订剩余编辑计划' : '正在制定编辑计划'}${progress?.planStepCount !== undefined ? ` · ${progress.planStepCount} 步` : ''}`
-      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
+      case 'agent-step': return `第 ${progress?.step ?? 0}/${progress?.planStepCount ?? progress?.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
       case 'attempt-failed': return `${attempt || '本次尝试'}失败 · ${failureReason}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
       case 'retrying': return `正在自动重试… · ${attempt}${tokenUsage ? ` · 上次消耗${tokenUsage}` : ''}`
       case 'fallback': return `正在生成安全替代结果… · ${attempt}`
       case 'local-processing': return '正在本地解析和编辑…'
       case 'completed': return tokenUsage ? `处理完成 · ${tokenUsage}` : '本地解析和编辑完成'
       case 'cancelled': return '请求已停止'
-      case 'failed': return `请求失败${attempt ? ` · ${attempt}` : ''}${tokenUsage ? ` · 消耗${tokenUsage}` : ''}`
+      case 'partial': return `部分完成${attempt ? ` · ${attempt}` : ''}${displayedTokenUsage ? ` · ${displayedTokenUsage}` : ''}`
+      case 'failed': return `请求失败${attempt ? ` · ${attempt}` : ''}${displayedTokenUsage ? ` · ${displayedTokenUsage}` : ''}`
       default: return '正在处理…'
     }
   }
@@ -592,6 +602,7 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'pdf-rendering':
       return current && total ? `Rendering PDF pages (${current}/${total})…` : 'Rendering PDF pages…'
     case 'pdf-rendered': return `PDF converted to ${total ?? current ?? 0} images`
+    case 'attachment-extracting': return 'Extracting attachment source brief…'
     case 'sending': return 'Sending to model…'
     case 'sent': return 'Sent to model'
     case 'waiting': return 'Waiting for model response…'
@@ -600,14 +611,15 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
     case 'responded': return 'Model responded'
     case 'validating': return attempt ? `Validating edit instructions… · ${attempt}` : 'Validating edit instructions…'
     case 'agent-plan': return `${progress?.planRevisionCount ? 'Revising remaining edit plan' : 'Creating edit plan'}${progress?.planStepCount !== undefined ? ` · ${progress.planStepCount} steps` : ''}`
-    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
+    case 'agent-step': return `Applied agent step ${progress?.step ?? 0}/${progress?.planStepCount ?? progress?.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}`
     case 'attempt-failed': return `${attempt || 'Attempt'} failed · ${failureReason}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
     case 'retrying': return `Retrying automatically… · ${attempt}${tokenUsage ? ` · previous ${tokenUsage}` : ''}`
     case 'fallback': return `Generating safe fallback… · ${attempt}`
     case 'local-processing': return 'Parsing and editing locally…'
     case 'completed': return tokenUsage ? `Completed · ${tokenUsage}` : 'Local parsing and editing completed'
     case 'cancelled': return 'Request stopped'
-    case 'failed': return `Request failed${attempt ? ` · ${attempt}` : ''}${tokenUsage ? ` · ${tokenUsage} used` : ''}`
+    case 'partial': return `Partially completed${attempt ? ` · ${attempt}` : ''}${displayedTokenUsage ? ` · ${displayedTokenUsage}` : ''}`
+    case 'failed': return `Request failed${attempt ? ` · ${attempt}` : ''}${displayedTokenUsage ? ` · ${displayedTokenUsage} used` : ''}`
     default: return 'Working…'
   }
 }
@@ -628,18 +640,26 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
   const usage = progress.inputTokens !== undefined
     ? chinese.value ? `输入 ${progress.inputTokens} / ${tokens}` : `input ${progress.inputTokens} / ${tokens}`
     : tokens
+  const stepTotal = progress.planStepCount ?? progress.maxSteps ?? 0
+  const totalUsage = progress.totalInputTokens !== undefined || progress.totalOutputTokens !== undefined
+    ? chinese.value
+      ? `累计输入 ${progress.totalInputTokens ?? 0} / 输出 ${progress.totalOutputTokens ?? 0}`
+      : `total input ${progress.totalInputTokens ?? 0} / output ${progress.totalOutputTokens ?? 0}`
+    : ''
   if (chinese.value) {
     switch (progress.phase) {
       case 'waiting': return `正在等待模型响应… · ${elapsed}`
+      case 'attachment-extracting': return `正在提取附件来源笔记… · ${elapsed}`
       case 'compacting': return `正在压缩对话上下文… · ${elapsed}`
       case 'streaming': return `模型已开始输出 · ${usage} · ${elapsed}`
       case 'validating': return `正在校验编辑指令… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
       case 'agent-plan': return `${progress.planRevisionCount ? '正在修订剩余编辑计划' : '正在制定编辑计划'}… · ${elapsed}`
-      case 'agent-step': return `第 ${progress.step ?? 0}/${progress.maxSteps ?? 0} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}，继续执行… · ${elapsed}`
+      case 'agent-step': return `第 ${progress.step ?? 0}/${stepTotal} 步已应用${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}，继续执行… · ${elapsed}`
       case 'attempt-failed': return `第 ${progress.attempt} 次尝试失败 · ${usage} · ${elapsed}`
       case 'retrying': return `格式不符合要求，正在重试… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
       case 'fallback': return `正在生成安全替代结果… · 第 ${progress.attempt} 次尝试 · ${elapsed}`
-      case 'completed': return `处理完成 · ${elapsed}`
+      case 'completed': return `处理完成${totalUsage ? ` · ${totalUsage}` : ''} · ${elapsed}`
+      case 'partial': return `部分完成${totalUsage ? ` · ${totalUsage}` : ''} · ${elapsed}`
       case 'failed': return `请求失败 · 第 ${progress.attempt} 次尝试 · ${usage} · ${elapsed}`
       case 'cancelled': return `请求已停止 · ${elapsed}`
       default: return `${tokens} · ${elapsed}`
@@ -647,15 +667,17 @@ const liveProgressLabel = (progress: AiProgressEvent | undefined, elapsedMs: num
   }
   switch (progress.phase) {
     case 'waiting': return `Waiting for model response… · ${elapsed}`
+    case 'attachment-extracting': return `Extracting attachment source brief… · ${elapsed}`
     case 'compacting': return `Compacting conversation context… · ${elapsed}`
     case 'streaming': return `Model is responding · ${usage} · ${elapsed}`
     case 'validating': return `Validating edit instructions… · attempt ${progress.attempt} · ${elapsed}`
     case 'agent-plan': return `${progress.planRevisionCount ? 'Revising remaining edit plan' : 'Creating edit plan'}… · ${elapsed}`
-    case 'agent-step': return `Applied agent step ${progress.step ?? 0}/${progress.maxSteps ?? 0}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}; continuing… · ${elapsed}`
+    case 'agent-step': return `Applied agent step ${progress.step ?? 0}/${stepTotal}${stepDeltaLabel(progress) ? ` · ${stepDeltaLabel(progress)}` : ''}; continuing… · ${elapsed}`
     case 'attempt-failed': return `Attempt ${progress.attempt} failed · ${usage} · ${elapsed}`
     case 'retrying': return `Format validation failed; retrying… · attempt ${progress.attempt} · ${elapsed}`
     case 'fallback': return `Generating safe fallback… · attempt ${progress.attempt} · ${elapsed}`
-    case 'completed': return `Completed · ${elapsed}`
+    case 'completed': return `Completed${totalUsage ? ` · ${totalUsage}` : ''} · ${elapsed}`
+    case 'partial': return `Partially completed${totalUsage ? ` · ${totalUsage}` : ''} · ${elapsed}`
     case 'failed': return `Request failed · attempt ${progress.attempt} · ${usage} · ${elapsed}`
     case 'cancelled': return `Request stopped · ${elapsed}`
     default: return `${tokens} · ${elapsed}`

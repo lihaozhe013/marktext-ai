@@ -1,7 +1,7 @@
 export type AiProtocol = 'openai-chat-completions' | 'anthropic-messages'
 export type AiInteractionMode = 'answer' | 'edit' | 'rewrite'
 export type AiContextMode = 'recent' | 'summary'
-export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback'
+export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback' | 'partial-agent'
 export type AiModelSource = 'manual' | 'discovered'
 export type AiReasoningControl = 'unknown' | 'effort' | 'budget'
 export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_content' | 'reasoning_text'
@@ -168,6 +168,7 @@ export interface AiMessageModel {
 export type AiProgressPhase =
   | 'pdf-rendering'
   | 'pdf-rendered'
+  | 'attachment-extracting'
   | 'sending'
   | 'sent'
   | 'waiting'
@@ -183,6 +184,7 @@ export type AiProgressPhase =
   | 'local-processing'
   | 'completed'
   | 'failed'
+  | 'partial'
   | 'cancelled'
 
 export interface AiProgressInfo {
@@ -216,11 +218,15 @@ export interface AiProgressInfo {
   stepAddedText?: string
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
+  totalInputTokens?: number
+  totalOutputTokens?: number
+  totalCachedInputTokens?: number
+  totalCacheWriteInputTokens?: number
 }
 
 export type AiFailureReason = 'format' | 'exact-match' | 'scope' | 'truncated' | 'provider' | 'capability' | 'unknown'
 
-export type AiLiveProgressPhase = 'waiting' | 'streaming' | 'compacting' | 'validating' | 'agent-plan' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'completed' | 'failed' | 'cancelled'
+export type AiLiveProgressPhase = 'waiting' | 'attachment-extracting' | 'streaming' | 'compacting' | 'validating' | 'agent-plan' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'partial' | 'completed' | 'failed' | 'cancelled'
 
 export interface AiProgressEvent {
   requestId: string
@@ -254,6 +260,10 @@ export interface AiProgressEvent {
   stepAddedText?: string
   cachedInputTokens?: number
   cacheWriteInputTokens?: number
+  totalInputTokens?: number
+  totalOutputTokens?: number
+  totalCachedInputTokens?: number
+  totalCacheWriteInputTokens?: number
   /** The validated agent step snapshot to apply immediately in the renderer. */
   documentId?: string
   stepBaseMarkdown?: string
@@ -324,6 +334,9 @@ export interface AiResponse {
   markdown?: string
   editSummary?: AiEditSummary
   recovery?: AiRecoveryInfo
+  agentCompletion?: 'complete' | 'partial'
+  agentCompletedSteps?: number
+  agentTotalSteps?: number
   /** Generated before renderer-side apply; committed only after a successful turn. */
   contextSummaryCandidate?: string
   documentId: string

@@ -22,6 +22,8 @@ describe('AI provider image message serialization', () => {
     expect(preciseEditTools.map(tool => tool.name)).toEqual([
       'create_markdown_edit_plan',
       'apply_markdown_edit',
+      'append_markdown',
+      'prepend_markdown',
       'revise_markdown_edit_plan',
       'finish_markdown_edit'
     ])

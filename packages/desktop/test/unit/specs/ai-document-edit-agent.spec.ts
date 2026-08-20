@@ -83,7 +83,7 @@ describe('document edit agent', () => {
       { addedLines: 1, removedLines: 1, removedText: 'alpha', addedText: 'beta' },
       { addedLines: 1, removedLines: 1, removedText: 'beta', addedText: 'gamma' }
     ])
-    expect(generateAgent).toHaveBeenCalledTimes(4)
+    expect(generateAgent).toHaveBeenCalledTimes(3)
     expect(generateAgent.mock.calls[1][0].phase).toBe('ready-to-apply')
     expect(generateAgent.mock.calls[1][0].tools.map(tool => tool.name)).toEqual(['apply_markdown_edit'])
     expect(generateAgent.mock.calls[1][0].messages.at(-1)?.content).toContain('"currentVersion":0')
@@ -109,14 +109,12 @@ describe('document edit agent', () => {
     })
 
     expect(result.markdown).toBe('new')
-    expect(calls.map(call => call.phase)).toEqual(['needs-plan', 'ready-to-apply', 'ready-to-finish'])
+    expect(calls.map(call => call.phase)).toEqual(['needs-plan', 'ready-to-apply'])
     expect(calls.map(call => call.tools.map(tool => tool.name))).toEqual([
       ['create_markdown_edit_plan'],
-      ['apply_markdown_edit'],
-      ['finish_markdown_edit']
+      ['apply_markdown_edit']
     ])
     expect(calls[1].messages.at(-1)?.content).toContain('"currentVersion":0')
-    expect(calls[2].messages.at(-1)?.content).toContain('"currentVersion":1')
     expect(calls.every(call => call.messages.every(message => !message.toolCalls && !message.toolResults))).toBe(true)
   })
 
@@ -191,7 +189,7 @@ describe('document edit agent', () => {
     })
 
     expect(result.markdown).toBe('done')
-    expect(phases).toEqual(['needs-plan', 'ready-to-apply', 'needs-revision', 'ready-to-apply', 'ready-to-finish'])
+    expect(phases).toEqual(['needs-plan', 'ready-to-apply', 'needs-revision', 'ready-to-apply'])
   })
 
   it('uses a confirmation fallback after two invalid initial plans', async() => {
@@ -239,7 +237,7 @@ describe('document edit agent', () => {
     expect(result.markdown).toBe('new')
     expect(result.summary.operationCount).toBe(1)
     expect(diagnostics[0].code).toBe('exact-match')
-    expect(generateAgent).toHaveBeenCalledTimes(4)
+    expect(generateAgent).toHaveBeenCalledTimes(3)
   })
 
   it('requires a plan before applying edits', async() => {
@@ -317,7 +315,7 @@ describe('document edit agent', () => {
     })
     expect(result.markdown).toBe('# HTML Guide')
     expect(diagnostics[0]).toMatchObject({ code: 'scope' })
-    expect(generateAgent).toHaveBeenCalledTimes(4)
+    expect(generateAgent).toHaveBeenCalledTimes(3)
   })
 
   it('revises only unfinished plan steps after a scope failure', async() => {
@@ -355,7 +353,7 @@ describe('document edit agent', () => {
       generateAgent
     })
     expect(result.markdown).toBe('done done2')
-    expect(generateAgent).toHaveBeenCalledTimes(5)
+    expect(generateAgent).toHaveBeenCalledTimes(4)
   })
 
   it('applies one exact local replacement and reports changed lines', async() => {
@@ -382,6 +380,87 @@ describe('document edit agent', () => {
       }]
     })
     expect(result.attempts).toBe(1)
+  })
+
+  it('uses host-owned append and prepend operations without replacing existing text', async() => {
+    const calls: DocumentAgentGenerateRequest[] = []
+    const generateAgent = vi.fn(async(input: DocumentAgentGenerateRequest) => {
+      calls.push(input)
+      if (calls.length === 1) {
+        return {
+          content: '',
+          toolCalls: [{
+            id: 'plan',
+            name: 'create_markdown_edit_plan',
+            input: {
+              summary: 'Add notes.',
+              steps: [{ id: 'append', description: 'Append notes.', intent: 'Add the notes at the end.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }]
+            }
+          }]
+        }
+      }
+      return {
+        content: '',
+        toolCalls: [{ id: 'append', name: 'append_markdown', input: { markdown: '## Notes\n\n- Added detail', description: 'Appended notes.' } }]
+      }
+    })
+    const result = await runDocumentEditAgent({
+      markdown: '# Existing',
+      instruction: 'Add notes.',
+      contextMessages: [],
+      requestId: 'append-operation-request',
+      signal: new AbortController().signal,
+      generateAgent
+    })
+
+    expect(result.markdown).toBe('# Existing\n\n## Notes\n\n- Added detail')
+    expect(calls[1].tools.map(tool => tool.name)).toEqual(['append_markdown'])
+    expect(result.summary.operationCount).toBe(1)
+  })
+
+  it('returns a partial result after a confirmed step when the provider fails', async() => {
+    let calls = 0
+    const phases: string[] = []
+    const result = await runDocumentEditAgent({
+      markdown: 'Existing',
+      instruction: 'Append notes.',
+      contextMessages: [],
+      requestId: 'partial-agent-request',
+      signal: new AbortController().signal,
+      generateAgent: vi.fn(async(_input: DocumentAgentGenerateRequest) => {
+        calls += 1
+        if (calls === 1) {
+          return {
+            content: '',
+            toolCalls: [{
+              id: 'plan',
+              name: 'create_markdown_edit_plan',
+              input: {
+                summary: 'Append notes.',
+                steps: [
+                  { id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] },
+                  { id: 'prepend', description: 'Prepend context.', intent: 'Prepend context.', operation: 'prepend', startAnchor: null, endAnchor: null, dependsOn: ['append'] }
+                ]
+              }
+            }]
+          }
+        }
+        if (calls === 2) {
+          return {
+            content: '',
+            toolCalls: [{ id: 'append', name: 'append_markdown', input: { markdown: 'Notes', description: 'Appended notes.' } }]
+          }
+        }
+        throw new Error('provider unavailable')
+      }),
+      onPhase: phase => phases.push(phase)
+    })
+
+    expect(result.agentCompletion).toBe('partial')
+    expect(result.recovery?.strategy).toBe('partial-agent')
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(result.agentCompletedSteps).toBe(1)
+    expect(phases).toContain('partial')
   })
 
   it('retries a non-unique block once and applies the corrected block', async() => {

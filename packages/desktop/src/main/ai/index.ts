@@ -42,6 +42,7 @@ import { consumeProviderStream, estimateTokenCount, type ProviderStreamProgress,
 import { extractProviderContentParts, normalizeProviderContent, readReasoningField, type ProviderReasoningCompatibility } from './providerReasoning'
 import {
   buildAnswerSystemPrompt,
+  buildAttachmentSourceBriefSystemPrompt,
   buildDocumentPrompt,
   buildMarkdownFormatRepairPrompt,
   buildRewriteSystemPrompt,
@@ -96,17 +97,25 @@ interface ProviderResponse {
   truncated: boolean
   toolCalls?: ProviderToolCall[]
   usage?: ProviderUsage
+  finishReason?: string
 }
+
+export type ProviderToolChoice = 'required' | 'auto' | { name: string }
 
 interface ProviderRequestOptions {
   tools?: ProviderToolDefinition[]
-  toolChoice?: 'required' | 'auto'
+  toolChoice?: ProviderToolChoice
+  parallelToolCalls?: boolean
+  allowEmptyToolResponse?: boolean
+  disableStreamFallback?: boolean
   stream?: boolean
   maxTokens?: number
   attempt?: number
   onWaiting?: () => void
   onProgress?: (progress: ProviderStreamProgress) => void
 }
+
+type AgentTransportMode = 'native-strict' | 'native-compatible' | 'json-envelope'
 
 type AiProgressSink = (event: AiProgressEvent) => void
 
@@ -432,6 +441,7 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
   const phases: AiProgressPhase[] = [
     'pdf-rendering',
     'pdf-rendered',
+    'attachment-extracting',
     'sending',
     'sent',
     'waiting',
@@ -447,6 +457,7 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     'local-processing',
     'completed',
     'failed',
+    'partial',
     'cancelled'
   ]
   if (!phases.includes(value.phase as AiProgressPhase)) return undefined
@@ -482,6 +493,10 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     stepAddedText: typeof value.stepAddedText === 'string' ? value.stepAddedText.slice(0, 16000) : undefined,
     cachedInputTokens: typeof value.cachedInputTokens === 'number' ? value.cachedInputTokens : undefined,
     cacheWriteInputTokens: typeof value.cacheWriteInputTokens === 'number' ? value.cacheWriteInputTokens : undefined,
+    totalInputTokens: typeof value.totalInputTokens === 'number' ? value.totalInputTokens : undefined,
+    totalOutputTokens: typeof value.totalOutputTokens === 'number' ? value.totalOutputTokens : undefined,
+    totalCachedInputTokens: typeof value.totalCachedInputTokens === 'number' ? value.totalCachedInputTokens : undefined,
+    totalCacheWriteInputTokens: typeof value.totalCacheWriteInputTokens === 'number' ? value.totalCacheWriteInputTokens : undefined,
     failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'scope' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'capability' || value.failureReason === 'unknown'
       ? value.failureReason
       : undefined
@@ -625,6 +640,14 @@ const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean =>
   return choices[0].finish_reason === 'length'
 }
 
+const extractFinishReason = (payload: unknown, protocol: AiProtocol): string | undefined => {
+  if (!isRecord(payload)) return undefined
+  if (protocol === 'anthropic-messages') return typeof payload.stop_reason === 'string' ? payload.stop_reason : undefined
+  const choices = payload.choices
+  if (!Array.isArray(choices) || !isRecord(choices[0])) return undefined
+  return typeof choices[0].finish_reason === 'string' ? choices[0].finish_reason : undefined
+}
+
 const extractUsage = (payload: unknown, protocol: AiProtocol): ProviderUsage | undefined => {
   if (!isRecord(payload)) return undefined
   const usage = isRecord(payload.usage)
@@ -669,7 +692,7 @@ export class AiService {
   private readonly pendingAttachmentDocuments = new Map<string, string>()
   private readonly attachmentMimeTypes = new Map<string, AiAttachment['mimeType']>()
   private readonly controllers = new Map<string, AbortController>()
-  private readonly toolCapabilities = new Map<string, boolean>()
+  private readonly toolCapabilities = new Map<string, AgentTransportMode>()
   private settingsMutation: Promise<void> = Promise.resolve()
 
   constructor(userDataPath: string) {
@@ -1042,7 +1065,11 @@ export class AiService {
           }
           if (options.tools?.length) {
             body.tools = options.tools.map(tool => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }))
-            body.tool_choice = options.toolChoice === 'auto' ? { type: 'auto' } : { type: 'any' }
+            body.tool_choice = options.toolChoice === 'auto'
+              ? { type: 'auto' }
+              : typeof options.toolChoice === 'object'
+                ? { type: 'tool', name: options.toolChoice.name }
+                : { type: 'any' }
           }
         } else {
           headers.authorization = `Bearer ${apiKey}`
@@ -1064,8 +1091,13 @@ export class AiService {
           }
           if (includeStreamUsage) body.stream_options = { include_usage: true }
           if (options.tools?.length) {
-            body.tools = options.tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))
-            body.tool_choice = options.toolChoice === 'auto' ? 'auto' : 'required'
+            body.tools = options.tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters, ...(tool.strict !== undefined ? { strict: tool.strict } : {}) } }))
+            body.tool_choice = options.toolChoice === 'auto'
+              ? 'auto'
+              : typeof options.toolChoice === 'object'
+                ? { type: 'function', function: { name: options.toolChoice.name } }
+                : 'required'
+            if (options.parallelToolCalls !== undefined) body.parallel_tool_calls = options.parallelToolCalls
           }
         }
         featureLog(
@@ -1108,7 +1140,7 @@ export class AiService {
             Date.now() - requestStartedAt,
             requestId
           )
-          if (!streamed.content && !streamed.toolCalls.length) throw new Error('The provider returned no text content.')
+          if (!streamed.content && !streamed.toolCalls.length && !options.allowEmptyToolResponse) throw new Error('The provider returned no text content.')
           return streamed
         }
         const text = await response.text()
@@ -1128,12 +1160,12 @@ export class AiService {
         }
         if (!response.ok) {
           const unsupportedStreamStatus = streaming && [400, 404, 405, 415, 422].includes(response.status)
-          if (unsupportedStreamStatus && includeStreamUsage) {
+          if (unsupportedStreamStatus && !options.disableStreamFallback && includeStreamUsage) {
             includeStreamUsage = false
             featureLog('stream usage option rejected; retrying without usage option requestId=%s', requestId)
             continue
           }
-          if (unsupportedStreamStatus && !streamFallbackAttempted) {
+          if (unsupportedStreamStatus && !options.disableStreamFallback && !streamFallbackAttempted) {
             streaming = false
             streamFallbackAttempted = true
             featureLog('stream unsupported; falling back to JSON requestId=%s', requestId)
@@ -1150,7 +1182,7 @@ export class AiService {
         const extracted = extractResponseContent(payload, settings.protocol, compatibility)
         const content = extracted.content
         const toolCalls = extractToolCalls(payload, settings.protocol)
-        if (!content && !toolCalls.length) throw new Error('The provider returned no text content.')
+        if (!content && !toolCalls.length && !options.allowEmptyToolResponse) throw new Error('The provider returned no text content.')
         const usage = extractUsage(payload, settings.protocol)
         options.onProgress?.({
           outputCharacters: content.length + (extracted.reasoning?.length ?? 0),
@@ -1165,7 +1197,8 @@ export class AiService {
           reasoning: extracted.reasoning,
           toolCalls,
           usage,
-          truncated: isTruncatedResponse(payload, settings.protocol)
+          truncated: isTruncatedResponse(payload, settings.protocol),
+          finishReason: extractFinishReason(payload, settings.protocol)
         }
       }
     } catch (error) {
@@ -1531,7 +1564,7 @@ export class AiService {
     let totalOutputTokens = 0
     let totalCachedInputTokens = 0
     let totalCacheWriteInputTokens = 0
-    let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'cachedInputTokens' | 'cacheWriteInputTokens'> = {
+    let lastProgressStats: Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'totalInputTokens' | 'totalOutputTokens' | 'totalCachedInputTokens' | 'totalCacheWriteInputTokens'> = {
       outputTokens: 0,
       outputTokensEstimated: true,
       streaming: false
@@ -1539,7 +1572,7 @@ export class AiService {
     const emitProgress = (
       phase: AiProgressEvent['phase'],
       attempt: number,
-      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
+      details: Partial<Pick<AiProgressEvent, 'outputTokens' | 'outputTokensEstimated' | 'inputTokens' | 'inputTokensEstimated' | 'streaming' | 'failureReason' | 'failureCount' | 'failureOutput' | 'failureOutputTruncated' | 'step' | 'maxSteps' | 'successfulSteps' | 'toolFailures' | 'documentVersion' | 'stepDescription' | 'stepAddedLines' | 'stepRemovedLines' | 'stepRemovedText' | 'stepAddedText' | 'cachedInputTokens' | 'cacheWriteInputTokens' | 'totalInputTokens' | 'totalOutputTokens' | 'totalCachedInputTokens' | 'totalCacheWriteInputTokens' | 'documentId' | 'stepBaseMarkdown' | 'stepMarkdown' | 'planSummary' | 'planStepCount' | 'planStepDescriptions' | 'planRevisionCount' | 'currentPlanStep'>> = {}
     ): void => {
       lastAttempt = Math.max(lastAttempt, attempt)
       const {
@@ -1581,11 +1614,13 @@ export class AiService {
       if (response.usage?.cacheWriteInputTokens !== undefined) totalCacheWriteInputTokens += response.usage.cacheWriteInputTokens
       lastProgressStats = {
         ...lastProgressStats,
-        inputTokens: totalInputTokens || undefined,
-        outputTokens: totalOutputTokens || lastProgressStats.outputTokens,
-        outputTokensEstimated: false,
-        cachedInputTokens: totalCachedInputTokens || undefined,
-        cacheWriteInputTokens: totalCacheWriteInputTokens || undefined,
+        inputTokens: response.usage?.inputTokens ?? lastProgressStats.inputTokens,
+        outputTokens: response.usage?.outputTokens ?? lastProgressStats.outputTokens,
+        outputTokensEstimated: response.usage?.outputTokens === undefined,
+        totalInputTokens: totalInputTokens || undefined,
+        totalOutputTokens: totalOutputTokens || undefined,
+        totalCachedInputTokens: totalCachedInputTokens || undefined,
+        totalCacheWriteInputTokens: totalCacheWriteInputTokens || undefined,
         streaming: false
       }
       const output = makeFailureOutput(response.rawContent, response.content, response.reasoning)
@@ -1621,6 +1656,49 @@ export class AiService {
           })
         }
       }
+    }
+    const extractAttachmentSourceBrief = async(signal: AbortSignal): Promise<string> => {
+      const delimiter = makePromptToken('MT_SOURCE')
+      const extractionMessages = await this.hydrateProviderMessages([
+        {
+          role: 'user',
+          content: `TASK ${delimiter}\n${request.prompt}\nEND_TASK ${delimiter}`,
+          attachments: currentAttachments
+        }
+      ], priorityAttachmentIds, request.renderedPdfPages)
+      let lastError = 'The attachment source brief was empty.'
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        emitProgress('attachment-extracting', attempt, { streaming: false })
+        const result = await this.requestProvider(
+          target,
+          buildAttachmentSourceBriefSystemPrompt(delimiter),
+          extractionMessages,
+          request.requestId,
+          signal,
+          {
+            stream: true,
+            maxTokens: 3072,
+            allowEmptyToolResponse: true,
+            attempt,
+            ...makeProviderProgress(attempt)
+          }
+        )
+        rememberProviderResponse(result)
+        if (!result.truncated && result.content.trim()) {
+          const brief = result.content.trim().slice(0, 12000)
+          featureLog(
+            'attachment source brief ready attempt=%s attachmentCount=%s pageCount=%s chars=%s requestId=%s',
+            attempt,
+            currentAttachments.length,
+            request.renderedPdfPages?.reduce((total, item) => total + item.pages.length, 0) ?? 0,
+            brief.length,
+            request.requestId
+          )
+          return brief
+        }
+        lastError = result.truncated ? 'The attachment source brief was truncated.' : 'The attachment source brief was empty.'
+      }
+      throw new Error(lastError)
     }
     if (request.mode === 'answer') {
       const promptToken = makePromptToken('MT_CONTEXT')
@@ -1691,6 +1769,9 @@ export class AiService {
     const controller = new AbortController()
     this.controllers.set(request.requestId, controller)
     try {
+      const sourceBrief = request.mode === 'edit' && currentAttachments.length
+        ? await extractAttachmentSourceBrief(controller.signal)
+        : undefined
       if (request.mode === 'rewrite') {
         const promptToken = makePromptToken('MT_CONTEXT')
         const messages = await this.hydrateProviderMessages([
@@ -1763,56 +1844,129 @@ export class AiService {
       const result = await runDocumentEditAgent({
         markdown: request.markdown,
         instruction: request.prompt,
-        contextMessages: recentMessages,
-        attachments: currentAttachments,
+        sourceBrief,
+        contextMessages: recentMessages.map(message => ({ role: message.role, content: message.content, reasoning: 'reasoning' in message ? message.reasoning : undefined })),
+        attachments: sourceBrief ? undefined : currentAttachments,
         generateAgent: async(agentRequest) => {
-          const attachmentKinds = Array.from(new Set(agentRequest.messages.flatMap(message =>
-            (message.attachments ?? []).map(() => 'image')
-          ))).sort().join('+') || 'text'
-          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}|${attachmentKinds}`
-          if (this.toolCapabilities.get(capabilityKey) === false) {
-            throw new Error('The selected model or gateway does not support Agent precise editing tools.')
-          }
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
+          const capabilityKey = `${settings.protocol}|${resolveRequestEndpoint(settings)}|${target.model.model}`
+          const expectedTool = agentRequest.tools[0]?.name ?? 'none'
+          const cachedTransport = this.toolCapabilities.get(capabilityKey)
+          const maxTokens = expectedTool === 'create_markdown_edit_plan' || expectedTool === 'revise_markdown_edit_plan'
+            ? 2048
+            : expectedTool === 'apply_markdown_edit' && agentRequest.activeScopeChars > 6000 ? 8192 : 4096
+          const messages = await this.hydrateProviderMessages(
+            agentRequest.messages,
+            sourceBrief ? new Set<string>() : priorityAttachmentIds,
+            sourceBrief ? [] : request.renderedPdfPages
+          )
           featureLog(
-            'edit agent checkpoint phase=%s allowedTool=%s version=%s planSteps=%s completedSteps=%s checkpointChars=%s requestId=%s',
+            'edit agent checkpoint phase=%s allowedTool=%s transport=%s version=%s planSteps=%s completedSteps=%s checkpointChars=%s sourceBriefChars=%s activeScopeChars=%s planFingerprint=%s attachmentPages=%s requestId=%s',
             agentRequest.phase,
-            agentRequest.tools[0]?.name ?? 'none',
+            expectedTool,
+            cachedTransport ?? 'native-strict',
             agentRequest.currentVersion,
             agentRequest.planStepCount,
             agentRequest.completedPlanStepCount,
             agentRequest.checkpointChars,
+            agentRequest.sourceBriefChars,
+            agentRequest.activeScopeChars,
+            agentRequest.planFingerprint ? agentRequest.planFingerprint.length : 0,
+            messages.reduce((total, message) => total + (message.images?.length ?? 0), 0),
             request.requestId
           )
-          try {
-            const generated = await this.requestProvider(
-              target,
-              `${agentRequest.system}\nCall exactly one of the supplied editing tools on every turn.`,
-              messages,
-              agentRequest.requestId,
-              agentRequest.signal,
-              {
-                tools: agentRequest.tools,
-                toolChoice: 'required',
-                stream: true,
-                attempt: agentRequest.attempt ?? 1,
-                ...makeProviderProgress(agentRequest.attempt ?? 1)
-              }
-            )
-            rememberProviderResponse(generated)
-            this.toolCapabilities.set(capabilityKey, true)
-            return { content: generated.content, rawContent: generated.rawContent, reasoning: generated.reasoning, toolCalls: generated.toolCalls, truncated: generated.truncated }
-          } catch (error) {
-            if (error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)) {
-              this.toolCapabilities.set(capabilityKey, false)
-              featureLog('agent tool capability unavailable protocol=%s model=%s requestId=%s', settings.protocol, target.model.model, agentRequest.requestId)
-              throw new Error('The selected model or gateway does not support Agent precise editing tools.')
+          const providerOptions = (transport: AgentTransportMode): ProviderRequestOptions => ({
+            stream: true,
+            maxTokens,
+            allowEmptyToolResponse: true,
+            disableStreamFallback: true,
+            attempt: agentRequest.attempt ?? 1,
+            ...makeProviderProgress(agentRequest.attempt ?? 1),
+            ...(transport === 'native-strict'
+              ? { tools: agentRequest.tools, toolChoice: { name: expectedTool }, parallelToolCalls: false }
+              : transport === 'native-compatible'
+                ? { tools: withoutStrictToolSchemas(agentRequest.tools), toolChoice: 'required' as const }
+                : {})
+          })
+          const system = `${agentRequest.system}\nCall exactly one of the supplied editing tools on every turn.`
+          const invoke = async(transport: AgentTransportMode): Promise<ProviderResponse> => {
+            if (transport === 'json-envelope') {
+              const jsonSystem = `${system}\nThe native tool transport is unavailable. Return exactly one JSON object matching this schema, with no Markdown fence, explanation, or extra text:\n${JSON.stringify(agentRequest.tools[0]?.parameters ?? {})}`
+              return this.requestProvider(target, jsonSystem, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
             }
-            throw error
+            return this.requestProvider(target, system, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
+          }
+          let transport = cachedTransport ?? 'native-strict'
+          const unsupportedTransport = (error: unknown): boolean =>
+            error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)
+          const invokeWithFallback = async(start: AgentTransportMode): Promise<{ transport: AgentTransportMode, response: ProviderResponse }> => {
+            try {
+              return { transport: start, response: await invoke(start) }
+            } catch (error) {
+              if (start === 'native-strict' && unsupportedTransport(error)) {
+                featureLog('edit agent transport downgrade strict->compatible requestId=%s', request.requestId)
+                try {
+                  return { transport: 'native-compatible', response: await invoke('native-compatible') }
+                } catch (compatibleError) {
+                  if (!unsupportedTransport(compatibleError)) throw compatibleError
+                  featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
+                  return { transport: 'json-envelope', response: await invoke('json-envelope') }
+                }
+              }
+              if (start === 'native-compatible' && unsupportedTransport(error)) {
+                featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
+                return { transport: 'json-envelope', response: await invoke('json-envelope') }
+              }
+              throw error
+            }
+          }
+          const invoked = await invokeWithFallback(transport)
+          transport = invoked.transport
+          let generated = invoked.response
+          rememberProviderResponse(generated)
+          let toolCalls = generated.toolCalls ?? []
+          if ((transport === 'native-strict' || transport === 'native-compatible') && (!toolCalls.length || generated.truncated)) {
+            transport = 'json-envelope'
+            const jsonGenerated = await invoke(transport)
+            rememberProviderResponse(jsonGenerated)
+            generated = jsonGenerated
+            toolCalls = generated.toolCalls ?? []
+          }
+          if (transport === 'json-envelope' && !toolCalls.length) {
+            toolCalls = parseStrictAgentEnvelope(generated.content, expectedTool)
+          }
+          this.toolCapabilities.set(capabilityKey, transport)
+          featureLog(
+            'edit agent response phase=%s transport=%s returnedTools=%s returnedNames=%s finishReason=%s truncated=%s reasoningChars=%s inputTokens=%s outputTokens=%s totalInputTokens=%s totalOutputTokens=%s totalCachedInputTokens=%s requestId=%s',
+            agentRequest.phase,
+            transport,
+            toolCalls.length,
+            toolCalls.map(call => call.name).join(',') || 'none',
+            generated.finishReason ?? 'none',
+            generated.truncated ?? false,
+            generated.reasoning?.length ?? 0,
+            generated.usage?.inputTokens ?? 'unknown',
+            generated.usage?.outputTokens ?? 'unknown',
+            lastProgressStats.totalInputTokens ?? 'unknown',
+            lastProgressStats.totalOutputTokens ?? 'unknown',
+            lastProgressStats.totalCachedInputTokens ?? 'unknown',
+            request.requestId
+          )
+          return {
+            content: generated.content,
+            rawContent: generated.rawContent,
+            reasoning: generated.reasoning,
+            toolCalls,
+            truncated: generated.truncated,
+            finishReason: generated.finishReason,
+            usage: generated.usage
           }
         },
         generateWhole: async(agentRequest) => {
-          const messages = await this.hydrateProviderMessages(agentRequest.messages, priorityAttachmentIds, request.renderedPdfPages)
+          const messages = await this.hydrateProviderMessages(
+            agentRequest.messages,
+            sourceBrief ? new Set<string>() : priorityAttachmentIds,
+            sourceBrief ? [] : request.renderedPdfPages
+          )
           featureLog(
             'edit agent whole fallback attempt=%s messageChars=%s requestId=%s',
             agentRequest.attempt ?? 1,
@@ -1843,6 +1997,7 @@ export class AiService {
         signal: controller.signal,
         maxSteps: state.settings.editAgentMaxSteps,
         onPhase: (phase, attempt) => {
+          featureLog('edit agent state transition phase=%s attempt=%s requestId=%s', phase, attempt, request.requestId)
           emitProgress(phase, attempt, {
             streaming: false
           })
@@ -1913,8 +2068,11 @@ export class AiService {
         }
       })
       featureLog(
-        'edit agent applied mode=%s attempts=%s operations=%s addedLines=%s removedLines=%s elapsedMs=%s requestId=%s',
+        'edit agent applied mode=%s completion=%s completedSteps=%s totalSteps=%s attempts=%s operations=%s addedLines=%s removedLines=%s elapsedMs=%s requestId=%s',
         request.mode,
+        result.agentCompletion ?? 'complete',
+        result.agentCompletedSteps ?? 0,
+        result.agentTotalSteps ?? 0,
         result.attempts,
         result.summary.operationCount,
         result.summary.addedLines,
@@ -1922,7 +2080,7 @@ export class AiService {
         Date.now() - requestStartedAt,
         request.requestId
       )
-      const contextSummaryCandidate = state.settings.contextMode === 'summary'
+      const contextSummaryCandidate = state.settings.contextMode === 'summary' && result.agentCompletion !== 'partial'
         ? await this.createContextSummary(
           target,
           contextSummary,
@@ -1945,6 +2103,9 @@ export class AiService {
         markdown: result.markdown,
         editSummary: result.summary,
         recovery: result.recovery,
+        agentCompletion: result.agentCompletion,
+        agentCompletedSteps: result.agentCompletedSteps,
+        agentTotalSteps: result.agentTotalSteps,
         documentId: request.documentId,
         baseMarkdown: request.markdown,
         model: toMessageModel(target)
@@ -2068,6 +2229,26 @@ const extractToolCalls = (payload: unknown, protocol: AiProtocol): ProviderToolC
     })
     .filter(call => !!call.name)
 }
+
+const parseStrictAgentEnvelope = (content: string, expectedTool: string): ProviderToolCall[] => {
+  const normalized = content.trim()
+  if (!normalized) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(normalized)
+  } catch {
+    return []
+  }
+  if (!isRecord(parsed) || Array.isArray(parsed)) return []
+  return [{
+    id: `json-agent-${expectedTool}`,
+    name: expectedTool,
+    input: parsed,
+    rawInput: normalized
+  }]
+}
+
+const withoutStrictToolSchemas = (tools: ProviderToolDefinition[]): ProviderToolDefinition[] => tools.map(({ strict: _strict, ...tool }) => tool)
 
 const normalizeEditAgentMaxSteps = (value: unknown): number => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_EDIT_AGENT_MAX_STEPS
