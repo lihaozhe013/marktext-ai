@@ -81,6 +81,34 @@
       <small>{{ labels.modelHint }}</small>
     </div>
 
+    <div
+      v-if="ai.selectedRequestBodyPresets?.presets.length"
+      class="ai-request-preset-select"
+    >
+      <label for="ai-request-preset-selector">{{ labels.requestBodyPreset }}</label>
+      <select
+        id="ai-request-preset-selector"
+        :value="ai.requestBodyPresetSelection"
+        :disabled="ai.loading"
+        @change="selectRequestBodyPreset"
+      >
+        <option value="__model_default__">
+          {{ labels.requestBodyPresetModelDefault(ai.selectedRequestBodyPresets.presets.find(preset => preset.id === ai.selectedModelOption?.requestBodyPresets?.defaultPresetId)?.name || '') }}
+        </option>
+        <option value="__omit__">
+          {{ labels.requestBodyPresetOmit }}
+        </option>
+        <option
+          v-for="preset in ai.selectedRequestBodyPresets.presets"
+          :key="preset.id"
+          :value="preset.id"
+        >
+          {{ preset.name }}
+        </option>
+      </select>
+      <small>{{ labels.requestBodyPresetHint }}</small>
+    </div>
+
     <p class="ai-mode-help">
       {{ modeHelp }}
     </p>
@@ -741,6 +769,10 @@ const selectModel = (event: Event): void => {
   if (option) ai.selectModel(option.ref)
 }
 
+const selectRequestBodyPreset = (event: Event): void => {
+  ai.setRequestBodyPreset((event.target as HTMLSelectElement).value)
+}
+
 const addFiles = (files: File[]): void => {
   if (!files.length) return
   ai.addAttachmentFiles(files).catch(() => undefined)
@@ -902,6 +934,10 @@ onUnmounted(() => {
 .ai-model-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-model-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }
 .ai-model-select small { color: var(--editorColor50); font-size: 10px; }
+.ai-request-preset-select { display: flex; flex-direction: column; gap: 5px; margin: 8px 14px 0; }
+.ai-request-preset-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
+.ai-request-preset-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }
+.ai-request-preset-select small { color: var(--editorColor50); font-size: 10px; }
 .ai-mode-help { margin: 8px 14px; color: var(--editorColor60); font-size: 12px; line-height: 1.4; }
 .ai-messages { flex: 1; overflow: auto; padding: 0 12px 12px; }
 .ai-plan-card { margin: 6px 0 10px; padding: 8px 9px; border: 1px solid var(--editorColor20); border-radius: 5px; color: var(--editorColor70); background: var(--editorColor05, transparent); font-size: 11px; line-height: 1.4; }

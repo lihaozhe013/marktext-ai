@@ -174,26 +174,96 @@
           <div
             v-for="model in form.models"
             :key="model.id || model.model"
-            class="model-row"
+            class="model-editor"
           >
-            <input
-              v-model="model.model"
-              type="text"
-              :placeholder="labels.modelId"
-            >
-            <input
-              v-model="model.label"
-              type="text"
-              :placeholder="labels.modelLabel"
-            >
-            <button
-              class="icon-danger"
-              type="button"
-              :title="labels.removeModel"
-              @click="removeModel(model.id)"
-            >
-              ×
-            </button>
+            <div class="model-row">
+              <input
+                v-model="model.model"
+                type="text"
+                :placeholder="labels.modelId"
+              >
+              <input
+                v-model="model.label"
+                type="text"
+                :placeholder="labels.modelLabel"
+              >
+              <button
+                class="icon-danger"
+                type="button"
+                :title="labels.removeModel"
+                @click="removeModel(model.id)"
+              >
+                ×
+              </button>
+            </div>
+            <details class="model-advanced">
+              <summary>{{ labels.modelAdvanced }}</summary>
+              <label class="checkbox-row">
+                <input
+                  type="checkbox"
+                  :checked="!!model.capabilities?.requestBodyPresets"
+                  @change="toggleRequestBodyPresets(model, ($event.target as HTMLInputElement).checked)"
+                >
+                <span>{{ labels.requestBodyPresetsEnabled }}</span>
+              </label>
+              <template v-if="model.capabilities?.requestBodyPresets">
+                <small>{{ labels.requestBodyPresetsHint }}</small>
+                <div
+                  v-for="(preset, index) in model.capabilities.requestBodyPresets.presets"
+                  :key="preset.id"
+                  class="request-preset-editor"
+                >
+                  <input
+                    v-model="preset.name"
+                    type="text"
+                    :maxlength="64"
+                    :placeholder="labels.requestBodyPresetName"
+                  >
+                  <button
+                    class="icon-danger"
+                    type="button"
+                    :title="labels.removeRequestBodyPreset"
+                    @click="removeRequestBodyPreset(model, index)"
+                  >
+                    ×
+                  </button>
+                  <textarea
+                    :value="requestBodyPresetDraft(model, preset)"
+                    :placeholder="labels.requestBodyPresetBody"
+                    rows="5"
+                    @input="setRequestBodyPresetDraft(model, preset, ($event.target as HTMLTextAreaElement).value)"
+                  />
+                  <small
+                    v-if="requestBodyPresetError(model, preset)"
+                    class="request-preset-error"
+                  >{{ requestBodyPresetError(model, preset) }}</small>
+                </div>
+                <button
+                  class="secondary-button compact-button"
+                  type="button"
+                  :disabled="model.capabilities.requestBodyPresets.presets.length >= 16"
+                  @click="addRequestBodyPreset(model)"
+                >
+                  {{ labels.addRequestBodyPreset }}
+                </button>
+                <select
+                  :value="model.capabilities.requestBodyPresets.defaultPresetId || ''"
+                  @change="setRequestBodyPresetDefault(model, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="">
+                    {{ labels.requestBodyPresetNoDefault }}
+                  </option>
+                  <option
+                    v-for="preset in model.capabilities.requestBodyPresets.presets"
+                    :key="`${model.id || model.model}-default-${preset.id}`"
+                    :value="preset.id"
+                  >
+                    {{ preset.name }}
+                  </option>
+                </select>
+                <small>{{ labels.requestBodyPresetDefaultHint }}</small>
+              </template>
+            </details>
           </div>
           <button
             class="secondary-button"
@@ -295,8 +365,13 @@ import type {
   AiConnectionProfile,
   AiConnectionSettings,
   AiContextMode,
-  AiDiscoveredModel
+  AiDiscoveredModel,
+  AiModelCapabilities,
+  AiRequestBodyPreset,
+  AiJsonValue
 } from '@shared/types/ai'
+
+type FormModel = AiConnectionInput['models'][number]
 
 const ai = useAiStore()
 const settings = ref<AiConnectionSettings>({ connections: [] })
@@ -313,6 +388,8 @@ const refreshing = ref(false)
 const status = ref('')
 const statusOk = ref(true)
 const discoveredModels = ref<AiDiscoveredModel[]>([])
+const requestBodyPresetDrafts = reactive<Record<string, string>>({})
+const requestBodyPresetErrors = reactive<Record<string, string>>({})
 const defaultModelId = ref('')
 const editAgentMaxSteps = ref(64)
 const failureOutputAfter = ref(1)
@@ -357,6 +434,15 @@ const labels = computed(() =>
         refreshModels: '刷新模型列表',
         refreshing: '刷新中…',
         discoveredModels: '发现的模型',
+        modelAdvanced: '模型高级设置',
+        requestBodyPresetsEnabled: '配置请求 JSON 预设',
+        requestBodyPresetsHint: '根据模型或网关文档填写 JSON 对象；应用不会自动判断模型能力。预设可以覆盖 model、messages、tools、stream 等字段。',
+        requestBodyPresetName: '预设名称',
+        requestBodyPresetBody: '{"thinking":{"type":"enabled"}}',
+        addRequestBodyPreset: '添加预设',
+        removeRequestBodyPreset: '移除预设',
+        requestBodyPresetNoDefault: '不应用额外 JSON',
+        requestBodyPresetDefaultHint: '默认预设影响模型请求；AI 面板可以按当前会话临时覆盖。',
         save: '保存连接',
         saving: '保存中…',
         test: '测试连接',
@@ -404,6 +490,15 @@ const labels = computed(() =>
         refreshModels: 'Refresh models',
         refreshing: 'Refreshing…',
         discoveredModels: 'Discovered models',
+        modelAdvanced: 'Advanced model settings',
+        requestBodyPresetsEnabled: 'Configure request JSON presets',
+        requestBodyPresetsHint: 'Enter JSON objects from the model or gateway documentation. The app does not detect capabilities. Presets can override model, messages, tools, stream, and other request fields.',
+        requestBodyPresetName: 'Preset name',
+        requestBodyPresetBody: '{"thinking":{"type":"enabled"}}',
+        addRequestBodyPreset: 'Add preset',
+        removeRequestBodyPreset: 'Remove preset',
+        requestBodyPresetNoDefault: 'Do not apply extra JSON',
+        requestBodyPresetDefaultHint: 'The default preset applies to model requests; the AI panel can override it for the current session.',
         save: 'Save connection',
         saving: 'Saving…',
         test: 'Test connection',
@@ -429,6 +524,108 @@ const createId = (): string => {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
+const formModelKey = (model: FormModel): string => model.id || model.model
+
+const requestBodyPresetKey = (model: FormModel, preset: AiRequestBodyPreset): string =>
+  `${formModelKey(model)}\u0000${preset.id}`
+
+const requestBodyPresetDraft = (model: FormModel, preset: AiRequestBodyPreset): string =>
+  requestBodyPresetDrafts[requestBodyPresetKey(model, preset)] ?? JSON.stringify(preset.body, null, 2)
+
+const requestBodyPresetError = (model: FormModel, preset: AiRequestBodyPreset): string =>
+  requestBodyPresetErrors[requestBodyPresetKey(model, preset)] ?? ''
+
+const setRequestBodyPresetDraft = (model: FormModel, preset: AiRequestBodyPreset, value: string): void => {
+  const key = requestBodyPresetKey(model, preset)
+  requestBodyPresetDrafts[key] = value
+  try {
+    const parsed = JSON.parse(value) as AiJsonValue
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Object.keys(parsed).length) {
+      throw new Error('The preset body must be a non-empty JSON object.')
+    }
+    preset.body = parsed as Record<string, AiJsonValue>
+    delete requestBodyPresetErrors[key]
+  } catch (error) {
+    requestBodyPresetErrors[key] = error instanceof Error ? error.message : 'Invalid JSON.'
+  }
+}
+
+const setRequestBodyPresetConfig = (model: FormModel, capabilities: AiModelCapabilities | undefined): void => {
+  model.capabilities = capabilities
+}
+
+const toggleRequestBodyPresets = (model: FormModel, enabled: boolean): void => {
+  if (enabled) {
+    setRequestBodyPresetConfig(model, {
+      ...(model.capabilities ?? {}),
+      requestBodyPresets: model.capabilities?.requestBodyPresets ?? { presets: [] }
+    })
+    return
+  }
+  const capabilities = model.capabilities ? { ...model.capabilities } : undefined
+  if (capabilities) delete capabilities.requestBodyPresets
+  setRequestBodyPresetConfig(model, capabilities && Object.keys(capabilities).length ? capabilities : undefined)
+}
+
+const addRequestBodyPreset = (model: FormModel): void => {
+  const config = model.capabilities?.requestBodyPresets
+  if (!config || config.presets.length >= 16) return
+  const preset: AiRequestBodyPreset = {
+    id: createId(),
+    name: chinese.value ? `新预设 ${config.presets.length + 1}` : `New preset ${config.presets.length + 1}`,
+    body: {}
+  }
+  model.capabilities = {
+    ...(model.capabilities ?? {}),
+    requestBodyPresets: { ...config, presets: [...config.presets, preset] }
+  }
+  const key = requestBodyPresetKey(model, preset)
+  requestBodyPresetDrafts[key] = '{}'
+  requestBodyPresetErrors[key] = 'The preset body must be a non-empty JSON object.'
+}
+
+const removeRequestBodyPreset = (model: FormModel, index: number): void => {
+  const config = model.capabilities?.requestBodyPresets
+  if (!config) return
+  const removed = config.presets[index]
+  if (!removed) return
+  const presets = config.presets.filter((_preset, presetIndex) => presetIndex !== index)
+  model.capabilities = {
+    ...(model.capabilities ?? {}),
+    requestBodyPresets: {
+      ...config,
+      presets,
+      ...(config.defaultPresetId === removed.id ? { defaultPresetId: undefined } : {})
+    }
+  }
+  const key = requestBodyPresetKey(model, removed)
+  delete requestBodyPresetDrafts[key]
+  delete requestBodyPresetErrors[key]
+}
+
+const setRequestBodyPresetDefault = (model: FormModel, value: string): void => {
+  const config = model.capabilities?.requestBodyPresets
+  if (!config) return
+  model.capabilities = {
+    ...(model.capabilities ?? {}),
+    requestBodyPresets: { ...config, ...(value ? { defaultPresetId: value } : { defaultPresetId: undefined }) }
+  }
+}
+
+const cloneCapabilities = (capabilities: AiModelCapabilities | undefined, model?: FormModel): AiModelCapabilities | undefined => {
+  if (!capabilities) return undefined
+  if (!capabilities.requestBodyPresets) return { ...capabilities }
+  const presets = capabilities.requestBodyPresets.presets.map(preset => {
+    const draft = model ? requestBodyPresetDrafts[requestBodyPresetKey(model, preset)] : undefined
+    const body = draft === undefined ? preset.body : JSON.parse(draft) as Record<string, AiJsonValue>
+    return { ...preset, body: JSON.parse(JSON.stringify(body)) }
+  })
+  return {
+    ...capabilities,
+    requestBodyPresets: { ...capabilities.requestBodyPresets, presets }
+  }
+}
+
 const resetForm = (): void => {
   form.id = undefined
   form.name = chinese.value ? '新连接' : 'New connection'
@@ -452,7 +649,7 @@ const selectConnection = (id: string): void => {
     model: model.model,
     label: model.label,
     source: model.source,
-    capabilities: model.capabilities
+    capabilities: cloneCapabilities(model.capabilities, model)
   }))
   defaultModelId.value =
     settings.value.defaultModel?.connectionId === connection.id
@@ -479,7 +676,7 @@ const input = (): AiConnectionInput => ({
     model: model.model,
     label: model.label,
     source: model.source,
-    capabilities: model.capabilities ? { ...model.capabilities } : undefined
+    capabilities: cloneCapabilities(model.capabilities, model)
   })),
   ...(apiKey.value.trim() ? { apiKey: apiKey.value.trim() } : {})
 })
@@ -551,9 +748,9 @@ const saveContextMode = async (): Promise<void> => {
 const save = async (): Promise<void> => {
   saving.value = true
   status.value = ''
-  const value = input()
-  logInput('save', value)
   try {
+    const value = input()
+    logInput('save', value)
     const saved = await window.electron.ipcRenderer.invoke('mt::ai::save-connection', value)
     apiKey.value = ''
     applySettings(saved)
@@ -576,9 +773,9 @@ const save = async (): Promise<void> => {
 const test = async (): Promise<void> => {
   testing.value = true
   status.value = ''
-  const value = input()
-  logInput('test', value)
   try {
+    const value = input()
+    logInput('test', value)
     const result = await window.electron.ipcRenderer.invoke('mt::ai::test-connection', value)
     statusOk.value = result.ok
     status.value = result.message
@@ -788,11 +985,59 @@ onMounted(() => {
 .model-row + .model-row {
   margin-top: 7px;
 }
+.model-editor + .model-editor {
+  margin-top: 10px;
+}
 .model-row input {
   min-width: 0;
 }
 .model-row button {
   height: 30px;
+}
+.model-advanced {
+  margin-top: 6px;
+  padding: 7px 9px;
+  border: 1px solid var(--floatBorderColor);
+  border-radius: 4px;
+  color: var(--editorColor);
+}
+.model-advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+}
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 9px 0 6px;
+  font-size: 12px;
+}
+.checkbox-row input {
+  width: auto;
+}
+.request-preset-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  gap: 6px;
+  margin-top: 9px;
+}
+.request-preset-editor textarea {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-height: 84px;
+  resize: vertical;
+  font-family: var(--font-family-monospace);
+  font-size: 12px;
+}
+.request-preset-error {
+  grid-column: 1 / -1;
+  color: var(--redColor);
+}
+.request-preset-editor input {
+  min-width: 0;
+}
+.model-advanced select {
+  margin-top: 8px;
 }
 .discovered-models {
   display: flex;

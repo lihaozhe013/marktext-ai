@@ -17,7 +17,9 @@ import type {
   AiProgressPhase,
   AiProgressEvent,
   AiFailureReason,
-  AiReasoningControl,
+  AiJsonValue,
+  AiRequestBodyPreset,
+  AiRequestBodyPresetOverride,
   AiReasoningField,
   AiReasoningTag,
   AiRecoveryInfo,
@@ -54,7 +56,7 @@ import {
   renderedPdfImageRules
 } from './prompts'
 import { inspectMarkdown, normalizeGeneratedMarkdown } from './outputRepair'
-import { featureLog, connectionLog } from './logging'
+import { featureLog, connectionLog, requestBodyPresetLog } from './logging'
 import { readJson, writeJsonAtomic } from './storage'
 import { AiChatStore } from './chatStore'
 import { AiRevisionStore } from './revisionStore'
@@ -69,7 +71,7 @@ import {
 } from './contextCompaction'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
-const SETTINGS_SCHEMA_VERSION = 5
+const SETTINGS_SCHEMA_VERSION = 7
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
 const CHAT_FILE = 'ai-chat.json'
@@ -86,6 +88,10 @@ const MAX_FAILURE_OUTPUT_AFTER = 3
 const MAX_FAILURE_OUTPUT_CHARS = 200_000
 const MAX_AGENT_DIFF_CHARS = 16_000
 const MAX_STORED_CHAT_MESSAGES = 100
+const MAX_REQUEST_BODY_PRESETS = 16
+const MAX_REQUEST_BODY_PRESET_NAME_LENGTH = 64
+const MAX_REQUEST_BODY_PRESET_BYTES = 16 * 1024
+const MAX_REQUEST_BODY_PRESET_DEPTH = 8
 const DEFAULT_CONTEXT_MODE = 'recent' as const
 const REQUEST_TIMEOUT_MS = 300_000
 const ATTACHMENT_GRACE_MS = 24 * 60 * 60 * 1000
@@ -110,6 +116,7 @@ interface ProviderRequestOptions {
   disableStreamFallback?: boolean
   stream?: boolean
   maxTokens?: number
+  omitRequestBodyPreset?: boolean
   attempt?: number
   onWaiting?: () => void
   onProgress?: (progress: ProviderStreamProgress) => void
@@ -176,6 +183,7 @@ interface ResolvedModelTarget {
   apiKey: string
   ref: AiModelRef
   attribution: AiMessageModel
+  requestBodyPreset?: AiRequestBodyPreset
 }
 
 export interface StoredRevision extends AiPreparedRevision {
@@ -240,6 +248,133 @@ const normalizeModelRef = (value: unknown): AiModelRef | undefined => {
   return { connectionId: value.connectionId, modelId: value.modelId }
 }
 
+const isValidPresetText = (value: string): boolean =>
+  !!value && value.length <= MAX_REQUEST_BODY_PRESET_NAME_LENGTH && !Array.from(value).some(character => {
+    const code = character.charCodeAt(0)
+    return code < 32 || code === 127
+  })
+
+const isUnsafeJsonKey = (key: string): boolean =>
+  key === '__proto__' || key === 'prototype' || key === 'constructor'
+
+const normalizeJsonValue = (value: unknown, depth = 0): AiJsonValue | undefined => {
+  if (depth > MAX_REQUEST_BODY_PRESET_DEPTH) return undefined
+  if (value === null) return null
+  if (typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (Array.isArray(value)) {
+    const normalized: AiJsonValue[] = []
+    for (const item of value) {
+      const next = normalizeJsonValue(item, depth + 1)
+      if (next === undefined) return undefined
+      normalized.push(next)
+    }
+    return normalized
+  }
+  if (!isRecord(value)) return undefined
+  const normalized: Record<string, AiJsonValue> = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (isUnsafeJsonKey(key)) return undefined
+    const next = normalizeJsonValue(item, depth + 1)
+    if (next === undefined) return undefined
+    normalized[key] = next
+  }
+  return normalized
+}
+
+const normalizePresetBody = (value: unknown): Record<string, AiJsonValue> | undefined => {
+  if (!isRecord(value) || !Object.keys(value).length) return undefined
+  const normalized = normalizeJsonValue(value)
+  return isRecord(normalized) && Object.keys(normalized).length ? normalized as Record<string, AiJsonValue> : undefined
+}
+
+const presetBodySize = (body: Record<string, AiJsonValue>): number =>
+  Buffer.byteLength(JSON.stringify(body), 'utf8')
+
+const legacyReasoningPresetId = (value: string): string =>
+  `legacy-reasoning-effort:${encodeURIComponent(value)}`
+
+const normalizeRequestBodyPreset = (value: unknown): AiRequestBodyPreset | undefined => {
+  if (!isRecord(value)) return undefined
+  const name = typeof value.name === 'string' ? value.name.trim() : ''
+  const body = normalizePresetBody(value.body)
+  const id = typeof value.id === 'string' ? value.id.trim() : ''
+  if (!isValidPresetText(id) || !isValidPresetText(name) || !body || presetBodySize(body) > MAX_REQUEST_BODY_PRESET_BYTES) return undefined
+  return { id, name, body }
+}
+
+const normalizeRequestBodyPresetConfig = (value: unknown): {
+  presets: AiRequestBodyPreset[]
+  defaultPresetId?: string
+} | undefined => {
+  if (!isRecord(value) || !Array.isArray(value.presets)) return undefined
+  if (!value.presets.length || value.presets.length > MAX_REQUEST_BODY_PRESETS) return undefined
+  const presets: AiRequestBodyPreset[] = []
+  const ids = new Set<string>()
+  const names = new Set<string>()
+  for (let index = 0; index < value.presets.length; index += 1) {
+    const preset = normalizeRequestBodyPreset(value.presets[index])
+    if (!preset || ids.has(preset.id) || names.has(preset.name.toLocaleLowerCase())) return undefined
+    ids.add(preset.id)
+    names.add(preset.name.toLocaleLowerCase())
+    presets.push(preset)
+  }
+  const defaultPresetId = value.defaultPresetId
+  if (defaultPresetId !== undefined && (typeof defaultPresetId !== 'string' || !ids.has(defaultPresetId))) return undefined
+  return {
+    presets,
+    ...(defaultPresetId !== undefined ? { defaultPresetId } : {})
+  }
+}
+
+const normalizeLegacyReasoningEffortConfig = (value: unknown): { options: string[]; defaultValue?: string } | undefined => {
+  if (!isRecord(value) || !Array.isArray(value.options)) return undefined
+  const options: string[] = []
+  for (const item of value.options) {
+    if (typeof item !== 'string') return undefined
+    const option = item.trim()
+    if (!isValidPresetText(option) || options.includes(option)) continue
+    options.push(option)
+    if (options.length > MAX_REQUEST_BODY_PRESETS) return undefined
+  }
+  if (!options.length) return undefined
+  const defaultValue = value.defaultValue
+  if (defaultValue !== undefined && (typeof defaultValue !== 'string' || !options.includes(defaultValue.trim()))) return undefined
+  return {
+    options,
+    ...(defaultValue !== undefined ? { defaultValue: (defaultValue as string).trim() } : {})
+  }
+}
+
+const migrateLegacyReasoningEffort = (value: unknown): {
+  presets: AiRequestBodyPreset[]
+  defaultPresetId?: string
+} | undefined => {
+  const legacy = normalizeLegacyReasoningEffortConfig(value)
+  if (!legacy) return undefined
+  const presets = legacy.options.map(option => ({
+    id: legacyReasoningPresetId(option),
+    name: option,
+    body: { reasoning_effort: option }
+  }))
+  return {
+    presets,
+    ...(legacy.defaultValue ? { defaultPresetId: legacyReasoningPresetId(legacy.defaultValue) } : {})
+  }
+}
+
+const mergeJsonValue = (base: unknown, override: AiJsonValue): unknown => {
+  if (!isRecord(base) || !isRecord(override)) return override
+  const merged: Record<string, unknown> = { ...base }
+  for (const [key, value] of Object.entries(override)) {
+    merged[key] = Object.prototype.hasOwnProperty.call(merged, key) ? mergeJsonValue(merged[key], value) : value
+  }
+  return merged
+}
+
+const mergeRequestBodyPreset = (body: Record<string, unknown>, preset: AiRequestBodyPreset): Record<string, unknown> =>
+  mergeJsonValue(body, preset.body) as Record<string, unknown>
+
 const normalizeEditAutoRetryCount = (value: unknown): number => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_EDIT_AUTO_RETRY_COUNT
   return Math.min(MAX_EDIT_AUTO_RETRY_COUNT, Math.max(0, Math.floor(value)))
@@ -253,28 +388,36 @@ const normalizeFailureOutputAfter = (value: unknown): number => {
 const normalizeContextMode = (value: unknown): StoredSettings['contextMode'] =>
   value === 'summary' ? 'summary' : DEFAULT_CONTEXT_MODE
 
-const normalizeModelCapabilities = (value: unknown): AiModelProfile['capabilities'] => {
+const normalizeModelCapabilities = (value: unknown, strict = false): AiModelProfile['capabilities'] => {
   if (!isRecord(value)) return undefined
-  const reasoningControl = value.reasoningControl
+  const requestBodyPresets = value.requestBodyPresets
+  const legacyReasoningEffort = value.reasoningEffort
   const reasoningField = value.reasoningField
   const reasoningTag = value.reasoningTag
   const replayReasoning = value.replayReasoning
+  const normalizedRequestBodyPresets = requestBodyPresets !== undefined
+    ? normalizeRequestBodyPresetConfig(requestBodyPresets)
+    : legacyReasoningEffort !== undefined
+      ? migrateLegacyReasoningEffort(legacyReasoningEffort)
+      : undefined
+  if (strict && (requestBodyPresets !== undefined || legacyReasoningEffort !== undefined) && !normalizedRequestBodyPresets) {
+    throw new Error(`Invalid request body preset configuration. Add between 1 and ${MAX_REQUEST_BODY_PRESETS} unique presets with non-empty JSON objects smaller than ${MAX_REQUEST_BODY_PRESET_BYTES} bytes.`)
+  }
   if (
-    (reasoningControl !== undefined && reasoningControl !== 'unknown' && reasoningControl !== 'effort' && reasoningControl !== 'budget') ||
     (reasoningField !== undefined && reasoningField !== 'reasoning' && reasoningField !== 'reasoning_content' && reasoningField !== 'reason_content' && reasoningField !== 'reasoning_text') ||
     (reasoningTag !== undefined && reasoningTag !== 'think' && reasoningTag !== 'thinking' && reasoningTag !== 'analysis' && reasoningTag !== 'reasoning') ||
     (replayReasoning !== undefined && typeof replayReasoning !== 'boolean')
   ) return undefined
-  if (reasoningControl === undefined && reasoningField === undefined && reasoningTag === undefined && replayReasoning === undefined) return undefined
+  if (normalizedRequestBodyPresets === undefined && reasoningField === undefined && reasoningTag === undefined && replayReasoning === undefined) return undefined
   return {
-    ...(reasoningControl !== undefined ? { reasoningControl: reasoningControl as AiReasoningControl } : {}),
+    ...(normalizedRequestBodyPresets ? { requestBodyPresets: normalizedRequestBodyPresets } : {}),
     ...(reasoningField !== undefined ? { reasoningField: reasoningField as AiReasoningField } : {}),
     ...(reasoningTag !== undefined ? { reasoningTag: reasoningTag as AiReasoningTag } : {}),
     ...(replayReasoning !== undefined ? { replayReasoning } : {})
   }
 }
 
-const normalizeModelProfile = (value: unknown): AiModelProfile | undefined => {
+const normalizeModelProfile = (value: unknown, strict = false): AiModelProfile | undefined => {
   if (!isRecord(value) || typeof value.model !== 'string' || !value.model.trim()) return undefined
   const model = value.model.trim()
   const source = value.source === 'discovered' ? 'discovered' : 'manual'
@@ -283,7 +426,7 @@ const normalizeModelProfile = (value: unknown): AiModelProfile | undefined => {
     model,
     label: typeof value.label === 'string' && value.label.trim() ? value.label.trim() : model,
     source,
-    capabilities: normalizeModelCapabilities(value.capabilities)
+    capabilities: normalizeModelCapabilities(value.capabilities, strict)
   }
 }
 
@@ -391,7 +534,7 @@ const validateConnectionInput = (input: AiConnectionInput): {
   const name = input.name.trim()
   if (!name) throw new Error('Connection name is required.')
   const models = input.models
-    .map(model => normalizeModelProfile({ ...model, model: model.model.trim() }))
+    .map(model => normalizeModelProfile({ ...model, model: model.model.trim() }, true))
     .filter((model): model is AiModelProfile => !!model)
   const dedupedModels = Array.from(new Map(models.map(model => [model.model, model])).values())
   return {
@@ -417,6 +560,18 @@ const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSetting
 })
 
 const toMessageModel = (target: ResolvedModelTarget): AiMessageModel => ({ ...target.attribution })
+
+const resolveRequestBodyPreset = (model: AiModelProfile, override: string | null | undefined): AiRequestBodyPreset | undefined => {
+  const config = model.capabilities?.requestBodyPresets
+  if (override === undefined) {
+    return config?.presets.find(preset => preset.id === config.defaultPresetId)
+  }
+  if (!config) throw new Error('This model has no request body preset configuration.')
+  if (override === null) return undefined
+  const preset = config.presets.find(candidate => candidate.id === override)
+  if (!preset) throw new Error('The selected request body preset is not configured for this model.')
+  return preset
+}
 
 const normalizeMessageModel = (value: unknown): AiMessageModel | undefined => {
   if (!isRecord(value)) return undefined
@@ -566,12 +721,34 @@ const normalizeMessages = (messages: unknown): AiChatMessage[] => {
     .slice(-MAX_STORED_CHAT_MESSAGES)
 }
 
+const requestBodyPresetOverrideKey = (value: AiRequestBodyPresetOverride): string =>
+  `${value.modelRef.connectionId}\u0000${value.modelRef.modelId}`
+
+const normalizeRequestBodyPresetOverrides = (value: unknown): AiRequestBodyPresetOverride[] | undefined => {
+  if (!Array.isArray(value)) return undefined
+  const overrides = new Map<string, AiRequestBodyPresetOverride>()
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const modelRef = normalizeModelRef(item.modelRef)
+    if (!modelRef) continue
+    let presetId: string | null | undefined
+    if (item.presetId === null || item.value === null) presetId = null
+    else if (typeof item.presetId === 'string' && isValidPresetText(item.presetId.trim())) presetId = item.presetId.trim()
+    else if (typeof item.value === 'string' && isValidPresetText(item.value.trim())) presetId = legacyReasoningPresetId(item.value.trim())
+    if (presetId === undefined) continue
+    const normalized = { modelRef, presetId }
+    overrides.set(requestBodyPresetOverrideKey(normalized), normalized)
+  }
+  return overrides.size ? Array.from(overrides.values()) : undefined
+}
+
 const normalizeChatSession = (value: unknown): AiChatSession => {
   if (Array.isArray(value)) return { messages: normalizeMessages(value) }
   if (!isRecord(value)) return { messages: [] }
   return {
     messages: normalizeMessages(value.messages),
     selectedModel: normalizeModelRef(value.selectedModel),
+    requestBodyPresetOverrides: normalizeRequestBodyPresetOverrides(value.requestBodyPresetOverrides ?? value.reasoningEffortOverrides),
     contextSummary: typeof value.contextSummary === 'string'
       ? value.contextSummary.trim().slice(0, MAX_CONTEXT_SUMMARY_CHARS) || undefined
       : undefined
@@ -754,7 +931,8 @@ export class AiService {
         connectionName: connection.name,
         model: model.model,
         protocol: connection.protocol
-      }
+      },
+      requestBodyPreset: resolveRequestBodyPreset(model, undefined)
     }
   }
 
@@ -933,7 +1111,8 @@ export class AiService {
           connectionName: connection.name,
           model: model.model,
           protocol: connection.protocol
-        }
+        },
+        requestBodyPreset: resolveRequestBodyPreset(model, undefined)
       }, connectionTestSystemPrompt, [{ role: 'user', content: connectionTestUserPrompt }], `test-${crypto.randomUUID()}`)
       connectionLog('test succeeded connectionId=%s model=%s', connection.id, model.model)
       return { ok: true, message: 'Connection succeeded.' }
@@ -1038,6 +1217,8 @@ export class AiService {
       let streaming = options.stream === true
       let includeStreamUsage = streaming && settings.protocol === 'openai-chat-completions'
       let streamFallbackAttempted = false
+      let streamFallbackOverride: boolean | undefined
+      let removeStreamOptionsForRetry = false
       while (true) {
         const headers: Record<string, string> = {
           accept: streaming ? 'text/event-stream, application/json' : 'application/json',
@@ -1100,6 +1281,25 @@ export class AiService {
             if (options.parallelToolCalls !== undefined) body.parallel_tool_calls = options.parallelToolCalls
           }
         }
+        if (!options.omitRequestBodyPreset && target.requestBodyPreset) {
+          body = mergeRequestBodyPreset(body, target.requestBodyPreset)
+          requestBodyPresetLog(
+            'applied presetId=%s presetName=%s topLevelKeys=%s model=%s requestId=%s',
+            target.requestBodyPreset.id,
+            target.requestBodyPreset.name,
+            Object.keys(target.requestBodyPreset.body).join(','),
+            model,
+            requestId
+          )
+        }
+        if (streamFallbackOverride === false) delete body.stream
+        else if (streamFallbackOverride === true) body.stream = true
+        if (removeStreamOptionsForRetry) delete body.stream_options
+        streaming = body.stream === true
+        headers.accept = streaming ? 'text/event-stream, application/json' : 'application/json'
+        if (!streaming && includeStreamUsage && !Object.prototype.hasOwnProperty.call(target.requestBodyPreset?.body ?? {}, 'stream_options')) {
+          delete body.stream_options
+        }
         featureLog(
           'request start protocol=%s endpoint=%s model=%s stream=%s attempt=%s requestId=%s',
           settings.protocol,
@@ -1159,21 +1359,25 @@ export class AiService {
           payload = null
         }
         if (!response.ok) {
-          const unsupportedStreamStatus = streaming && [400, 404, 405, 415, 422].includes(response.status)
-          if (unsupportedStreamStatus && !options.disableStreamFallback && includeStreamUsage) {
+          const providerMessage = isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === 'string'
+            ? payload.error.message
+            : `Provider returned HTTP ${response.status}.`
+          const explicitlyRejectedStream = /\bstream(?:_options)?\b/i.test(providerMessage)
+          const unsupportedStreamStatus = streaming && explicitlyRejectedStream && [400, 404, 405, 415, 422].includes(response.status)
+          const hasStreamOptions = Object.prototype.hasOwnProperty.call(body, 'stream_options')
+          if (unsupportedStreamStatus && !options.disableStreamFallback && hasStreamOptions && /\bstream_options\b/i.test(providerMessage)) {
             includeStreamUsage = false
+            removeStreamOptionsForRetry = true
             featureLog('stream usage option rejected; retrying without usage option requestId=%s', requestId)
             continue
           }
-          if (unsupportedStreamStatus && !options.disableStreamFallback && !streamFallbackAttempted) {
+          if (unsupportedStreamStatus && !options.disableStreamFallback && !streamFallbackAttempted && !/\bstream_options\b/i.test(providerMessage)) {
+            streamFallbackOverride = false
             streaming = false
             streamFallbackAttempted = true
             featureLog('stream unsupported; falling back to JSON requestId=%s', requestId)
             continue
           }
-          const providerMessage = isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === 'string'
-            ? payload.error.message
-            : `Provider returned HTTP ${response.status}.`
           const attachmentHint = messages.some(message => !!message.images?.length)
             ? ' The configured model or endpoint may not support image input.'
             : ''
@@ -1479,7 +1683,7 @@ export class AiService {
         [{ role: 'user', content: summaryPrompt.content }],
         requestId,
         signal,
-        { stream: false, maxTokens: 512, attempt: 2 }
+        { stream: false, maxTokens: 512, attempt: 2, omitRequestBodyPreset: true }
       )
       onResponse(generated)
       const summary = normalizeContextSummary(generated.content)
@@ -1509,6 +1713,14 @@ export class AiService {
     if (!request.requestId || !request.documentId) throw new Error('Invalid AI request.')
     const state = await this.readSettingsState()
     const target = await this.resolveModelTarget(request.modelRef, state)
+    target.requestBodyPreset = resolveRequestBodyPreset(target.model, request.requestBodyPresetOverride)
+    requestBodyPresetLog(
+      'resolved presetId=%s override=%s model=%s requestId=%s',
+      target.requestBodyPreset?.id ?? 'not-applied',
+      request.requestBodyPresetOverride === undefined ? 'model-default' : request.requestBodyPresetOverride ?? 'omit',
+      target.model.model,
+      request.requestId
+    )
     const settings = target.connection
     const currentAttachments = await this.saveRequestAttachments(request.attachments, request.documentId)
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))

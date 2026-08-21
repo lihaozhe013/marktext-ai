@@ -27,6 +27,7 @@ import type {
   AiMessageModel,
   AiPreparedRevision,
   AiModelRef,
+  AiRequestBodyPresetOverride,
   AiProgressEvent,
   AiProgressInfo,
   AiProgressPhase,
@@ -128,6 +129,7 @@ export const useAiStore = defineStore('ai', () => {
   const messages = ref<AiChatMessage[]>([])
   const contextSummary = ref<string | undefined>()
   const selectedModel = ref<AiModelRef | undefined>()
+  const requestBodyPresetOverrides = ref<AiRequestBodyPresetOverride[]>([])
   const pendingAttachments = ref<PendingAiAttachment[]>([])
   const attachmentError = ref<AiAttachmentError>('')
   const loading = ref(false)
@@ -164,12 +166,49 @@ export const useAiStore = defineStore('ai', () => {
     model: model.model,
     label: model.label,
     protocol: connection.protocol,
-    hasApiKey: connection.hasApiKey
+    hasApiKey: connection.hasApiKey,
+    requestBodyPresets: model.capabilities?.requestBodyPresets
   }))))
   const hasAnyApiKey = computed(() => settings.value.connections.some(connection => connection.hasApiKey))
 
   const isValidModelRef = (value: AiModelRef | undefined): value is AiModelRef =>
     !!value && modelOptions.value.some(option => option.ref.connectionId === value.connectionId && option.ref.modelId === value.modelId)
+
+  const pruneRequestBodyPresetOverrides = (): void => {
+    requestBodyPresetOverrides.value = requestBodyPresetOverrides.value.filter((override) => {
+      const option = modelOptions.value.find(item => modelRefKey(item.ref) === modelRefKey(override.modelRef))
+      return !!option && !!option.requestBodyPresets && (override.presetId === null || option.requestBodyPresets.presets.some(preset => preset.id === override.presetId))
+    })
+  }
+
+  const requestBodyPresetOverrideFor = (modelRef: AiModelRef | undefined): string | null | undefined => {
+    if (!modelRef) return undefined
+    return requestBodyPresetOverrides.value.find(item => modelRefKey(item.modelRef) === modelRefKey(modelRef))?.presetId
+  }
+
+  const selectedModelOption = computed(() =>
+    modelOptions.value.find(option => modelRefKey(option.ref) === modelRefKey(selectedModel.value))
+  )
+  const selectedRequestBodyPresets = computed(() => selectedModelOption.value?.requestBodyPresets)
+  const requestBodyPresetSelection = computed(() => {
+    const override = requestBodyPresetOverrideFor(selectedModel.value)
+    if (override === undefined) return '__model_default__'
+    return override === null ? '__omit__' : override
+  })
+
+  const setRequestBodyPreset = (selection: string): void => {
+    const modelRef = selectedModel.value
+    if (!modelRef || !selectedRequestBodyPresets.value) return
+    requestBodyPresetOverrides.value = requestBodyPresetOverrides.value.filter(item => modelRefKey(item.modelRef) !== modelRefKey(modelRef))
+    if (selection === '__model_default__') {
+      saveChat().catch(err => featureLog('request body preset save failed reason=%s', err instanceof Error ? err.message : String(err)))
+      return
+    }
+    const presetId = selection === '__omit__' ? null : selection
+    if (presetId !== null && !selectedRequestBodyPresets.value.presets.some(preset => preset.id === presetId)) return
+    requestBodyPresetOverrides.value.push({ modelRef: { ...modelRef }, presetId })
+    saveChat().catch(err => featureLog('request body preset save failed reason=%s', err instanceof Error ? err.message : String(err)))
+  }
 
   const resolveSelectedModel = (): AiModelRef | undefined => {
     if (isValidModelRef(selectedModel.value)) return { ...selectedModel.value }
@@ -298,6 +337,7 @@ export const useAiStore = defineStore('ai', () => {
 
   const setSettings = (value: AiConnectionSettings): void => {
     settings.value = value
+    pruneRequestBodyPresetOverrides()
     if (!isValidModelRef(selectedModel.value)) resolveSelectedModel()
   }
 
@@ -330,6 +370,8 @@ export const useAiStore = defineStore('ai', () => {
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
       messages.value = loadedSession.messages
       contextSummary.value = loadedSession.contextSummary
+      requestBodyPresetOverrides.value = loadedSession.requestBodyPresetOverrides ?? []
+      pruneRequestBodyPresetOverrides()
       selectedModel.value = loadedSession.selectedModel
       resolveSelectedModel()
       loadedChatDocumentId = documentId
@@ -338,6 +380,7 @@ export const useAiStore = defineStore('ai', () => {
       error.value = err instanceof Error ? err.message : String(err)
       messages.value = []
       contextSummary.value = undefined
+      requestBodyPresetOverrides.value = []
       resolveSelectedModel()
       loadedChatDocumentId = documentId
     }
@@ -353,6 +396,7 @@ export const useAiStore = defineStore('ai', () => {
     const session: AiChatSession = {
       messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
       selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined,
+      requestBodyPresetOverrides: requestBodyPresetOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, presetId: item.presetId })),
       contextSummary: contextSummary.value
     }
     return enqueueChatPersistence(() => window.electron.ipcRenderer.invoke('mt::ai::chat-save', documentId, session))
@@ -362,6 +406,7 @@ export const useAiStore = defineStore('ai', () => {
     clearPendingAttachments()
     messages.value = []
     contextSummary.value = undefined
+    requestBodyPresetOverrides.value = []
     selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
     currentProgress.value = undefined
@@ -759,6 +804,7 @@ export const useAiStore = defineStore('ai', () => {
         prompt: value,
         markdown: baseMarkdown,
         modelRef: requestModel,
+        requestBodyPresetOverride: requestBodyPresetOverrideFor(requestModel),
         attachments: uploads,
         messages: toIpcChatMessages(contextMessages),
         contextSummary: contextSummary.value,
@@ -1164,6 +1210,9 @@ export const useAiStore = defineStore('ai', () => {
     modelOptions,
     hasAnyApiKey,
     selectedModel,
+    selectedModelOption,
+    selectedRequestBodyPresets,
+    requestBodyPresetSelection,
     selectedModelKey: computed(() => modelRefKey(selectedModel.value)),
     mode,
     visible,
@@ -1186,6 +1235,7 @@ export const useAiStore = defineStore('ai', () => {
     setMode,
     setSettings,
     selectModel,
+    setRequestBodyPreset,
     setDefaultModel,
     setWidth,
     addImageFiles,

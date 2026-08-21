@@ -121,13 +121,15 @@ Reasoning handling by mode:
 - `rewrite`: pass only normalized `content` to Markdown repair and validation;
   do not persist reasoning as document Markdown.
 
-Model profiles may declare `reasoningField`, `reasoningTag`, and
-`replayReasoning`. Provider-specific request controls must only be sent when a
-model profile declares that capability. If `replayReasoning` is enabled, the
+Model profiles may declare user-authored `requestBodyPresets`, along with
+`reasoningField`, `reasoningTag`, and `replayReasoning`. Request body presets
+are parsed JSON objects selected by name and merged into provider request
+bodies; the application does not infer reasoning capabilities from model names,
+providers, or model discovery responses. If `replayReasoning` is enabled, the
 configured reasoning field is preserved on assistant history because some
-thinking APIs require it on follow-up requests. Unknown fields are not sent to
-the provider. Reasoning content may be shown and stored only as a separate chat
-field; it must never be merged into Markdown or written to diagnostic logs.
+thinking APIs require it on follow-up requests. Reasoning content may be shown
+and stored only as a separate chat field; it must never be merged into Markdown
+or written to diagnostic logs.
 
 The streaming parser must tolerate tags and JSON fields split across chunks.
 Local reasoning normalization is not a provider retry. A retry is allowed only
