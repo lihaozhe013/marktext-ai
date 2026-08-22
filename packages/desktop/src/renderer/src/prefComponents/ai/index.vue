@@ -262,6 +262,26 @@
                   </option>
                 </select>
                 <small>{{ labels.requestBodyPresetDefaultHint }}</small>
+                <label>{{ labels.editAgentPreset }}</label>
+                <select
+                  :value="model.capabilities.requestBodyPresets.editAgentPresetId === null ? '__omit__' : model.capabilities.requestBodyPresets.editAgentPresetId || '__inherit__'"
+                  @change="setEditAgentPreset(model, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="__inherit__">
+                    {{ labels.editAgentPresetInherit }}
+                  </option>
+                  <option value="__omit__">
+                    {{ labels.editAgentPresetNoExtra }}
+                  </option>
+                  <option
+                    v-for="preset in model.capabilities.requestBodyPresets.presets"
+                    :key="`${model.id || model.model}-edit-agent-${preset.id}`"
+                    :value="preset.id"
+                  >
+                    {{ preset.name }}
+                  </option>
+                </select>
+                <small>{{ labels.editAgentPresetHint }}</small>
               </template>
             </details>
           </div>
@@ -443,6 +463,10 @@ const labels = computed(() =>
         removeRequestBodyPreset: '移除预设',
         requestBodyPresetNoDefault: '不应用额外 JSON',
         requestBodyPresetDefaultHint: '默认预设影响模型请求；AI 面板可以按当前会话临时覆盖。',
+        editAgentPreset: '编辑 Agent 预设',
+        editAgentPresetInherit: '继承普通预设',
+        editAgentPresetNoExtra: '无额外 JSON',
+        editAgentPresetHint: '仅前台精准编辑流程使用；附件提取、计划、编辑步骤和完整文档回退都会使用此选择。',
         save: '保存连接',
         saving: '保存中…',
         test: '测试连接',
@@ -499,6 +523,10 @@ const labels = computed(() =>
         removeRequestBodyPreset: 'Remove preset',
         requestBodyPresetNoDefault: 'Do not apply extra JSON',
         requestBodyPresetDefaultHint: 'The default preset applies to model requests; the AI panel can override it for the current session.',
+        editAgentPreset: 'Edit Agent preset',
+        editAgentPresetInherit: 'Inherit normal preset',
+        editAgentPresetNoExtra: 'No extra JSON',
+        editAgentPresetHint: 'Applies only to the foreground precise-edit workflow, including attachment extraction, planning, edit steps, and whole-document fallback.',
         save: 'Save connection',
         saving: 'Saving…',
         test: 'Test connection',
@@ -595,7 +623,8 @@ const removeRequestBodyPreset = (model: FormModel, index: number): void => {
     requestBodyPresets: {
       ...config,
       presets,
-      ...(config.defaultPresetId === removed.id ? { defaultPresetId: undefined } : {})
+      ...(config.defaultPresetId === removed.id ? { defaultPresetId: undefined } : {}),
+      ...(config.editAgentPresetId === removed.id ? { editAgentPresetId: undefined } : {})
     }
   }
   const key = requestBodyPresetKey(model, removed)
@@ -609,6 +638,16 @@ const setRequestBodyPresetDefault = (model: FormModel, value: string): void => {
   model.capabilities = {
     ...(model.capabilities ?? {}),
     requestBodyPresets: { ...config, ...(value ? { defaultPresetId: value } : { defaultPresetId: undefined }) }
+  }
+}
+
+const setEditAgentPreset = (model: FormModel, value: string): void => {
+  const config = model.capabilities?.requestBodyPresets
+  if (!config) return
+  const editAgentPresetId = value === '__omit__' ? null : value === '__inherit__' ? undefined : value
+  model.capabilities = {
+    ...(model.capabilities ?? {}),
+    requestBodyPresets: { ...config, editAgentPresetId }
   }
 }
 

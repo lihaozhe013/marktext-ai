@@ -130,7 +130,8 @@ describe('AI connection profiles and model routing', () => {
               { id: 'enabled', name: 'Enabled', body: { thinking: { type: ' enabled ' } } },
               { id: 'disabled', name: 'Disabled', body: { thinking: { type: 'disabled' } } }
             ],
-            defaultPresetId: 'enabled'
+            defaultPresetId: 'enabled',
+            editAgentPresetId: 'disabled'
           }
         }
       }],
@@ -142,7 +143,8 @@ describe('AI connection profiles and model routing', () => {
           { id: 'enabled', name: 'Enabled', body: { thinking: { type: ' enabled ' } } },
           { id: 'disabled', name: 'Disabled', body: { thinking: { type: 'disabled' } } }
         ],
-        defaultPresetId: 'enabled'
+        defaultPresetId: 'enabled',
+        editAgentPresetId: 'disabled'
       }
     })
 
@@ -153,6 +155,21 @@ describe('AI connection profiles and model routing', () => {
       models: [{ model: 'arbitrary-model', capabilities: { requestBodyPresets: { presets: [] } } }],
       apiKey: 'invalid-key'
     })).rejects.toThrow('Invalid request body preset configuration')
+    await expect(service.saveConnection({
+      name: 'Invalid edit preset reference',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://invalid-edit-preset.example/v1',
+      models: [{
+        model: 'arbitrary-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'only', name: 'Only', body: { thinking: { type: 'enabled' } } }],
+            editAgentPresetId: 'missing'
+          }
+        }
+      }],
+      apiKey: 'invalid-key'
+    })).rejects.toThrow('edit Agent preset')
   })
 
   it('migrates legacy reasoning_effort profiles and session overrides', async() => {
@@ -195,11 +212,51 @@ describe('AI connection profiles and model routing', () => {
       { id: 'legacy-reasoning-effort:low', name: 'low', body: { reasoning_effort: 'low' } },
       { id: 'legacy-reasoning-effort:high', name: 'high', body: { reasoning_effort: 'high' } }
     ])
-    expect(JSON.parse(await readFile(path.join(directory, 'ai-connection.json'), 'utf8')).schemaVersion).toBe(7)
+    expect(JSON.parse(await readFile(path.join(directory, 'ai-connection.json'), 'utf8')).schemaVersion).toBe(8)
     expect((await service.loadChat('tab:legacy')).requestBodyPresetOverrides).toEqual([{
       modelRef: { connectionId: 'legacy-connection', modelId: 'legacy-model' },
       presetId: 'legacy-reasoning-effort:low'
     }])
+  })
+
+  it('clears a broken persisted edit Agent preset reference', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-broken-edit-preset-'))
+    directories.push(directory)
+    await writeFile(path.join(directory, 'ai-connection.json'), JSON.stringify({
+      schemaVersion: 8,
+      connections: [{
+        id: 'broken-connection',
+        name: 'Broken preset',
+        protocol: 'openai-chat-completions',
+        endpoint: 'https://broken-preset.example/v1',
+        models: [{
+          id: 'broken-model',
+          model: 'broken-model',
+          label: 'Broken model',
+          source: 'manual',
+          capabilities: {
+            requestBodyPresets: {
+              presets: [{ id: 'valid', name: 'Valid', body: { thinking: { type: 'enabled' } } }],
+              defaultPresetId: 'valid',
+              editAgentPresetId: 'deleted'
+            }
+          }
+        }]
+      }],
+      defaultModel: { connectionId: 'broken-connection', modelId: 'broken-model' },
+      editAutoRetryCount: 1,
+      editAgentMaxSteps: 64,
+      failureOutputAfter: 1,
+      contextMode: 'recent'
+    }))
+    const service = new AiService(directory)
+
+    const settings = await service.getSettings()
+    expect(settings.connections[0].models[0].capabilities?.requestBodyPresets).toEqual({
+      presets: [{ id: 'valid', name: 'Valid', body: { thinking: { type: 'enabled' } } }],
+      defaultPresetId: 'valid'
+    })
+    expect(JSON.parse(await readFile(path.join(directory, 'ai-connection.json'), 'utf8')).connections[0].models[0].capabilities.requestBodyPresets.editAgentPresetId).toBeUndefined()
   })
 
   it('rejects oversized, deeply nested, and prototype-polluting preset JSON', async() => {
@@ -461,6 +518,187 @@ describe('AI connection profiles and model routing', () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).thinking).toEqual({ type: 'enabled' })
   })
 
+  it('uses the edit Agent preset for every foreground edit turn', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-edit-agent-preset-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const presetConfig = {
+      presets: [
+        { id: 'enabled', name: 'Thinking enabled', body: { thinking: { type: 'enabled' } } },
+        { id: 'disabled', name: 'Thinking disabled', body: { thinking: { type: 'disabled' } } }
+      ],
+      defaultPresetId: 'enabled' as const,
+      editAgentPresetId: 'disabled' as const
+    }
+    const saved = await service.saveConnection({
+      name: 'Edit Agent presets',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://edit-agent-preset.example/v1',
+      models: [{ model: 'edit-preset-model', capabilities: { requestBodyPresets: presetConfig } }],
+      apiKey: 'edit-preset-key'
+    })
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      const toolName = (body.tools as Array<{ function?: { name?: string } }> | undefined)?.[0]?.function?.name
+      const input = toolName === 'create_markdown_edit_plan'
+        ? { summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }
+        : { markdown: 'Notes', description: 'Appended notes.' }
+      return response({ choices: [{ message: { tool_calls: [{ id: `call-${fetchMock.mock.calls.length}`, type: 'function', function: { name: toolName, arguments: JSON.stringify(input) } }] }, finish_reason: 'tool_calls' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const modelRef = { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    const result = await service.request({
+      requestId: 'edit-agent-preset-request',
+      documentId: 'tab:edit-agent-preset',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls.map(call => JSON.parse(String(call[1].body)).thinking)).toEqual([
+      { type: 'disabled' },
+      { type: 'disabled' }
+    ])
+
+    await service.saveConnection({
+      id: saved.connections[0].id,
+      name: 'Edit Agent presets inherited',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://edit-agent-preset.example/v1',
+      models: [{
+        id: saved.connections[0].models[0].id,
+        model: 'edit-preset-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: presetConfig.presets,
+            defaultPresetId: 'enabled'
+          }
+        }
+      }]
+    })
+    fetchMock.mockClear()
+    await service.request({
+      requestId: 'edit-agent-preset-inherit',
+      documentId: 'tab:edit-agent-preset-inherit',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef
+    })
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body)).thinking).toEqual({ type: 'enabled' })
+
+    await service.saveConnection({
+      id: saved.connections[0].id,
+      name: 'Edit Agent presets omitted',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://edit-agent-preset.example/v1',
+      models: [{
+        id: saved.connections[0].models[0].id,
+        model: 'edit-preset-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: presetConfig.presets,
+            defaultPresetId: 'enabled',
+            editAgentPresetId: null
+          }
+        }
+      }]
+    })
+    fetchMock.mockClear()
+    await service.request({
+      requestId: 'edit-agent-preset-omit',
+      documentId: 'tab:edit-agent-preset-omit',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef
+    })
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).not.toHaveProperty('thinking')
+  })
+
+  it('keeps a truncated native tool response on native transport', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-agent-truncated-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Native', 'https://native-truncated.example/v1', 'native-truncated-model', 'native-key'))
+    let calls = 0
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      calls += 1
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const toolName = (body.tools as Array<{ function?: { name?: string } }> | undefined)?.[0]?.function?.name
+      if (calls === 3) return response({ choices: [{ message: { content: '' }, finish_reason: 'length' }] })
+      const input = toolName === 'create_markdown_edit_plan'
+        ? {
+          summary: 'Append notes.',
+          steps: [
+            { id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] },
+            { id: 'more', description: 'Append more notes.', intent: 'Append more notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: ['append'] }
+          ]
+        }
+        : { markdown: calls === 2 ? 'Notes' : 'More', description: calls === 2 ? 'Appended notes.' : 'Appended more notes.' }
+      return response({ choices: [{ message: { tool_calls: [{ id: `call-${calls}`, type: 'function', function: { name: toolName, arguments: JSON.stringify(input) } }] }, finish_reason: 'tool_calls' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'native-truncated-request',
+      documentId: 'tab:native-truncated',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes\n\nMore')
+    expect(requests).toHaveLength(4)
+    expect(requests.every(body => Array.isArray(body.tools))).toBe(true)
+    expect(requests.every(body => !JSON.stringify(body).includes('native tool transport is unavailable'))).toBe(true)
+  })
+
+  it('does not downgrade edit Agent transport for unrelated provider errors', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-agent-parameter-error-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Parameter error',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://agent-parameter-error.example/v1',
+      models: [{
+        model: 'parameter-error-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'thinking', name: 'Thinking', body: { thinking: { type: 'enabled' } } }],
+            defaultPresetId: 'thinking'
+          }
+        }
+      }],
+      apiKey: 'parameter-error-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({ error: { message: 'thinking.type is unsupported' } }, 400))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(service.request({
+      requestId: 'agent-parameter-error-request',
+      documentId: 'tab:agent-parameter-error',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })).rejects.toThrow('thinking.type is unsupported')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('exposes raw edit output before the whole-document fallback', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-failure-output-'))
     directories.push(directory)
@@ -492,7 +730,7 @@ describe('AI connection profiles and model routing', () => {
 
     expect(result.markdown).toBe('# Fallback title')
     expect(result.recovery?.requiresConfirmation).toBe(true)
-    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(progress).toContainEqual(expect.objectContaining({ phase: 'attempt-failed', failureCount: 2 }))
   })
 

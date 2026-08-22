@@ -131,6 +131,13 @@ thinking APIs require it on follow-up requests. Reasoning content may be shown
 and stored only as a separate chat field; it must never be merged into Markdown
 or written to diagnostic logs.
 
+`requestBodyPresets.editAgentPresetId` controls the foreground precise-edit
+workflow independently: an omitted value inherits the current model/session
+preset, `null` disables extra JSON for editing, and a preset ID selects a named
+override. Attachment extraction, planning, revisions, edit steps, and the
+whole-document edit fallback use that effective edit preset; answer, rewrite,
+connection tests, and hidden context summaries keep their normal request rules.
+
 The streaming parser must tolerate tags and JSON fields split across chunks.
 Local reasoning normalization is not a provider retry. A retry is allowed only
 when normalized content is empty, truncated, or fails the existing Markdown,

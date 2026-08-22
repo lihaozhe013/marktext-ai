@@ -595,11 +595,13 @@ const progressLabelFor = (progress: AiProgressInfo | undefined): string => {
       ? chinese.value ? '编辑计划定位失败，正在重新规划' : 'Edit plan target failed; replanning'
       : progress?.failureReason === 'truncated'
         ? chinese.value ? '输出被截断' : 'Output was truncated'
-        : progress?.failureReason === 'provider'
-          ? chinese.value ? '模型请求失败' : 'Model request failed'
-          : progress?.failureReason === 'capability'
-            ? chinese.value ? '模型不支持工具调用' : 'Model does not support tool calling'
-            : chinese.value ? '格式不符合要求' : 'Format validation failed'
+        : progress?.failureReason === 'missing-tool-call'
+          ? chinese.value ? '模型未返回所需编辑工具调用' : 'Model did not return the required editing tool call'
+          : progress?.failureReason === 'provider'
+            ? chinese.value ? '模型请求失败' : 'Model request failed'
+            : progress?.failureReason === 'capability'
+              ? chinese.value ? '模型不支持工具调用' : 'Model does not support tool calling'
+              : chinese.value ? '格式不符合要求' : 'Format validation failed'
   if (chinese.value) {
     switch (progress?.phase) {
       case 'pdf-rendering':

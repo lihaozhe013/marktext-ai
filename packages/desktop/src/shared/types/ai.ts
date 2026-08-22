@@ -97,6 +97,8 @@ export interface AiRequestBodyPreset {
 export interface AiRequestBodyPresetConfig {
   presets: AiRequestBodyPreset[]
   defaultPresetId?: string
+  /** undefined inherits the normal request preset; null disables presets for edit Agent requests. */
+  editAgentPresetId?: string | null
 }
 
 export interface AiModelCapabilities {
@@ -242,7 +244,7 @@ export interface AiProgressInfo {
   totalCacheWriteInputTokens?: number
 }
 
-export type AiFailureReason = 'format' | 'exact-match' | 'scope' | 'truncated' | 'provider' | 'capability' | 'unknown'
+export type AiFailureReason = 'format' | 'exact-match' | 'scope' | 'truncated' | 'missing-tool-call' | 'provider' | 'capability' | 'unknown'
 
 export type AiLiveProgressPhase = 'waiting' | 'attachment-extracting' | 'streaming' | 'compacting' | 'validating' | 'agent-plan' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'partial' | 'completed' | 'failed' | 'cancelled'
 

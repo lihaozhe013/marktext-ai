@@ -71,7 +71,7 @@ import {
 } from './contextCompaction'
 
 const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
-const SETTINGS_SCHEMA_VERSION = 7
+const SETTINGS_SCHEMA_VERSION = 8
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
 const CHAT_FILE = 'ai-chat.json'
@@ -135,13 +135,29 @@ interface RepairedMarkdownResult {
 class ProviderRequestError extends Error {
   readonly status: number
   readonly toolRequest: boolean
+  readonly providerMessage: string
+  readonly providerParam?: string
 
-  constructor(message: string, status: number, toolRequest: boolean) {
+  constructor(message: string, status: number, toolRequest: boolean, providerMessage = message, providerParam?: string) {
     super(message)
     this.name = 'ProviderRequestError'
     this.status = status
     this.toolRequest = toolRequest
+    this.providerMessage = providerMessage
+    this.providerParam = providerParam
   }
+}
+
+type AgentTransportRejection = 'strict' | 'tools'
+
+const classifyAgentTransportRejection = (error: unknown): AgentTransportRejection | undefined => {
+  if (!(error instanceof ProviderRequestError) || !error.toolRequest || ![400, 404, 422].includes(error.status)) return undefined
+  const message = `${error.providerMessage} ${error.providerParam ?? ''}`
+  const mentionsTools = /\btools?\b|\btool[_ -]?choice\b|\bparallel[_ -]?tool[_ -]?calls\b|\btool calling\b|\bfunction calling\b/i.test(message)
+  const mentionsStrict = /\bstrict\b|function schema|function parameters|schema validation/i.test(message)
+  if (!mentionsTools && !mentionsStrict) return undefined
+  if (!/unsupported|not support|does not support|unknown|unrecognized|invalid|not allowed|forbidden|rejected|unexpected|cannot|must be|does not accept/i.test(message)) return undefined
+  return mentionsStrict && !mentionsTools ? 'strict' : 'tools'
 }
 
 const makeFailureOutput = (rawContent: string, content: string, reasoning?: string): { value?: string; truncated: boolean } => {
@@ -303,9 +319,10 @@ const normalizeRequestBodyPreset = (value: unknown): AiRequestBodyPreset | undef
   return { id, name, body }
 }
 
-const normalizeRequestBodyPresetConfig = (value: unknown): {
+const normalizeRequestBodyPresetConfig = (value: unknown, strict = false): {
   presets: AiRequestBodyPreset[]
   defaultPresetId?: string
+  editAgentPresetId?: string | null
 } | undefined => {
   if (!isRecord(value) || !Array.isArray(value.presets)) return undefined
   if (!value.presets.length || value.presets.length > MAX_REQUEST_BODY_PRESETS) return undefined
@@ -321,9 +338,20 @@ const normalizeRequestBodyPresetConfig = (value: unknown): {
   }
   const defaultPresetId = value.defaultPresetId
   if (defaultPresetId !== undefined && (typeof defaultPresetId !== 'string' || !ids.has(defaultPresetId))) return undefined
+  const configuredEditAgentPresetId = value.editAgentPresetId
+  let editAgentPresetId: string | null | undefined
+  if (configuredEditAgentPresetId === null) editAgentPresetId = null
+  else if (configuredEditAgentPresetId !== undefined) {
+    if (typeof configuredEditAgentPresetId !== 'string' || !ids.has(configuredEditAgentPresetId)) {
+      if (strict) throw new Error('The edit Agent preset must be empty, null, or reference a configured request body preset.')
+    } else {
+      editAgentPresetId = configuredEditAgentPresetId
+    }
+  }
   return {
     presets,
-    ...(defaultPresetId !== undefined ? { defaultPresetId } : {})
+    ...(defaultPresetId !== undefined ? { defaultPresetId } : {}),
+    ...(editAgentPresetId !== undefined ? { editAgentPresetId } : {})
   }
 }
 
@@ -396,7 +424,7 @@ const normalizeModelCapabilities = (value: unknown, strict = false): AiModelProf
   const reasoningTag = value.reasoningTag
   const replayReasoning = value.replayReasoning
   const normalizedRequestBodyPresets = requestBodyPresets !== undefined
-    ? normalizeRequestBodyPresetConfig(requestBodyPresets)
+    ? normalizeRequestBodyPresetConfig(requestBodyPresets, strict)
     : legacyReasoningEffort !== undefined
       ? migrateLegacyReasoningEffort(legacyReasoningEffort)
       : undefined
@@ -465,17 +493,18 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
     const connections = value.connections
       .map((connection, index) => normalizeStoredConnection(connection, index))
       .filter((connection): connection is StoredConnection => !!connection)
+    const settings: StoredSettings = {
+      schemaVersion: SETTINGS_SCHEMA_VERSION,
+      connections,
+      defaultModel: normalizeModelRef(value.defaultModel),
+      editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
+      editAgentMaxSteps: normalizeEditAgentMaxSteps(value.editAgentMaxSteps),
+      failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter),
+      contextMode: normalizeContextMode(value.contextMode)
+    }
     return {
-      settings: {
-        schemaVersion: SETTINGS_SCHEMA_VERSION,
-        connections,
-        defaultModel: normalizeModelRef(value.defaultModel),
-        editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
-        editAgentMaxSteps: normalizeEditAgentMaxSteps(value.editAgentMaxSteps),
-        failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter),
-        contextMode: normalizeContextMode(value.contextMode)
-      },
-      legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION
+      settings,
+      legacy: value.schemaVersion !== SETTINGS_SCHEMA_VERSION || JSON.stringify(value) !== JSON.stringify(settings)
     }
   }
 
@@ -573,6 +602,14 @@ const resolveRequestBodyPreset = (model: AiModelProfile, override: string | null
   return preset
 }
 
+const resolveEditAgentPreset = (model: AiModelProfile, inherited: AiRequestBodyPreset | undefined): AiRequestBodyPreset | undefined => {
+  const config = model.capabilities?.requestBodyPresets
+  const editAgentPresetId = config?.editAgentPresetId
+  if (editAgentPresetId === undefined) return inherited
+  if (editAgentPresetId === null) return undefined
+  return config?.presets.find(preset => preset.id === editAgentPresetId)
+}
+
 const normalizeMessageModel = (value: unknown): AiMessageModel | undefined => {
   if (!isRecord(value)) return undefined
   if (
@@ -652,7 +689,7 @@ const normalizeProgress = (value: unknown): AiChatMessage['progress'] | undefine
     totalOutputTokens: typeof value.totalOutputTokens === 'number' ? value.totalOutputTokens : undefined,
     totalCachedInputTokens: typeof value.totalCachedInputTokens === 'number' ? value.totalCachedInputTokens : undefined,
     totalCacheWriteInputTokens: typeof value.totalCacheWriteInputTokens === 'number' ? value.totalCacheWriteInputTokens : undefined,
-    failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'scope' || value.failureReason === 'truncated' || value.failureReason === 'provider' || value.failureReason === 'capability' || value.failureReason === 'unknown'
+    failureReason: value.failureReason === 'format' || value.failureReason === 'exact-match' || value.failureReason === 'scope' || value.failureReason === 'truncated' || value.failureReason === 'missing-tool-call' || value.failureReason === 'provider' || value.failureReason === 'capability' || value.failureReason === 'unknown'
       ? value.failureReason
       : undefined
   }
@@ -1359,9 +1396,11 @@ export class AiService {
           payload = null
         }
         if (!response.ok) {
-          const providerMessage = isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === 'string'
-            ? payload.error.message
+          const providerError = isRecord(payload) && isRecord(payload.error) ? payload.error : undefined
+          const providerMessage = providerError && typeof providerError.message === 'string'
+            ? providerError.message
             : `Provider returned HTTP ${response.status}.`
+          const providerParam = providerError && typeof providerError.param === 'string' ? providerError.param : undefined
           const explicitlyRejectedStream = /\bstream(?:_options)?\b/i.test(providerMessage)
           const unsupportedStreamStatus = streaming && explicitlyRejectedStream && [400, 404, 405, 415, 422].includes(response.status)
           const hasStreamOptions = Object.prototype.hasOwnProperty.call(body, 'stream_options')
@@ -1381,7 +1420,13 @@ export class AiService {
           const attachmentHint = messages.some(message => !!message.images?.length)
             ? ' The configured model or endpoint may not support image input.'
             : ''
-          throw new ProviderRequestError(`Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`, response.status, !!options.tools?.length)
+          throw new ProviderRequestError(
+            `Provider returned HTTP ${response.status} from ${requestEndpoint}. ${providerMessage}${attachmentHint}`,
+            response.status,
+            !!options.tools?.length,
+            providerMessage,
+            providerParam
+          )
         }
         const extracted = extractResponseContent(payload, settings.protocol, compatibility)
         const content = extracted.content
@@ -1721,6 +1766,16 @@ export class AiService {
       target.model.model,
       request.requestId
     )
+    const editTarget: ResolvedModelTarget = {
+      ...target,
+      requestBodyPreset: resolveEditAgentPreset(target.model, target.requestBodyPreset)
+    }
+    requestBodyPresetLog(
+      'resolved edit agent presetId=%s model=%s requestId=%s',
+      editTarget.requestBodyPreset?.id ?? 'not-applied',
+      target.model.model,
+      request.requestId
+    )
     const settings = target.connection
     const currentAttachments = await this.saveRequestAttachments(request.attachments, request.documentId)
     const priorityAttachmentIds = new Set(currentAttachments.map(attachment => attachment.id))
@@ -1882,7 +1937,7 @@ export class AiService {
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         emitProgress('attachment-extracting', attempt, { streaming: false })
         const result = await this.requestProvider(
-          target,
+          editTarget,
           buildAttachmentSourceBriefSystemPrompt(delimiter),
           extractionMessages,
           request.requestId,
@@ -2103,50 +2158,52 @@ export class AiService {
           const invoke = async(transport: AgentTransportMode): Promise<ProviderResponse> => {
             if (transport === 'json-envelope') {
               const jsonSystem = `${system}\nThe native tool transport is unavailable. Return exactly one JSON object matching this schema, with no Markdown fence, explanation, or extra text:\n${JSON.stringify(agentRequest.tools[0]?.parameters ?? {})}`
-              return this.requestProvider(target, jsonSystem, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
+              return this.requestProvider(editTarget, jsonSystem, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
             }
-            return this.requestProvider(target, system, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
+            return this.requestProvider(editTarget, system, messages, agentRequest.requestId, agentRequest.signal, providerOptions(transport))
           }
           let transport = cachedTransport ?? 'native-strict'
-          const unsupportedTransport = (error: unknown): boolean =>
-            error instanceof ProviderRequestError && [400, 404, 422].includes(error.status)
+          let fallbackUsed = false
           const invokeWithFallback = async(start: AgentTransportMode): Promise<{ transport: AgentTransportMode, response: ProviderResponse }> => {
             try {
               return { transport: start, response: await invoke(start) }
             } catch (error) {
-              if (start === 'native-strict' && unsupportedTransport(error)) {
+              const rejection = classifyAgentTransportRejection(error)
+              if (start === 'native-strict' && rejection) {
                 featureLog('edit agent transport downgrade strict->compatible requestId=%s', request.requestId)
                 try {
-                  return { transport: 'native-compatible', response: await invoke('native-compatible') }
+                  const response = await invoke('native-compatible')
+                  fallbackUsed = true
+                  return { transport: 'native-compatible', response }
                 } catch (compatibleError) {
-                  if (!unsupportedTransport(compatibleError)) throw compatibleError
+                  if (!classifyAgentTransportRejection(compatibleError)) throw compatibleError
                   featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
-                  return { transport: 'json-envelope', response: await invoke('json-envelope') }
+                  const response = await invoke('json-envelope')
+                  fallbackUsed = true
+                  return { transport: 'json-envelope', response }
                 }
               }
-              if (start === 'native-compatible' && unsupportedTransport(error)) {
+              if (start === 'native-compatible' && rejection) {
                 featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
-                return { transport: 'json-envelope', response: await invoke('json-envelope') }
+                const response = await invoke('json-envelope')
+                fallbackUsed = true
+                return { transport: 'json-envelope', response }
               }
               throw error
             }
           }
           const invoked = await invokeWithFallback(transport)
           transport = invoked.transport
-          let generated = invoked.response
+          const generated = invoked.response
           rememberProviderResponse(generated)
           let toolCalls = generated.toolCalls ?? []
-          if ((transport === 'native-strict' || transport === 'native-compatible') && (!toolCalls.length || generated.truncated)) {
-            transport = 'json-envelope'
-            const jsonGenerated = await invoke(transport)
-            rememberProviderResponse(jsonGenerated)
-            generated = jsonGenerated
-            toolCalls = generated.toolCalls ?? []
-          }
           if (transport === 'json-envelope' && !toolCalls.length) {
             toolCalls = parseStrictAgentEnvelope(generated.content, expectedTool)
           }
-          this.toolCapabilities.set(capabilityKey, transport)
+          if (fallbackUsed && toolCalls.length && !generated.truncated) {
+            this.toolCapabilities.set(capabilityKey, transport)
+            featureLog('edit agent transport cached transport=%s requestId=%s', transport, request.requestId)
+          }
           featureLog(
             'edit agent response phase=%s transport=%s returnedTools=%s returnedNames=%s finishReason=%s truncated=%s reasoningChars=%s inputTokens=%s outputTokens=%s totalInputTokens=%s totalOutputTokens=%s totalCachedInputTokens=%s requestId=%s',
             agentRequest.phase,
@@ -2186,7 +2243,7 @@ export class AiService {
             request.requestId
           )
           const generated = await this.requestProvider(
-            target,
+            editTarget,
             agentRequest.system,
             messages,
             agentRequest.requestId,
@@ -2257,9 +2314,11 @@ export class AiService {
               ? 'exact-match'
               : diagnostic.code === 'truncated'
                 ? 'truncated'
-                : diagnostic.code === 'capability'
-                  ? 'capability'
-                  : 'format'
+                : diagnostic.code === 'missing-tool-call'
+                  ? 'missing-tool-call'
+                  : diagnostic.code === 'capability'
+                    ? 'capability'
+                    : 'format'
           emitProgress('attempt-failed', diagnostic.attempt, { failureReason, failureCount, toolFailures: failureCount, streaming: false })
           featureLog(
             'edit agent validation failure attempt=%s code=%s error=%s responseChars=%s responseLines=%s summaryMarkers=%s searchMarkers=%s dividerMarkers=%s replaceMarkers=%s requestId=%s',
@@ -2324,9 +2383,7 @@ export class AiService {
       }
     } catch (error) {
       const cancelled = error instanceof Error && /cancelled|canceled/i.test(error.message)
-      if (!cancelled && /does not support Agent precise editing tools/i.test(error instanceof Error ? error.message : String(error))) {
-        lastFailureReason = 'capability'
-      }
+      if (!cancelled && classifyAgentTransportRejection(error)) lastFailureReason = 'capability'
       const exposeFailureOutput = !cancelled &&
         state.settings.failureOutputAfter > 0 &&
         failureCount >= state.settings.failureOutputAfter &&
