@@ -973,6 +973,7 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
   let version = 0
   let successfulSteps = 0
   let failures = 0
+  let consecutiveToolResponseFailures = 0
   let initialPlanFailures = 0
   let revisionFailures = 0
   let planRevisionCount = 0
@@ -1173,12 +1174,7 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      if (successfulSteps > 0 && !/does not support Agent precise editing tools/i.test(message)) {
-        return makePartialResult(message, turn)
-      }
-      if (!planSteps && request.generateWhole && /does not support Agent precise editing tools/i.test(message)) {
-        return runWholeFallback(message, turn + 1)
-      }
+      if (successfulSteps > 0) return makePartialResult(message, turn)
       throw error
     }
     lastReasoning = generated.reasoning ?? lastReasoning
@@ -1202,11 +1198,15 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
       if (phase === 'needs-revision') {
         revisionFailures += 1
       }
+      if (generated.truncated || calls.length === 0) consecutiveToolResponseFailures += 1
+      else consecutiveToolResponseFailures = 0
       request.onValidationFailure?.({
         attempt: turn,
-        code: calls.length === 0
-          ? 'capability'
-          : /anchor|scope/i.test(error) ? 'scope' : /SEARCH|version|match|unique/i.test(error) ? 'exact-match' : 'contract',
+        code: generated.truncated
+          ? 'truncated'
+          : calls.length === 0
+            ? 'missing-tool-call'
+            : /anchor|scope/i.test(error) ? 'scope' : /SEARCH|version|match|unique/i.test(error) ? 'exact-match' : 'contract',
         error: effectiveError,
         responseChars: (generated.rawContent || generated.content).length,
         responseLines: (generated.rawContent || generated.content).replaceAll('\r\n', '\n').split('\n').length,
@@ -1225,10 +1225,13 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
       failTurn(calls[0], calls.length === 0
         ? `The provider returned no editing tool call. Call ${tools[0].name}.`
         : 'Exactly one editing tool call is allowed per turn.')
-      if (calls.length === 0 && failures >= 2) {
-        if (!planSteps && request.generateWhole) return runWholeFallback('The provider returned no usable editing tool call.', turn + 1)
-        if (successfulSteps > 0) return makePartialResult('The provider returned no usable editing tool call.', turn)
-        throw new Error(`The selected model or gateway does not support Agent precise editing tools; the AI edit could not be validated after ${turn} attempts.`)
+      if ((generated.truncated || calls.length === 0) && consecutiveToolResponseFailures >= 2) {
+        const reason = generated.truncated
+          ? 'The provider response was truncated before a complete editing tool call.'
+          : 'The provider returned no usable editing tool call.'
+        if (!planSteps && request.generateWhole) return runWholeFallback(reason, turn + 1)
+        if (successfulSteps > 0) return makePartialResult(reason, turn)
+        throw new Error(`The AI edit agent did not receive the required editing tool call after ${turn} attempts. ${reason}`)
       }
     } else {
       const call = calls[0]
@@ -1256,6 +1259,7 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
             acceptedPlanFingerprint = planFingerprint(parsedPlan)
             lastFailure = undefined
             repeatedFailureCount = 0
+            consecutiveToolResponseFailures = 0
             request.onAgentPlan?.(planSummary, planSteps, planRevisionCount, successfulSteps)
           } catch (error) {
             failTurn(call, error instanceof Error ? error.message : String(error))
@@ -1286,6 +1290,7 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
             planRevisionRequired = false
             lastFailure = undefined
             repeatedFailureCount = 0
+            consecutiveToolResponseFailures = 0
             request.onAgentPlan?.(planSummary, planSteps, planRevisionCount, successfulSteps)
           } catch (error) {
             failTurn(call, error instanceof Error ? error.message : String(error))
@@ -1346,6 +1351,7 @@ const runDocumentAgent = async(request: DocumentEditAgentRequest): Promise<Docum
             revisionFailures = 0
             lastFailure = undefined
             repeatedFailureCount = 0
+            consecutiveToolResponseFailures = 0
             ranges.splice(0, ranges.length, ...rebased)
             request.onAgentStep?.(
               successfulSteps,

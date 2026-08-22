@@ -224,10 +224,24 @@ reasoning-only, or truncated output and aborts before any document change if it
 still fails.
 
 Native Agent calls use a named tool choice, strict schemas, and
-`parallel_tool_calls: false` when supported. A 400/404/422 compatibility error
-downgrades to a non-strict native request, then to a strict JSON envelope. The
-JSON fallback accepts only a complete JSON object and never extracts fragments
-from prose or fences. The selected transport is cached per provider/model.
+`parallel_tool_calls: false` when supported. Only a 400/404/422 error that
+explicitly identifies tools, `tool_choice`, strict/function schemas, or
+`parallel_tool_calls` can trigger a downgrade to a non-strict native request
+and then to a JSON envelope. Parameter errors unrelated to the tool transport
+are returned once. A successful HTTP response with a missing or truncated tool
+call stays on the current transport; it is retried by the Agent state machine
+and never poisons the transport cache. The JSON fallback accepts only a
+complete JSON object and never extracts fragments from prose or fences. A
+transport is cached only after an explicit protocol rejection and a usable
+fallback response.
+
+Model request JSON presets are user-authored and are applied after the
+application constructs the protocol body. The normal model/session preset is
+used by answer and rewrite requests. The model's optional edit-Agent preset
+independently controls attachment extraction, planning, revisions, edit steps,
+and whole-document fallback; omitted means inherit, `null` means no extra JSON,
+and a string selects a named preset. Hidden context summaries never apply a
+preset.
 
 Agent checkpoint logs use the `[ai-editor]` prefix and record only phase,
 transport, allowed tool, document version, plan/step counts, checkpoint and

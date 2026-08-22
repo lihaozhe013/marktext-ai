@@ -3,6 +3,7 @@ export type AiOutputFailureCode =
   | 'exact-match'
   | 'markdown-compatibility'
   | 'truncated'
+  | 'missing-tool-call'
   | 'capability'
   | 'transport'
   | 'scope'

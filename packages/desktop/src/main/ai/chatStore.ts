@@ -37,6 +37,9 @@ export class AiChatStore {
       all[documentId] = {
         messages: normalized.messages,
         selectedModel: this.dependencies.normalizeModel(normalized.selectedModel),
+        ...(normalized.requestBodyPresetOverrides?.length
+          ? { requestBodyPresetOverrides: normalized.requestBodyPresetOverrides }
+          : {}),
         ...(normalized.contextSummary
           ? { contextSummary: normalized.contextSummary }
           : {})

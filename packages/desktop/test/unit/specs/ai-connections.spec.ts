@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'fs/promises'
 import os from 'os'
 import path from 'path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { AiConnectionInput, AiRequest } from '@shared/types/ai'
+import type { AiConnectionInput, AiJsonValue, AiRequest } from '@shared/types/ai'
 
 vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
@@ -113,6 +113,592 @@ describe('AI connection profiles and model routing', () => {
     expect((await service.setContextMode(undefined)).contextMode).toBe('recent')
   })
 
+  it('persists and validates user-defined request body presets', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-settings-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+
+    const saved = await service.saveConnection({
+      name: 'Custom request presets',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://custom.example/v1',
+      models: [{
+        model: 'arbitrary-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [
+              { id: 'enabled', name: 'Enabled', body: { thinking: { type: ' enabled ' } } },
+              { id: 'disabled', name: 'Disabled', body: { thinking: { type: 'disabled' } } }
+            ],
+            defaultPresetId: 'enabled',
+            editAgentPresetId: 'disabled'
+          }
+        }
+      }],
+      apiKey: 'custom-key'
+    })
+    expect(saved.connections[0].models[0].capabilities).toEqual({
+      requestBodyPresets: {
+        presets: [
+          { id: 'enabled', name: 'Enabled', body: { thinking: { type: ' enabled ' } } },
+          { id: 'disabled', name: 'Disabled', body: { thinking: { type: 'disabled' } } }
+        ],
+        defaultPresetId: 'enabled',
+        editAgentPresetId: 'disabled'
+      }
+    })
+
+    await expect(service.saveConnection({
+      name: 'Invalid presets',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://invalid.example/v1',
+      models: [{ model: 'arbitrary-model', capabilities: { requestBodyPresets: { presets: [] } } }],
+      apiKey: 'invalid-key'
+    })).rejects.toThrow('Invalid request body preset configuration')
+    await expect(service.saveConnection({
+      name: 'Invalid edit preset reference',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://invalid-edit-preset.example/v1',
+      models: [{
+        model: 'arbitrary-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'only', name: 'Only', body: { thinking: { type: 'enabled' } } }],
+            editAgentPresetId: 'missing'
+          }
+        }
+      }],
+      apiKey: 'invalid-key'
+    })).rejects.toThrow('edit Agent preset')
+  })
+
+  it('migrates legacy reasoning_effort profiles and session overrides', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-migration-'))
+    directories.push(directory)
+    await writeFile(path.join(directory, 'ai-connection.json'), JSON.stringify({
+      schemaVersion: 6,
+      connections: [{
+        id: 'legacy-connection',
+        name: 'Legacy',
+        protocol: 'openai-chat-completions',
+        endpoint: 'https://legacy.example/v1',
+        models: [{
+          id: 'legacy-model',
+          model: 'legacy-model',
+          label: 'Legacy model',
+          capabilities: { reasoningEffort: { options: ['low', 'high'], defaultValue: 'high' } }
+        }]
+      }],
+      editAutoRetryCount: 1,
+      editAgentMaxSteps: 64,
+      failureOutputAfter: 1,
+      contextMode: 'recent'
+    }))
+    await writeFile(path.join(directory, 'ai-chat.json'), JSON.stringify({
+      'tab:legacy': {
+        messages: [],
+        reasoningEffortOverrides: [{
+          modelRef: { connectionId: 'legacy-connection', modelId: 'legacy-model' },
+          value: 'low'
+        }]
+      }
+    }))
+    const service = new AiService(directory)
+
+    const settings = await service.getSettings()
+    const capabilities = settings.connections[0].models[0].capabilities
+    expect(capabilities?.requestBodyPresets?.defaultPresetId).toBe('legacy-reasoning-effort:high')
+    expect(capabilities?.requestBodyPresets?.presets).toEqual([
+      { id: 'legacy-reasoning-effort:low', name: 'low', body: { reasoning_effort: 'low' } },
+      { id: 'legacy-reasoning-effort:high', name: 'high', body: { reasoning_effort: 'high' } }
+    ])
+    expect(JSON.parse(await readFile(path.join(directory, 'ai-connection.json'), 'utf8')).schemaVersion).toBe(8)
+    expect((await service.loadChat('tab:legacy')).requestBodyPresetOverrides).toEqual([{
+      modelRef: { connectionId: 'legacy-connection', modelId: 'legacy-model' },
+      presetId: 'legacy-reasoning-effort:low'
+    }])
+  })
+
+  it('clears a broken persisted edit Agent preset reference', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-broken-edit-preset-'))
+    directories.push(directory)
+    await writeFile(path.join(directory, 'ai-connection.json'), JSON.stringify({
+      schemaVersion: 8,
+      connections: [{
+        id: 'broken-connection',
+        name: 'Broken preset',
+        protocol: 'openai-chat-completions',
+        endpoint: 'https://broken-preset.example/v1',
+        models: [{
+          id: 'broken-model',
+          model: 'broken-model',
+          label: 'Broken model',
+          source: 'manual',
+          capabilities: {
+            requestBodyPresets: {
+              presets: [{ id: 'valid', name: 'Valid', body: { thinking: { type: 'enabled' } } }],
+              defaultPresetId: 'valid',
+              editAgentPresetId: 'deleted'
+            }
+          }
+        }]
+      }],
+      defaultModel: { connectionId: 'broken-connection', modelId: 'broken-model' },
+      editAutoRetryCount: 1,
+      editAgentMaxSteps: 64,
+      failureOutputAfter: 1,
+      contextMode: 'recent'
+    }))
+    const service = new AiService(directory)
+
+    const settings = await service.getSettings()
+    expect(settings.connections[0].models[0].capabilities?.requestBodyPresets).toEqual({
+      presets: [{ id: 'valid', name: 'Valid', body: { thinking: { type: 'enabled' } } }],
+      defaultPresetId: 'valid'
+    })
+    expect(JSON.parse(await readFile(path.join(directory, 'ai-connection.json'), 'utf8')).connections[0].models[0].capabilities.requestBodyPresets.editAgentPresetId).toBeUndefined()
+  })
+
+  it('rejects oversized, deeply nested, and prototype-polluting preset JSON', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-validation-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const save = (body: Record<string, AiJsonValue>) => service.saveConnection({
+      name: 'Invalid preset',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://invalid.example/v1',
+      models: [{
+        model: 'invalid-model',
+        capabilities: { requestBodyPresets: { presets: [{ id: 'invalid', name: 'Invalid', body }] } }
+      }],
+      apiKey: 'invalid-key'
+    })
+
+    await expect(save({ value: 'x'.repeat(17 * 1024) })).rejects.toThrow('Invalid request body preset configuration')
+    let nested: Record<string, AiJsonValue> = { value: true }
+    for (let index = 0; index < 9; index += 1) nested = { nested }
+    await expect(save(nested)).rejects.toThrow('Invalid request body preset configuration')
+    await expect(save(JSON.parse('{"__proto__":{"polluted":true}}') as Record<string, AiJsonValue>)).rejects.toThrow('Invalid request body preset configuration')
+  })
+
+  it('sends the configured default, session preset override, and explicit omission', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-request-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Custom request presets',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://custom.example/v1',
+      models: [{
+        model: 'arbitrary-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [
+              { id: 'low', name: 'Low', body: { reasoning_effort: 'low' } },
+              { id: 'high', name: 'High', body: { reasoning_effort: 'high' } }
+            ],
+            defaultPresetId: 'low'
+          }
+        }
+      }],
+      apiKey: 'custom-key'
+    })
+    const fetchMock = vi.fn()
+      .mockResolvedValue(response({ choices: [{ message: { content: 'answer' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const request = (requestId: string, requestBodyPresetOverride?: string | null): AiRequest => ({
+      requestId,
+      documentId: `tab:${requestId}`,
+      mode: 'answer',
+      prompt: 'Explain this.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id },
+      ...(requestBodyPresetOverride !== undefined ? { requestBodyPresetOverride } : {})
+    })
+
+    await service.request(request('preset-default'))
+    await service.request(request('preset-override', 'high'))
+    await service.request(request('preset-omit', null))
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).reasoning_effort).toBe('low')
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).reasoning_effort).toBe('high')
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body as string)).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('merges nested preset JSON and lets user fields override generated fields', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-merge-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Nested presets',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://nested.example/v1',
+      models: [{
+        model: 'generated-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{
+              id: 'mimo-enabled',
+              name: 'Mimo enabled',
+              body: {
+                model: 'user-model',
+                thinking: { type: 'enabled', budget: { mode: 'deep' } },
+                messages: [{ role: 'user', content: 'user message' }],
+                stream: false,
+                stream_options: { extra: true },
+                array: [1, 2],
+                nullable: null
+              }
+            }],
+            defaultPresetId: 'mimo-enabled'
+          }
+        }
+      }],
+      apiKey: 'nested-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({ choices: [{ message: { content: 'answer' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await service.request({
+      requestId: 'preset-merge',
+      documentId: 'tab:preset-merge',
+      mode: 'answer',
+      prompt: 'Explain this.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.model).toBe('user-model')
+    expect(body.thinking).toEqual({ type: 'enabled', budget: { mode: 'deep' } })
+    expect(body.messages).toEqual([{ role: 'user', content: 'user message' }])
+    expect(body.stream).toBe(false)
+    expect(body.stream_options).toEqual({ include_usage: true, extra: true })
+    expect(body.array).toEqual([1, 2])
+    expect(body.nullable).toBeNull()
+  })
+
+  it('uses the final preset stream value for response parsing', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-stream-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Non-stream preset',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://stream-preset.example/v1',
+      models: [{
+        model: 'stream-preset-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'json', name: 'JSON response', body: { stream: false } }],
+            defaultPresetId: 'json'
+          }
+        }
+      }],
+      apiKey: 'stream-preset-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({ choices: [{ message: { content: 'parsed answer' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'preset-stream',
+      documentId: 'tab:preset-stream',
+      mode: 'answer',
+      prompt: 'Answer.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.content).toBe('parsed answer')
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    expect(body.stream).toBe(false)
+    expect(body).not.toHaveProperty('stream_options')
+  })
+
+  it('does not send request body presets to the hidden context summary request', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-summary-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Summary presets',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://summary.example/v1',
+      models: [{
+        model: 'arbitrary-summary-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'high', name: 'High', body: { reasoning_effort: 'high' } }],
+            defaultPresetId: 'high'
+          }
+        }
+      }],
+      apiKey: 'summary-key'
+    })
+    await service.setContextMode('summary')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Answer' }, finish_reason: 'stop' }] }))
+      .mockResolvedValueOnce(response({ choices: [{ message: { content: 'Memory' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await service.request({
+      requestId: 'preset-summary',
+      documentId: 'tab:preset-summary',
+      mode: 'answer',
+      prompt: 'Answer.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).reasoning_effort).toBe('high')
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string)).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('returns a custom request body rejection without retrying', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-rejection-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Rejecting preset',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://reject.example/v1',
+      models: [{
+        model: 'arbitrary-reject-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'custom', name: 'Custom', body: { thinking: { type: 'enabled' } } }],
+            defaultPresetId: 'custom'
+          }
+        }
+      }],
+      apiKey: 'reject-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({ error: { message: 'thinking.type is unsupported' } }, 400))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(service.request({
+      requestId: 'preset-rejection',
+      documentId: 'tab:preset-rejection',
+      mode: 'answer',
+      prompt: 'Answer.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })).rejects.toThrow('thinking.type is unsupported')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses the model default request preset for connection tests', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-test-connection-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const fetchMock = vi.fn().mockResolvedValue(response({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.testConnection({
+      name: 'Test preset',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://test-preset.example/v1',
+      models: [{
+        model: 'test-preset-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'enabled', name: 'Enabled', body: { thinking: { type: 'enabled' } } }],
+            defaultPresetId: 'enabled'
+          }
+        }
+      }],
+      apiKey: 'test-preset-key'
+    })
+
+    expect(result.ok).toBe(true)
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).thinking).toEqual({ type: 'enabled' })
+  })
+
+  it('uses the edit Agent preset for every foreground edit turn', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-edit-agent-preset-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const presetConfig = {
+      presets: [
+        { id: 'enabled', name: 'Thinking enabled', body: { thinking: { type: 'enabled' } } },
+        { id: 'disabled', name: 'Thinking disabled', body: { thinking: { type: 'disabled' } } }
+      ],
+      defaultPresetId: 'enabled' as const,
+      editAgentPresetId: 'disabled' as const
+    }
+    const saved = await service.saveConnection({
+      name: 'Edit Agent presets',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://edit-agent-preset.example/v1',
+      models: [{ model: 'edit-preset-model', capabilities: { requestBodyPresets: presetConfig } }],
+      apiKey: 'edit-preset-key'
+    })
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      const toolName = (body.tools as Array<{ function?: { name?: string } }> | undefined)?.[0]?.function?.name
+      const input = toolName === 'create_markdown_edit_plan'
+        ? { summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }
+        : { markdown: 'Notes', description: 'Appended notes.' }
+      return response({ choices: [{ message: { tool_calls: [{ id: `call-${fetchMock.mock.calls.length}`, type: 'function', function: { name: toolName, arguments: JSON.stringify(input) } }] }, finish_reason: 'tool_calls' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const modelRef = { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    const result = await service.request({
+      requestId: 'edit-agent-preset-request',
+      documentId: 'tab:edit-agent-preset',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls.map(call => JSON.parse(String(call[1].body)).thinking)).toEqual([
+      { type: 'disabled' },
+      { type: 'disabled' }
+    ])
+
+    await service.saveConnection({
+      id: saved.connections[0].id,
+      name: 'Edit Agent presets inherited',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://edit-agent-preset.example/v1',
+      models: [{
+        id: saved.connections[0].models[0].id,
+        model: 'edit-preset-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: presetConfig.presets,
+            defaultPresetId: 'enabled'
+          }
+        }
+      }]
+    })
+    fetchMock.mockClear()
+    await service.request({
+      requestId: 'edit-agent-preset-inherit',
+      documentId: 'tab:edit-agent-preset-inherit',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef
+    })
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body)).thinking).toEqual({ type: 'enabled' })
+
+    await service.saveConnection({
+      id: saved.connections[0].id,
+      name: 'Edit Agent presets omitted',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://edit-agent-preset.example/v1',
+      models: [{
+        id: saved.connections[0].models[0].id,
+        model: 'edit-preset-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: presetConfig.presets,
+            defaultPresetId: 'enabled',
+            editAgentPresetId: null
+          }
+        }
+      }]
+    })
+    fetchMock.mockClear()
+    await service.request({
+      requestId: 'edit-agent-preset-omit',
+      documentId: 'tab:edit-agent-preset-omit',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef
+    })
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).not.toHaveProperty('thinking')
+  })
+
+  it('keeps a truncated native tool response on native transport', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-agent-truncated-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection(connection('Native', 'https://native-truncated.example/v1', 'native-truncated-model', 'native-key'))
+    let calls = 0
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      calls += 1
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const toolName = (body.tools as Array<{ function?: { name?: string } }> | undefined)?.[0]?.function?.name
+      if (calls === 3) return response({ choices: [{ message: { content: '' }, finish_reason: 'length' }] })
+      const input = toolName === 'create_markdown_edit_plan'
+        ? {
+          summary: 'Append notes.',
+          steps: [
+            { id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] },
+            { id: 'more', description: 'Append more notes.', intent: 'Append more notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: ['append'] }
+          ]
+        }
+        : { markdown: calls === 2 ? 'Notes' : 'More', description: calls === 2 ? 'Appended notes.' : 'Appended more notes.' }
+      return response({ choices: [{ message: { tool_calls: [{ id: `call-${calls}`, type: 'function', function: { name: toolName, arguments: JSON.stringify(input) } }] }, finish_reason: 'tool_calls' }] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'native-truncated-request',
+      documentId: 'tab:native-truncated',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes\n\nMore')
+    expect(requests).toHaveLength(4)
+    expect(requests.every(body => Array.isArray(body.tools))).toBe(true)
+    expect(requests.every(body => !JSON.stringify(body).includes('native tool transport is unavailable'))).toBe(true)
+  })
+
+  it('does not downgrade edit Agent transport for unrelated provider errors', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-agent-parameter-error-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Parameter error',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://agent-parameter-error.example/v1',
+      models: [{
+        model: 'parameter-error-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'thinking', name: 'Thinking', body: { thinking: { type: 'enabled' } } }],
+            defaultPresetId: 'thinking'
+          }
+        }
+      }],
+      apiKey: 'parameter-error-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({ error: { message: 'thinking.type is unsupported' } }, 400))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(service.request({
+      requestId: 'agent-parameter-error-request',
+      documentId: 'tab:agent-parameter-error',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })).rejects.toThrow('thinking.type is unsupported')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('exposes raw edit output before the whole-document fallback', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-failure-output-'))
     directories.push(directory)
@@ -144,7 +730,7 @@ describe('AI connection profiles and model routing', () => {
 
     expect(result.markdown).toBe('# Fallback title')
     expect(result.recovery?.requiresConfirmation).toBe(true)
-    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(progress).toContainEqual(expect.objectContaining({ phase: 'attempt-failed', failureCount: 2 }))
   })
 
@@ -309,6 +895,44 @@ describe('AI connection profiles and model routing', () => {
     expect(body).not.toHaveProperty('reasoning_effort')
     expect(body).not.toHaveProperty('thinking')
     expect(body).not.toHaveProperty('budget_tokens')
+  })
+
+  it('injects the user-configured request preset into Anthropic request bodies too', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-anthropic-request-preset-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Anthropic custom preset',
+      protocol: 'anthropic-messages',
+      endpoint: 'https://anthropic.example',
+      models: [{
+        model: 'arbitrary-anthropic-model',
+        capabilities: {
+          requestBodyPresets: {
+            presets: [{ id: 'custom', name: 'Custom', body: { thinking: { type: 'enabled' } } }],
+            defaultPresetId: 'custom'
+          }
+        }
+      }],
+      apiKey: 'anthropic-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      content: [{ type: 'text', text: 'from Anthropic' }],
+      stop_reason: 'end_turn'
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await service.request({
+      requestId: 'anthropic-preset-request',
+      documentId: 'tab:anthropic-preset',
+      mode: 'answer',
+      prompt: 'Hello',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).thinking).toEqual({ type: 'enabled' })
   })
 
   it('uses the compact output budget for Anthropic summaries', async() => {
@@ -682,10 +1306,17 @@ describe('AI connection profiles and model routing', () => {
 
     await service.saveChat('tab:test', {
       messages: loaded.messages,
-      selectedModel: { connectionId: 'connection-a', modelId: 'model-a' }
+      selectedModel: { connectionId: 'connection-a', modelId: 'model-a' },
+      requestBodyPresetOverrides: [{
+        modelRef: { connectionId: 'connection-a', modelId: 'model-a' },
+        presetId: 'preset-high'
+      }]
     })
     const stored = JSON.parse(await readFile(path.join(directory, 'ai-chat.json'), 'utf8'))
-    expect(stored['tab:test']).toMatchObject({ selectedModel: { connectionId: 'connection-a', modelId: 'model-a' } })
+    expect(stored['tab:test']).toMatchObject({
+      selectedModel: { connectionId: 'connection-a', modelId: 'model-a' },
+      requestBodyPresetOverrides: [{ modelRef: { connectionId: 'connection-a', modelId: 'model-a' }, presetId: 'preset-high' }]
+    })
   })
 
   it('uses only rolling memory in summary context mode and persists it', async() => {

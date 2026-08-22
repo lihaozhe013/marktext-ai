@@ -3,7 +3,6 @@ export type AiInteractionMode = 'answer' | 'edit' | 'rewrite'
 export type AiContextMode = 'recent' | 'summary'
 export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback' | 'partial-agent'
 export type AiModelSource = 'manual' | 'discovered'
-export type AiReasoningControl = 'unknown' | 'effort' | 'budget'
 export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_content' | 'reasoning_text'
 export type AiReasoningTag = 'think' | 'thinking' | 'analysis' | 'reasoning'
 
@@ -81,8 +80,29 @@ export type AiAttachment = AiImageAttachment | AiPdfAttachment
 export type AiAttachmentUpload = AiImageUpload | AiPdfUpload
 export type AiAttachmentData = AiImageData | AiPdfData
 
+export type AiJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | AiJsonValue[]
+  | { [key: string]: AiJsonValue }
+
+export interface AiRequestBodyPreset {
+  id: string
+  name: string
+  body: Record<string, AiJsonValue>
+}
+
+export interface AiRequestBodyPresetConfig {
+  presets: AiRequestBodyPreset[]
+  defaultPresetId?: string
+  /** undefined inherits the normal request preset; null disables presets for edit Agent requests. */
+  editAgentPresetId?: string | null
+}
+
 export interface AiModelCapabilities {
-  reasoningControl?: AiReasoningControl
+  requestBodyPresets?: AiRequestBodyPresetConfig
   reasoningField?: AiReasoningField
   reasoningTag?: AiReasoningTag
   replayReasoning?: boolean
@@ -224,7 +244,7 @@ export interface AiProgressInfo {
   totalCacheWriteInputTokens?: number
 }
 
-export type AiFailureReason = 'format' | 'exact-match' | 'scope' | 'truncated' | 'provider' | 'capability' | 'unknown'
+export type AiFailureReason = 'format' | 'exact-match' | 'scope' | 'truncated' | 'missing-tool-call' | 'provider' | 'capability' | 'unknown'
 
 export type AiLiveProgressPhase = 'waiting' | 'attachment-extracting' | 'streaming' | 'compacting' | 'validating' | 'agent-plan' | 'agent-step' | 'attempt-failed' | 'retrying' | 'fallback' | 'partial' | 'completed' | 'failed' | 'cancelled'
 
@@ -289,8 +309,14 @@ export interface AiChatMessage {
 export interface AiChatSession {
   messages: AiChatMessage[]
   selectedModel?: AiModelRef
+  requestBodyPresetOverrides?: AiRequestBodyPresetOverride[]
   /** Bounded document-scoped memory used when contextMode is summary. */
   contextSummary?: string
+}
+
+export interface AiRequestBodyPresetOverride {
+  modelRef: AiModelRef
+  presetId: string | null
 }
 
 export interface AiRequest {
@@ -302,6 +328,7 @@ export interface AiRequest {
   messages: AiChatMessage[]
   contextSummary?: string
   modelRef: AiModelRef
+  requestBodyPresetOverride?: string | null
   attachments?: AiAttachmentUpload[]
   renderedPdfPages?: AiRenderedPdfPages[]
 }

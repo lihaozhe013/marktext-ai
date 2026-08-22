@@ -734,4 +734,63 @@ describe('document edit agent', () => {
     await expect(request('existing', generate)).rejects.toThrow('truncated')
     expect(generate).toHaveBeenCalledTimes(documentEditAgentLimits.maxAttempts)
   })
+
+  it('resets consecutive missing-tool failures after a valid plan step', async() => {
+    const diagnostics: DocumentEditValidationDiagnostic[] = []
+    let calls = 0
+    const generateAgent = vi.fn(async(_input: DocumentAgentGenerateRequest) => {
+      calls += 1
+      if (calls === 1) {
+        return {
+          content: '',
+          toolCalls: [{
+            id: 'plan',
+            name: 'create_markdown_edit_plan',
+            input: {
+              summary: 'Append notes.',
+              steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }]
+            }
+          }]
+        }
+      }
+      if (calls === 2) return { content: '', truncated: true }
+      return {
+        content: '',
+        toolCalls: [{ id: 'append', name: 'append_markdown', input: { markdown: 'Notes', description: 'Appended notes.' } }]
+      }
+    })
+
+    const result = await runDocumentEditAgent({
+      markdown: 'Existing',
+      instruction: 'Append notes.',
+      contextMessages: [],
+      requestId: 'truncated-then-success',
+      signal: new AbortController().signal,
+      generateAgent,
+      onValidationFailure: diagnostic => diagnostics.push(diagnostic)
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(generateAgent).toHaveBeenCalledTimes(3)
+    expect(diagnostics).toHaveLength(1)
+    expect(diagnostics[0].code).toBe('truncated')
+  })
+
+  it('waits for two consecutive missing tool calls before failing', async() => {
+    const diagnostics: DocumentEditValidationDiagnostic[] = []
+    const generateAgent = vi.fn(async(_input: DocumentAgentGenerateRequest) => ({ content: '', toolCalls: [] }))
+
+    await expect(runDocumentEditAgent({
+      markdown: 'Existing',
+      instruction: 'Append notes.',
+      contextMessages: [],
+      requestId: 'missing-tool-call',
+      signal: new AbortController().signal,
+      generateAgent,
+      onValidationFailure: diagnostic => diagnostics.push(diagnostic)
+    })).rejects.toThrow('required editing tool call')
+
+    expect(generateAgent).toHaveBeenCalledTimes(2)
+    expect(diagnostics.map(diagnostic => diagnostic.code)).toEqual(['missing-tool-call', 'missing-tool-call'])
+  })
 })
