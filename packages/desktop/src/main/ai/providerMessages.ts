@@ -284,3 +284,59 @@ export const serializeProviderMessages = (
     ...reasoning
   }]
 })
+
+const toResponsesImage = (image: ProviderImage): Record<string, unknown> => ({
+  type: 'input_image',
+  image_url: toImageDataUrl(image),
+  detail: 'auto'
+})
+
+/**
+ * Responses treats messages, function calls, and function outputs as
+ * separate input items. Keep this serializer independent from the legacy
+ * message serializers so the legacy wire shapes remain unchanged.
+ */
+export const serializeResponsesInput = (messages: ProviderMessage[]): Array<Record<string, unknown>> => messages.flatMap(message => {
+  const content = message.attachmentContext
+    ? `${message.attachmentContext}\n\n${message.content}`
+    : message.content
+  const images = message.images ?? []
+  const items: Array<Record<string, unknown>> = []
+
+  if (message.role === 'assistant' && message.toolCalls?.length) {
+    for (const call of message.toolCalls) {
+      items.push({
+        type: 'function_call',
+        call_id: call.id,
+        name: call.name,
+        arguments: call.rawInput ?? JSON.stringify(call.input ?? {})
+      })
+    }
+  }
+
+  if (message.toolResults?.length) {
+    for (const result of message.toolResults) {
+      items.push({
+        type: 'function_call_output',
+        call_id: result.toolCallId,
+        output: result.content
+      })
+    }
+  }
+
+  if (content || images.length) {
+    if (!images.length) {
+      items.push({ role: message.role, content })
+    } else {
+      items.push({
+        role: message.role,
+        content: [
+          ...images.map(toResponsesImage),
+          ...(content ? [{ type: 'input_text', text: content }] : [])
+        ]
+      })
+    }
+  }
+
+  return items
+})

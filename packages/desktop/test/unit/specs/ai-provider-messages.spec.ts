@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { preciseEditTool, preciseEditTools, serializeProviderMessages } from 'main_renderer/ai/providerMessages'
+import { preciseEditTool, preciseEditTools, serializeProviderMessages, serializeResponsesInput } from 'main_renderer/ai/providerMessages'
 
 describe('AI provider image message serialization', () => {
   const messages = [
@@ -115,6 +115,36 @@ describe('AI provider image message serialization', () => {
     }])).toMatchObject([{
       content: [{ type: 'image' }, { type: 'text', text: 'Read these PDF pages.' }]
     }])
+  })
+
+  it('serializes Responses text, images, and function items', () => {
+    expect(serializeResponsesInput([
+      {
+        role: 'user',
+        content: 'Read this.',
+        images: [{ mimeType: 'image/png', data: 'aGVsbG8=' }]
+      },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'call-1', name: 'apply_markdown_edit', input: { search: 'old' }, rawInput: '{"search":"old"}' }]
+      },
+      {
+        role: 'user',
+        content: '',
+        toolResults: [{ toolCallId: 'call-1', content: '{"ok":true}' }]
+      }
+    ])).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=', detail: 'auto' },
+          { type: 'input_text', text: 'Read this.' }
+        ]
+      },
+      { type: 'function_call', call_id: 'call-1', name: 'apply_markdown_edit', arguments: '{"search":"old"}' },
+      { type: 'function_call_output', call_id: 'call-1', output: '{"ok":true}' }
+    ])
   })
 
   it('places rendered PDF context before the user text', () => {

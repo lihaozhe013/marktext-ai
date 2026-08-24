@@ -54,8 +54,11 @@ renderer AI panel/store, and `packages/desktop/src/shared/types/ai.ts`:
 - The three modes are `answer`, `edit`, and `rewrite`. Networking, API-key
   access, attachment storage, provider adaptation, validation, and revisions
   stay in the main process; the renderer uses typed `mt::ai::*` IPC only.
-- OpenAI Chat Completions and Anthropic Messages are supported. Image input is
-  PNG, JPEG, WebP, or GIF only: up to 10 images per request, 10 MB per image,
+- OpenAI Responses is the preferred protocol for new connections; OpenAI Chat
+  Completions remains an explicit Legacy compatibility option and Anthropic
+  Messages remains supported. Responses uses standard `reasoning.effort` and
+  optional `reasoning.summary` controls rather than requiring users to author
+  reasoning JSON. Image input is PNG, JPEG, WebP, or GIF only: up to 10 images per request, 10 MB per image,
   and 30 MB total. Images are stored under Electron `userData`, while chat
   history keeps metadata and the panel displays an icon plus filename (not a
   thumbnail). PDF uploads are rendered locally into PNG page images before being sent to image-capable models; PDF text extraction and OCR are not performed.
@@ -91,6 +94,15 @@ AI logs use `[ai-editor]` and `[ai-output-repair]`; they must not include API
 keys, image bytes/base64, attachment paths, or document content. Relevant
 tests are in `packages/desktop/test/unit/specs/ai-*.spec.ts`.
 
+For Responses connections, ordinary `answer` turns use provider-managed
+`store: true` state and `previous_response_id` only after the assistant turn
+anchoring that ID has been persisted. Model switches, summary mode, failed
+turns, edit/rewrite requests, and cleared chats invalidate the chain. Agent,
+rewrite, attachment extraction, hidden summaries, and connection tests remain
+stateless (`store: false`) and never consume the answer chain. A stale response
+ID is retried once only when the provider explicitly rejects
+`previous_response_id` with HTTP 400/404; other failures are not retried.
+
 Final validation failures may expose a bounded raw model output through the
 typed progress event when the configured failure threshold is reached. This
 output is intentionally user-visible and copyable for debugging, while
@@ -120,6 +132,12 @@ Reasoning handling by mode:
   reasoning block must never cause a protocol retry by itself.
 - `rewrite`: pass only normalized `content` to Markdown repair and validation;
   do not persist reasoning as document Markdown.
+
+Responses reasoning summaries are displayed in a separate collapsed
+“Reasoning summary” section and are never included in answer Markdown or later
+local context. The panel offers a session-level effort override with explicit
+“Model default” and “Provider default” choices; advanced JSON presets are kept
+folded and cannot replace application-owned Responses fields.
 
 Model profiles may declare user-authored `requestBodyPresets`, along with
 `reasoningField`, `reasoningTag`, and `replayReasoning`. Request body presets

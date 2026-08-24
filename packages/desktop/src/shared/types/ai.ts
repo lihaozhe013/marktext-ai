@@ -1,10 +1,32 @@
-export type AiProtocol = 'openai-chat-completions' | 'anthropic-messages'
+export type AiProtocol = 'openai-responses' | 'openai-chat-completions' | 'anthropic-messages'
 export type AiInteractionMode = 'answer' | 'edit' | 'rewrite'
 export type AiContextMode = 'recent' | 'summary'
 export type AiRecoveryStrategy = 'direct' | 'local-normalization' | 'model-repair' | 'whole-document-fallback' | 'partial-agent'
 export type AiModelSource = 'manual' | 'discovered'
 export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_content' | 'reasoning_text'
 export type AiReasoningTag = 'think' | 'thinking' | 'analysis' | 'reasoning'
+export type AiReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+export interface AiResponsesModelOptions {
+  reasoningEffort?: AiReasoningEffort
+  reasoningSummary?: boolean
+}
+
+export interface AiResponsesConversationState {
+  modelRef: AiModelRef
+  previousResponseId: string
+  anchorMessageId: string
+}
+
+export interface AiResponsesConversationCandidate {
+  modelRef: AiModelRef
+  previousResponseId: string
+}
+
+export interface AiReasoningEffortOverride {
+  modelRef: AiModelRef
+  effort: AiReasoningEffort | null
+}
 
 export interface AiRecoveryInfo {
   strategy: AiRecoveryStrategy
@@ -103,6 +125,7 @@ export interface AiRequestBodyPresetConfig {
 
 export interface AiModelCapabilities {
   requestBodyPresets?: AiRequestBodyPresetConfig
+  responses?: AiResponsesModelOptions
   reasoningField?: AiReasoningField
   reasoningTag?: AiReasoningTag
   replayReasoning?: boolean
@@ -310,6 +333,8 @@ export interface AiChatSession {
   messages: AiChatMessage[]
   selectedModel?: AiModelRef
   requestBodyPresetOverrides?: AiRequestBodyPresetOverride[]
+  reasoningEffortOverrides?: AiReasoningEffortOverride[]
+  responsesConversation?: AiResponsesConversationState
   /** Bounded document-scoped memory used when contextMode is summary. */
   contextSummary?: string
 }
@@ -329,6 +354,8 @@ export interface AiRequest {
   contextSummary?: string
   modelRef: AiModelRef
   requestBodyPresetOverride?: string | null
+  reasoningEffortOverride?: AiReasoningEffort | null
+  responsesConversation?: AiResponsesConversationState
   attachments?: AiAttachmentUpload[]
   renderedPdfPages?: AiRenderedPdfPages[]
 }
@@ -366,6 +393,7 @@ export interface AiResponse {
   agentTotalSteps?: number
   /** Generated before renderer-side apply; committed only after a successful turn. */
   contextSummaryCandidate?: string
+  responsesConversationCandidate?: AiResponsesConversationCandidate
   documentId: string
   baseMarkdown: string
   model: AiMessageModel

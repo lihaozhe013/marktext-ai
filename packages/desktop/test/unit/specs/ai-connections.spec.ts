@@ -326,6 +326,118 @@ describe('AI connection profiles and model routing', () => {
     expect(JSON.parse(fetchMock.mock.calls[2][1].body as string)).not.toHaveProperty('reasoning_effort')
   })
 
+  it('prefers Responses, sends standard reasoning controls, and continues a stored answer chain', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-chain-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Responses provider',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1/chat/completions',
+      models: [{
+        model: 'responses-model',
+        capabilities: { responses: { reasoningEffort: 'medium', reasoningSummary: true } }
+      }],
+      apiKey: 'responses-key'
+    })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({
+        id: 'resp_1',
+        status: 'completed',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'First answer' }] }]
+      }))
+      .mockResolvedValueOnce(response({
+        id: 'resp_2',
+        status: 'completed',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'Second answer' }] }]
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    const modelRef = { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    const first = await service.request({
+      requestId: 'responses-first',
+      documentId: 'tab:responses',
+      mode: 'answer',
+      prompt: 'First question',
+      markdown: '# Document',
+      messages: [],
+      modelRef
+    })
+    expect(first.responsesConversationCandidate).toEqual({ modelRef, previousResponseId: 'resp_1' })
+    const firstConversation = first.responsesConversationCandidate
+    if (!firstConversation) throw new Error('Expected a Responses conversation candidate.')
+
+    const second = await service.request({
+      requestId: 'responses-second',
+      documentId: 'tab:responses',
+      mode: 'answer',
+      prompt: 'Follow up',
+      markdown: '# Document',
+      messages: [{ id: 'assistant-1', role: 'assistant', mode: 'answer', content: 'First answer', createdAt: 1 }],
+      modelRef,
+      responsesConversation: { ...firstConversation, anchorMessageId: 'assistant-1' }
+    })
+    expect(second.content).toBe('Second answer')
+    const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+    const secondBody = JSON.parse(fetchMock.mock.calls[1][1].body as string)
+    expect(firstBody).toMatchObject({ model: 'responses-model', store: true, instructions: expect.any(String), reasoning: { effort: 'medium', summary: 'auto' } })
+    expect(firstBody.input).toEqual([{ role: 'user', content: expect.stringContaining('First question') }])
+    expect(firstBody).not.toHaveProperty('previous_response_id')
+    expect(secondBody).toMatchObject({ store: true, previous_response_id: 'resp_1', reasoning: { effort: 'medium', summary: 'auto' } })
+    expect(secondBody.input).toEqual([{ role: 'user', content: expect.stringContaining('Follow up') }])
+  })
+
+  it('rejects Responses presets that override application-owned fields', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-preset-validation-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    await expect(service.saveConnection({
+      name: 'Invalid Responses preset',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1',
+      models: [{
+        model: 'responses-model',
+        capabilities: { requestBodyPresets: { presets: [{ id: 'bad', name: 'Bad', body: { previous_response_id: 'other' } }] } }
+      }],
+      apiKey: 'responses-key'
+    })).rejects.toThrow('cannot override')
+  })
+
+  it('rebuilds local context once when a stored Responses id is explicitly stale', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-stale-id-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Responses stale id',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1',
+      models: [{ model: 'responses-model' }],
+      apiKey: 'responses-key'
+    })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ error: { message: 'previous_response_id is not found', param: 'previous_response_id' } }, 404))
+      .mockResolvedValueOnce(response({ id: 'resp-new', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'Rebuilt' }] }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const modelRef = { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    const result = await service.request({
+      requestId: 'responses-stale',
+      documentId: 'tab:responses-stale',
+      mode: 'answer',
+      prompt: 'New question',
+      markdown: '# Document',
+      messages: [{ id: 'assistant-1', role: 'assistant', mode: 'answer', content: 'Earlier answer', createdAt: 1 }],
+      modelRef,
+      responsesConversation: { modelRef, previousResponseId: 'resp-old', anchorMessageId: 'assistant-1' }
+    })
+    expect(result.content).toBe('Rebuilt')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const staleBody = JSON.parse(String(fetchMock.mock.calls[0][1].body))
+    const rebuiltBody = JSON.parse(String(fetchMock.mock.calls[1][1].body))
+    expect(staleBody.previous_response_id).toBe('resp-old')
+    expect(rebuiltBody).not.toHaveProperty('previous_response_id')
+    expect(rebuiltBody.input).toHaveLength(2)
+    expect(rebuiltBody.input[0].content).toBe('Earlier answer')
+  })
+
   it('merges nested preset JSON and lets user fields override generated fields', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-request-presets-merge-'))
     directories.push(directory)

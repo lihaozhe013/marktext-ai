@@ -82,9 +82,51 @@
     </div>
 
     <div
+      v-if="ai.selectedResponsesModelOptions"
+      class="ai-reasoning-effort-select"
+    >
+      <label for="ai-reasoning-effort-selector">{{ labels.reasoningEffort }}</label>
+      <select
+        id="ai-reasoning-effort-selector"
+        :value="ai.reasoningEffortSelection"
+        :disabled="ai.loading"
+        @change="selectReasoningEffort"
+      >
+        <option value="__model_default__">
+          {{ labels.reasoningEffortModelDefault }}
+        </option>
+        <option value="__provider_default__">
+          {{ labels.reasoningEffortProviderDefault }}
+        </option>
+        <option value="none">
+          none
+        </option>
+        <option value="minimal">
+          minimal
+        </option>
+        <option value="low">
+          low
+        </option>
+        <option value="medium">
+          medium
+        </option>
+        <option value="high">
+          high
+        </option>
+        <option value="xhigh">
+          xhigh
+        </option>
+        <option value="max">
+          max
+        </option>
+      </select>
+    </div>
+
+    <details
       v-if="ai.selectedRequestBodyPresets?.presets.length"
       class="ai-request-preset-select"
     >
+      <summary>{{ labels.advancedCompatibility }}</summary>
       <label for="ai-request-preset-selector">{{ labels.requestBodyPreset }}</label>
       <select
         id="ai-request-preset-selector"
@@ -107,7 +149,7 @@
         </option>
       </select>
       <small>{{ labels.requestBodyPresetHint }}</small>
-    </div>
+    </details>
 
     <p class="ai-mode-help">
       {{ modeHelp }}
@@ -216,7 +258,7 @@
             v-if="message.reasoning"
             class="ai-message-reasoning"
           >
-            <summary>{{ labels.modelReasoning }}</summary>
+            <summary>{{ message.model?.protocol === 'openai-responses' ? labels.reasoningSummary : labels.modelReasoning }}</summary>
             <div>{{ message.reasoning }}</div>
           </details>
           <div
@@ -775,6 +817,10 @@ const selectRequestBodyPreset = (event: Event): void => {
   ai.setRequestBodyPreset((event.target as HTMLSelectElement).value)
 }
 
+const selectReasoningEffort = (event: Event): void => {
+  ai.setReasoningEffort((event.target as HTMLSelectElement).value)
+}
+
 const addFiles = (files: File[]): void => {
   if (!files.length) return
   ai.addAttachmentFiles(files).catch(() => undefined)
@@ -936,6 +982,9 @@ onUnmounted(() => {
 .ai-model-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-model-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }
 .ai-model-select small { color: var(--editorColor50); font-size: 10px; }
+.ai-reasoning-effort-select { display: flex; flex-direction: column; gap: 5px; margin: 8px 14px 0; }
+.ai-reasoning-effort-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
+.ai-reasoning-effort-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }
 .ai-request-preset-select { display: flex; flex-direction: column; gap: 5px; margin: 8px 14px 0; }
 .ai-request-preset-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-request-preset-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }

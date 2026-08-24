@@ -30,6 +30,7 @@ export interface ProviderStreamResult {
   usage?: ProviderUsage
   truncated: boolean
   finishReason?: string
+  responseId?: string
 }
 
 interface SseEvent {
@@ -49,9 +50,21 @@ interface AnthropicToolAccumulator {
   input: string
 }
 
+interface ResponsesToolAccumulator {
+  id: string
+  name: string
+  arguments: string
+}
+
 interface ProviderStreamState {
   truncated: boolean
   finishReason?: string
+  responseId?: string
+  responseStatus?: string
+  terminal?: boolean
+  error?: string
+  refusal?: string
+  finalResponse?: Record<string, unknown>
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -270,6 +283,144 @@ const readAnthropicDelta = (
   return { content: '', reasoning: '' }
 }
 
+const readResponsesUsage = (value: unknown): ProviderUsage | undefined => {
+  if (!isRecord(value)) return undefined
+  const inputTokens = asNumber(value.input_tokens)
+  const outputTokens = asNumber(value.output_tokens)
+  const inputDetails = isRecord(value.input_tokens_details) ? value.input_tokens_details : undefined
+  const cachedInputTokens = asNumber(inputDetails?.cached_tokens)
+  const cacheWriteInputTokens = asNumber(inputDetails?.cache_write_tokens)
+  if (inputTokens === undefined && outputTokens === undefined && cachedInputTokens === undefined && cacheWriteInputTokens === undefined) return undefined
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(cacheWriteInputTokens !== undefined ? { cacheWriteInputTokens } : {})
+  }
+}
+
+const readResponsesOutput = (
+  response: Record<string, unknown>,
+  content: { value: string },
+  reasoning: { value: string },
+  tools: Map<string, ResponsesToolAccumulator>,
+  state: ProviderStreamState,
+  usage: { value?: ProviderUsage }
+): void => {
+  const output = Array.isArray(response.output) ? response.output : undefined
+  if (!output) {
+    usage.value = readResponsesUsage(response.usage) ?? usage.value
+    if (typeof response.id === 'string') state.responseId = response.id
+    if (typeof response.status === 'string') {
+      state.responseStatus = response.status
+      state.finishReason = response.status
+    }
+    const incomplete = isRecord(response.incomplete_details) ? response.incomplete_details : undefined
+    if (response.status === 'incomplete' || incomplete?.reason === 'max_output_tokens') state.truncated = true
+    return
+  }
+  content.value = ''
+  reasoning.value = ''
+  tools.clear()
+  const streamedRefusal = state.refusal
+  const finalRefusals: string[] = []
+  for (const item of output) {
+    if (!isRecord(item)) continue
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (!isRecord(part)) continue
+        if (part.type === 'output_text' && typeof part.text === 'string') content.value += part.text
+        else if (part.type === 'refusal' && typeof part.refusal === 'string') finalRefusals.push(part.refusal)
+      }
+    } else if (item.type === 'reasoning' && Array.isArray(item.summary)) {
+      for (const part of item.summary) {
+        if (!isRecord(part)) continue
+        if (part.type === 'summary_text' && typeof part.text === 'string') reasoning.value += part.text
+      }
+    } else if (item.type === 'function_call' && typeof item.name === 'string') {
+      const id = typeof item.call_id === 'string'
+        ? item.call_id
+        : typeof item.id === 'string' ? item.id : `responses-tool-${tools.size}`
+      const rawInput = typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {})
+      tools.set(id, { id, name: item.name, arguments: rawInput })
+    }
+  }
+  state.refusal = finalRefusals.length ? finalRefusals.join('\n\n') : streamedRefusal
+  if (!content.value && typeof response.output_text === 'string') content.value = response.output_text
+  usage.value = readResponsesUsage(response.usage) ?? usage.value
+  if (typeof response.id === 'string') state.responseId = response.id
+  if (typeof response.status === 'string') {
+    state.responseStatus = response.status
+    state.finishReason = response.status
+  }
+  const incomplete = isRecord(response.incomplete_details) ? response.incomplete_details : undefined
+  if (response.status === 'incomplete' || incomplete?.reason === 'max_output_tokens') state.truncated = true
+}
+
+const readResponsesDelta = (
+  event: SseEvent,
+  payload: Record<string, unknown>,
+  content: { value: string },
+  reasoning: { value: string },
+  tools: Map<string, ResponsesToolAccumulator>,
+  usage: { value?: ProviderUsage },
+  state: ProviderStreamState
+): { content: string; reasoning: string } => {
+  const eventType = event.event ?? (typeof payload.type === 'string' ? payload.type : '')
+  if (eventType === 'response.created' || eventType === 'response.in_progress') {
+    const response = isRecord(payload.response) ? payload.response : undefined
+    if (response) {
+      if (typeof response.id === 'string') state.responseId = response.id
+      if (typeof response.status === 'string') state.responseStatus = response.status
+    }
+  } else if (eventType === 'response.output_text.delta') {
+    const delta = typeof payload.delta === 'string' ? payload.delta : ''
+    content.value += delta
+    return { content: delta, reasoning: '' }
+  } else if (eventType === 'response.refusal.delta') {
+    const delta = typeof payload.delta === 'string' ? payload.delta : ''
+    state.refusal = state.refusal ? `${state.refusal}${delta}` : delta
+    return { content: '', reasoning: '' }
+  } else if (eventType === 'response.reasoning_summary_text.delta' || eventType === 'response.reasoning_text.delta') {
+    const delta = typeof payload.delta === 'string' ? payload.delta : ''
+    reasoning.value += delta
+    return { content: '', reasoning: delta }
+  } else if (eventType === 'response.output_item.added' || eventType === 'response.output_item.done') {
+    const item = isRecord(payload.item) ? payload.item : undefined
+    if (item?.type === 'function_call' && typeof item.name === 'string') {
+      const id = typeof item.call_id === 'string'
+        ? item.call_id
+        : typeof item.id === 'string' ? item.id : `responses-tool-${tools.size}`
+      const rawInput = typeof item.arguments === 'string' ? item.arguments : ''
+      const current = tools.get(id) ?? { id, name: item.name, arguments: '' }
+      current.name = item.name
+      if (rawInput) current.arguments = rawInput
+      tools.set(id, current)
+    }
+  } else if (eventType === 'response.function_call_arguments.delta') {
+    const id = typeof payload.call_id === 'string'
+      ? payload.call_id
+      : typeof payload.item_id === 'string' ? payload.item_id : `responses-tool-${tools.size}`
+    const current = tools.get(id) ?? { id, name: '', arguments: '' }
+    if (typeof payload.name === 'string') current.name = payload.name
+    if (typeof payload.delta === 'string') current.arguments += payload.delta
+    tools.set(id, current)
+  } else if (eventType === 'response.completed' || eventType === 'response.incomplete') {
+    state.terminal = true
+    const response = isRecord(payload.response) ? payload.response : undefined
+    if (response) {
+      state.finalResponse = response
+      readResponsesOutput(response, content, reasoning, tools, state, usage)
+    }
+  } else if (eventType === 'response.failed' || eventType === 'response.error' || eventType === 'error') {
+    state.terminal = true
+    state.finishReason = 'failed'
+    const error = isRecord(payload.error) ? payload.error : payload
+    state.error = typeof error.message === 'string' ? error.message : 'The Responses API request failed.'
+  }
+  return { content: '', reasoning: '' }
+}
+
 export const consumeProviderStream = async(
   protocol: AiProtocol,
   body: ReadableStream<Uint8Array>,
@@ -282,6 +433,7 @@ export const consumeProviderStream = async(
   const usage: { value?: ProviderUsage } = {}
   const openAiTools = new Map<number, OpenAiToolAccumulator>()
   const anthropicTools = new Map<number, AnthropicToolAccumulator>()
+  const responsesTools = new Map<string, ResponsesToolAccumulator>()
   const state: ProviderStreamState = { truncated: false }
   let outputCharacters = 0
   let reasoningCharacters = 0
@@ -311,19 +463,30 @@ export const consumeProviderStream = async(
     const beforeReasoningLength = reasoning.value.length
     const beforeToolLength = protocol === 'anthropic-messages'
       ? [...anthropicTools.values()].reduce((total, tool) => total + tool.input.length, 0)
-      : [...openAiTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
+      : protocol === 'openai-responses'
+        ? [...responsesTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
+        : [...openAiTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
     if (protocol === 'anthropic-messages') {
       readAnthropicDelta(event, payload, content, reasoning, anthropicTools, usage, state)
+    } else if (protocol === 'openai-responses') {
+      readResponsesDelta(event, payload, content, reasoning, responsesTools, usage, state)
     } else {
       readOpenAiDelta(payload, content, reasoning, openAiTools, usage, state, compatibility)
     }
     const afterToolLength = protocol === 'anthropic-messages'
       ? [...anthropicTools.values()].reduce((total, tool) => total + tool.input.length, 0)
-      : [...openAiTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
+      : protocol === 'openai-responses'
+        ? [...responsesTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
+        : [...openAiTools.values()].reduce((total, tool) => total + tool.arguments.length, 0)
     outputCharacters += (content.value.length - beforeContentLength) + (afterToolLength - beforeToolLength)
     reasoningCharacters += reasoning.value.length - beforeReasoningLength
     notify()
   })
+
+  if (protocol === 'openai-responses') {
+    if (state.error) throw new Error(state.error)
+    if (!state.terminal) throw new Error('The Responses API stream ended without a terminal event.')
+  }
 
   const toolCalls: ProviderToolCall[] = protocol === 'anthropic-messages'
     ? [...anthropicTools.values()]
@@ -338,21 +501,37 @@ export const consumeProviderStream = async(
         }
       })
       .filter(tool => !!tool.name)
-    : [...openAiTools.values()]
-      .map(tool => {
-        const input = parseToolInput(tool.arguments)
-        return {
-          ...(tool.id ? { id: tool.id } : {}),
-          name: tool.name,
-          input,
-          ...(tool.id ? { rawInput: tool.arguments } : {}),
-          ...(input === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
-        }
-      })
-      .filter(tool => !!tool.name)
+    : protocol === 'openai-responses'
+      ? [...responsesTools.values()]
+        .map(tool => {
+          const input = parseToolInput(tool.arguments)
+          return {
+            ...(tool.id ? { id: tool.id } : {}),
+            name: tool.name,
+            input,
+            ...(tool.id ? { rawInput: tool.arguments } : {}),
+            ...(input === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
+          }
+        })
+        .filter(tool => !!tool.name)
+      : [...openAiTools.values()]
+        .map(tool => {
+          const input = parseToolInput(tool.arguments)
+          return {
+            ...(tool.id ? { id: tool.id } : {}),
+            name: tool.name,
+            input,
+            ...(tool.id ? { rawInput: tool.arguments } : {}),
+            ...(input === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
+          }
+        })
+        .filter(tool => !!tool.name)
 
-  const normalized = normalizeProviderContent(content.value, reasoning.value, compatibility, 'field')
-  if (!done && !normalized.content && !toolCalls.length) {
+  const normalized = normalizeProviderContent(content.value, reasoning.value, compatibility, protocol === 'openai-responses' ? 'native' : 'field')
+  if (protocol === 'openai-responses' && state.refusal && !normalized.content && !toolCalls.length) {
+    throw new Error(`Provider refusal: ${state.refusal}`)
+  }
+  if (!done && protocol !== 'openai-responses' && !normalized.content && !toolCalls.length) {
     throw new Error('The provider stream ended without content.')
   }
   return {
@@ -362,6 +541,7 @@ export const consumeProviderStream = async(
     toolCalls,
     usage: usage.value,
     truncated: state.truncated,
-    finishReason: state.finishReason
+    finishReason: state.finishReason,
+    ...(state.responseId ? { responseId: state.responseId } : {})
   }
 }

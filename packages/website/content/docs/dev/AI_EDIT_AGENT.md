@@ -61,6 +61,25 @@ system prompt again. Historical images, PDFs, reasoning, status messages, and
 Agent tool transcripts are not replayed in this mode. The full chat remains
 available for renderer display.
 
+### Responses conversation state
+
+New OpenAI-compatible connections use the Responses protocol by default.
+Ordinary `answer` turns persist a successful response with `store: true`; after
+the assistant message is saved, the renderer stores its response ID and the
+next answer can send only the new user input with `previous_response_id`.
+Instructions are repeated on every turn because Responses does not carry them
+forward automatically. The persisted state includes the model reference and
+assistant-message anchor, so model changes, summary mode, failed user turns,
+edit/rewrite requests, and cleared chats cannot reuse an unrelated chain.
+
+If a provider explicitly rejects `previous_response_id` with HTTP 400 or 404,
+the request is rebuilt once from the bounded local context. Timeouts, 5xx
+responses, interrupted streams, and ordinary parameter errors are not retried.
+Editing Agent calls, rewrites, attachment extraction, hidden context summaries,
+and connection tests use `store: false` and never read or update the answer
+chain. Reasoning summaries remain separate collapsed UI content and are not
+replayed as ordinary Markdown context.
+
 The renderer then records `sending`, `sent`, and `waiting` progress. The main
 process emits provider and Agent progress through `mt::ai::progress` while the
 request is running.
