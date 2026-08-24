@@ -93,7 +93,7 @@
         @change="selectReasoningEffort"
       >
         <option value="__model_default__">
-          {{ labels.reasoningEffortModelDefault }}
+          {{ labels.reasoningEffortModelDefault(ai.selectedResponsesModelOptions?.reasoningEffort) }}
         </option>
         <option value="__provider_default__">
           {{ labels.reasoningEffortProviderDefault }}
@@ -118,6 +118,35 @@
         </option>
         <option value="max">
           max
+        </option>
+      </select>
+    </div>
+
+    <div
+      v-if="ai.selectedResponsesModelOptions"
+      class="ai-verbosity-select"
+    >
+      <label for="ai-verbosity-selector">{{ labels.verbosity }}</label>
+      <select
+        id="ai-verbosity-selector"
+        :value="ai.verbositySelection"
+        :disabled="ai.loading"
+        @change="selectVerbosity"
+      >
+        <option value="__model_default__">
+          {{ labels.verbosityModelDefault(ai.selectedResponsesModelOptions?.verbosity) }}
+        </option>
+        <option value="__provider_default__">
+          {{ labels.verbosityProviderDefault }}
+        </option>
+        <option value="low">
+          low
+        </option>
+        <option value="medium">
+          medium
+        </option>
+        <option value="high">
+          high
         </option>
       </select>
     </div>
@@ -821,6 +850,10 @@ const selectReasoningEffort = (event: Event): void => {
   ai.setReasoningEffort((event.target as HTMLSelectElement).value)
 }
 
+const selectVerbosity = (event: Event): void => {
+  ai.setVerbosity((event.target as HTMLSelectElement).value)
+}
+
 const addFiles = (files: File[]): void => {
   if (!files.length) return
   ai.addAttachmentFiles(files).catch(() => undefined)
@@ -985,6 +1018,9 @@ onUnmounted(() => {
 .ai-reasoning-effort-select { display: flex; flex-direction: column; gap: 5px; margin: 8px 14px 0; }
 .ai-reasoning-effort-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-reasoning-effort-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }
+.ai-verbosity-select { display: flex; flex-direction: column; gap: 5px; margin: 8px 14px 0; }
+.ai-verbosity-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
+.ai-verbosity-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }
 .ai-request-preset-select { display: flex; flex-direction: column; gap: 5px; margin: 8px 14px 0; }
 .ai-request-preset-select label { color: var(--editorColor60); font-size: 11px; font-weight: 600; }
 .ai-request-preset-select select { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid var(--editorColor20); border-radius: 4px; color: var(--editorColor); background: var(--editorBgColor); font: inherit; }

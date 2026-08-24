@@ -336,7 +336,7 @@ describe('AI connection profiles and model routing', () => {
       endpoint: 'https://responses.example/v1/chat/completions',
       models: [{
         model: 'responses-model',
-        capabilities: { responses: { reasoningEffort: 'medium', reasoningSummary: true } }
+        capabilities: { responses: { reasoningEffort: 'medium', reasoningSummary: true, verbosity: 'low' } }
       }],
       apiKey: 'responses-key'
     })
@@ -379,11 +379,78 @@ describe('AI connection profiles and model routing', () => {
     expect(second.content).toBe('Second answer')
     const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
     const secondBody = JSON.parse(fetchMock.mock.calls[1][1].body as string)
-    expect(firstBody).toMatchObject({ model: 'responses-model', store: true, instructions: expect.any(String), reasoning: { effort: 'medium', summary: 'auto' } })
+    expect(firstBody).toMatchObject({ model: 'responses-model', store: true, instructions: expect.any(String), reasoning: { effort: 'medium', summary: 'auto' }, text: { verbosity: 'low' } })
     expect(firstBody.input).toEqual([{ role: 'user', content: expect.stringContaining('First question') }])
     expect(firstBody).not.toHaveProperty('previous_response_id')
-    expect(secondBody).toMatchObject({ store: true, previous_response_id: 'resp_1', reasoning: { effort: 'medium', summary: 'auto' } })
+    expect(secondBody).toMatchObject({ store: true, previous_response_id: 'resp_1', reasoning: { effort: 'medium', summary: 'auto' }, text: { verbosity: 'low' } })
     expect(secondBody.input).toEqual([{ role: 'user', content: expect.stringContaining('Follow up') }])
+  })
+
+  it('applies Responses verbosity overrides and omits it for rewrite requests', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-verbosity-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Responses verbosity',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1',
+      models: [{ model: 'responses-model', capabilities: { responses: { verbosity: 'medium' } } }],
+      apiKey: 'responses-key'
+    })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ id: 'resp-provider-default', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'Provider default' }] }] }))
+      .mockResolvedValueOnce(response({ id: 'resp-high', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'High' }] }] }))
+      .mockResolvedValueOnce(response({ id: 'resp-rewrite', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: '# Rewritten\n\nDocument' }] }] }))
+      .mockResolvedValueOnce(response({ id: 'resp-test', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'Connection test' }] }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const modelRef = { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+
+    await service.request({
+      requestId: 'responses-provider-default',
+      documentId: 'tab:responses-verbosity',
+      mode: 'answer',
+      prompt: 'Answer briefly.',
+      markdown: '# Document',
+      messages: [],
+      modelRef,
+      verbosityOverride: null
+    })
+    await service.request({
+      requestId: 'responses-high',
+      documentId: 'tab:responses-verbosity',
+      mode: 'answer',
+      prompt: 'Explain fully.',
+      markdown: '# Document',
+      messages: [],
+      modelRef,
+      verbosityOverride: 'high'
+    })
+    await service.request({
+      requestId: 'responses-rewrite',
+      documentId: 'tab:responses-verbosity',
+      mode: 'rewrite',
+      prompt: 'Rewrite this.',
+      markdown: '# Document',
+      messages: [],
+      modelRef,
+      verbosityOverride: 'high'
+    })
+    await expect(service.testConnection({
+      name: 'Responses verbosity test',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1',
+      models: [{ model: 'responses-model', capabilities: { responses: { verbosity: 'high' } } }],
+      apiKey: 'responses-key'
+    })).resolves.toMatchObject({ ok: true })
+
+    const providerDefaultBody = JSON.parse(String(fetchMock.mock.calls[0][1].body))
+    const highBody = JSON.parse(String(fetchMock.mock.calls[1][1].body))
+    const rewriteBody = JSON.parse(String(fetchMock.mock.calls[2][1].body))
+    const testBody = JSON.parse(String(fetchMock.mock.calls[3][1].body))
+    expect(providerDefaultBody).not.toHaveProperty('text')
+    expect(highBody).toMatchObject({ text: { verbosity: 'high' } })
+    expect(rewriteBody).not.toHaveProperty('text')
+    expect(testBody).not.toHaveProperty('text')
   })
 
   it('rejects Responses presets that override application-owned fields', async() => {
@@ -396,10 +463,59 @@ describe('AI connection profiles and model routing', () => {
       endpoint: 'https://responses.example/v1',
       models: [{
         model: 'responses-model',
-        capabilities: { requestBodyPresets: { presets: [{ id: 'bad', name: 'Bad', body: { previous_response_id: 'other' } }] } }
+        capabilities: { requestBodyPresets: { presets: [{ id: 'bad', name: 'Bad', body: { text: { verbosity: 'low' } } }] } }
       }],
       apiKey: 'responses-key'
     })).rejects.toThrow('cannot override')
+  })
+
+  it('rejects invalid Responses verbosity configuration', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-invalid-verbosity-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const invalidInput = {
+      name: 'Invalid Responses verbosity',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1',
+      models: [{ model: 'responses-model', capabilities: { responses: { verbosity: 'verbose' } } }],
+      apiKey: 'responses-key'
+    } as unknown as AiConnectionInput
+    await expect(service.saveConnection(invalidInput)).rejects.toThrow('Responses verbosity')
+  })
+
+  it('preserves legal Responses text preset fields while applying verbosity', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-text-preset-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Responses text preset',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1',
+      models: [{
+        model: 'responses-model',
+        capabilities: {
+          responses: { verbosity: 'high' },
+          requestBodyPresets: {
+            presets: [{ id: 'text-format', name: 'Text format', body: { text: { format: { type: 'text' } } } }],
+            defaultPresetId: 'text-format'
+          }
+        }
+      }],
+      apiKey: 'responses-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(response({ id: 'resp-text-preset', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'Answer' }] }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await service.request({
+      requestId: 'responses-text-preset',
+      documentId: 'tab:responses-text-preset',
+      mode: 'answer',
+      prompt: 'Answer.',
+      markdown: '# Document',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body))
+    expect(body.text).toEqual({ format: { type: 'text' }, verbosity: 'high' })
   })
 
   it('rebuilds local context once when a stored Responses id is explicitly stale', async() => {
@@ -1422,13 +1538,22 @@ describe('AI connection profiles and model routing', () => {
       requestBodyPresetOverrides: [{
         modelRef: { connectionId: 'connection-a', modelId: 'model-a' },
         presetId: 'preset-high'
+      }],
+      verbosityOverrides: [{
+        modelRef: { connectionId: 'connection-a', modelId: 'model-a' },
+        verbosity: null
       }]
     })
     const stored = JSON.parse(await readFile(path.join(directory, 'ai-chat.json'), 'utf8'))
     expect(stored['tab:test']).toMatchObject({
       selectedModel: { connectionId: 'connection-a', modelId: 'model-a' },
-      requestBodyPresetOverrides: [{ modelRef: { connectionId: 'connection-a', modelId: 'model-a' }, presetId: 'preset-high' }]
+      requestBodyPresetOverrides: [{ modelRef: { connectionId: 'connection-a', modelId: 'model-a' }, presetId: 'preset-high' }],
+      verbosityOverrides: [{ modelRef: { connectionId: 'connection-a', modelId: 'model-a' }, verbosity: null }]
     })
+    expect((await service.loadChat('tab:test')).verbosityOverrides).toEqual([{
+      modelRef: { connectionId: 'connection-a', modelId: 'model-a' },
+      verbosity: null
+    }])
   })
 
   it('uses only rolling memory in summary context mode and persists it', async() => {

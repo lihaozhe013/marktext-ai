@@ -43,6 +43,9 @@ export class AiChatStore {
         ...(normalized.reasoningEffortOverrides?.length
           ? { reasoningEffortOverrides: normalized.reasoningEffortOverrides }
           : {}),
+        ...(normalized.verbosityOverrides?.length
+          ? { verbosityOverrides: normalized.verbosityOverrides }
+          : {}),
         ...(normalized.responsesConversation
           ? { responsesConversation: normalized.responsesConversation }
           : {}),

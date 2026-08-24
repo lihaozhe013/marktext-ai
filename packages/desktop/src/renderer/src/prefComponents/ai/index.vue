@@ -233,6 +233,24 @@
                   max
                 </option>
               </select>
+              <label>{{ labels.verbosity }}</label>
+              <select
+                :value="model.capabilities?.responses?.verbosity || ''"
+                @change="setResponsesVerbosity(model, ($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">
+                  {{ labels.providerDefault }}
+                </option>
+                <option value="low">
+                  low
+                </option>
+                <option value="medium">
+                  medium
+                </option>
+                <option value="high">
+                  high
+                </option>
+              </select>
               <label class="checkbox-row">
                 <input
                   type="checkbox"
@@ -436,7 +454,8 @@ import type {
   AiModelCapabilities,
   AiRequestBodyPreset,
   AiJsonValue,
-  AiReasoningEffort
+  AiReasoningEffort,
+  AiVerbosity
 } from '@shared/types/ai'
 
 type FormModel = AiConnectionInput['models'][number]
@@ -484,9 +503,10 @@ const labels = computed(() =>
         connectionName: '连接名称',
         protocol: '协议',
         reasoningEffort: '推理 effort（模型默认）',
+        verbosity: '回答详细程度（模型默认）',
         providerDefault: 'Provider default',
         reasoningSummary: '显示推理摘要',
-        responsesHint: 'Responses API 使用标准 reasoning.effort；无需手写 JSON。摘要默认关闭。',
+        responsesHint: 'Responses API 使用标准 reasoning.effort 和 text.verbosity；无需手写 JSON。摘要默认关闭。',
         endpoint: 'API 地址 / Base URL',
         endpointHint:
           '支持 Base URL 或完整端点，必须使用 HTTPS。模型列表接口不可用时仍可手动添加模型。',
@@ -549,9 +569,10 @@ const labels = computed(() =>
         connectionName: 'Connection name',
         protocol: 'Protocol',
         reasoningEffort: 'Reasoning effort (model default)',
+        verbosity: 'Response verbosity (model default)',
         providerDefault: 'Provider default',
         reasoningSummary: 'Show reasoning summary',
-        responsesHint: 'Responses API uses standard reasoning.effort; no JSON is required. Summaries are off by default.',
+        responsesHint: 'Responses API uses standard reasoning.effort and text.verbosity; no JSON is required. Summaries are off by default.',
         endpoint: 'API endpoint / Base URL',
         endpointHint:
           'Base URLs and complete endpoints are supported over HTTPS. Models can still be added manually when discovery is unavailable.',
@@ -669,6 +690,17 @@ const setResponsesReasoningSummary = (model: FormModel, enabled: boolean): void 
   const responses = { ...(capabilities.responses ?? {}) }
   if (enabled) responses.reasoningSummary = true
   else delete responses.reasoningSummary
+  if (Object.keys(responses).length) capabilities.responses = responses
+  else delete capabilities.responses
+  model.capabilities = Object.keys(capabilities).length ? capabilities : undefined
+}
+
+const setResponsesVerbosity = (model: FormModel, value: string): void => {
+  const capabilities = { ...(model.capabilities ?? {}) }
+  const responses = { ...(capabilities.responses ?? {}) }
+  const valid: AiVerbosity[] = ['low', 'medium', 'high']
+  if (!value) delete responses.verbosity
+  else if (valid.includes(value as AiVerbosity)) responses.verbosity = value as AiVerbosity
   if (Object.keys(responses).length) capabilities.responses = responses
   else delete capabilities.responses
   model.capabilities = Object.keys(capabilities).length ? capabilities : undefined
@@ -1123,12 +1155,13 @@ onMounted(() => {
   border: 1px solid var(--floatBorderColor);
   border-radius: 4px;
 }
-.responses-model-options > label:first-child {
+.responses-model-options > label:not(.checkbox-row) {
   color: var(--editorColor60);
   font-size: 12px;
 }
 .responses-model-options select {
   margin-top: 0;
+  font-size: 12px;
 }
 .responses-model-options small {
   color: var(--editorColor50);

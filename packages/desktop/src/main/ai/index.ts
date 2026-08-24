@@ -24,6 +24,8 @@ import type {
   AiReasoningField,
   AiReasoningTag,
   AiReasoningEffortOverride,
+  AiVerbosity,
+  AiVerbosityOverride,
   AiResponsesModelOptions,
   AiResponsesConversationState,
   AiRecoveryInfo,
@@ -132,6 +134,8 @@ interface ProviderRequestOptions {
   reasoningEffort?: AiReasoningEffort
   omitReasoningEffort?: boolean
   reasoningSummary?: boolean
+  verbosity?: AiVerbosity
+  omitVerbosity?: boolean
 }
 
 type AgentTransportMode = 'native-strict' | 'native-compatible' | 'json-envelope'
@@ -431,8 +435,13 @@ const validateResponsesPresetBody = (body: Record<string, AiJsonValue>): void =>
   const conflict = Object.keys(body).find(key => reserved.has(key))
   const reasoning = isRecord(body.reasoning) ? body.reasoning : undefined
   const reasoningConflict = reasoning && ('effort' in reasoning || 'summary' in reasoning || 'generate_summary' in reasoning)
-  if (conflict || reasoningConflict) {
-    throw new Error('Responses advanced JSON cannot override model input, session state, tools, stream, or reasoning effort/summary. Use the standard controls instead.')
+  const text = body.text
+  if (text !== undefined && !isRecord(text)) {
+    throw new Error('Responses advanced JSON text must be an object. Use the standard verbosity control for output detail.')
+  }
+  const verbosityConflict = isRecord(text) && 'verbosity' in text
+  if (conflict || reasoningConflict || verbosityConflict) {
+    throw new Error('Responses advanced JSON cannot override model input, session state, tools, stream, reasoning effort/summary, or text verbosity. Use the standard controls instead.')
   }
 }
 
@@ -452,10 +461,14 @@ const normalizeContextMode = (value: unknown): StoredSettings['contextMode'] =>
 const isReasoningEffort = (value: unknown): value is AiReasoningEffort =>
   value === 'none' || value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max'
 
+const isVerbosity = (value: unknown): value is AiVerbosity =>
+  value === 'low' || value === 'medium' || value === 'high'
+
 const normalizeResponsesModelOptions = (value: unknown, strict = false): AiResponsesModelOptions | undefined => {
   if (!isRecord(value)) return undefined
   const reasoningEffort = value.reasoningEffort
   const reasoningSummary = value.reasoningSummary
+  const verbosity = value.verbosity
   if (reasoningEffort !== undefined && !isReasoningEffort(reasoningEffort)) {
     if (strict) throw new Error('Responses reasoning effort must be a supported effort value or empty.')
     return undefined
@@ -464,10 +477,15 @@ const normalizeResponsesModelOptions = (value: unknown, strict = false): AiRespo
     if (strict) throw new Error('Responses reasoning summary must be a boolean.')
     return undefined
   }
-  if (reasoningEffort === undefined && reasoningSummary === undefined) return undefined
+  if (verbosity !== undefined && !isVerbosity(verbosity)) {
+    if (strict) throw new Error('Responses verbosity must be low, medium, high, or empty.')
+    return undefined
+  }
+  if (reasoningEffort === undefined && reasoningSummary === undefined && verbosity === undefined) return undefined
   return {
     ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
-    ...(reasoningSummary !== undefined ? { reasoningSummary } : {})
+    ...(reasoningSummary !== undefined ? { reasoningSummary } : {}),
+    ...(verbosity !== undefined ? { verbosity } : {})
   }
 }
 
@@ -859,6 +877,20 @@ const normalizeReasoningEffortOverrides = (value: unknown): AiReasoningEffortOve
   return overrides.size ? Array.from(overrides.values()) : undefined
 }
 
+const normalizeVerbosityOverrides = (value: unknown): AiVerbosityOverride[] | undefined => {
+  if (!Array.isArray(value)) return undefined
+  const overrides = new Map<string, AiVerbosityOverride>()
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const modelRef = normalizeModelRef(item.modelRef)
+    if (!modelRef) continue
+    if (item.verbosity !== null && !isVerbosity(item.verbosity)) continue
+    const normalized = { modelRef, verbosity: item.verbosity as AiVerbosity | null }
+    overrides.set(`${modelRef.connectionId}\u0000${modelRef.modelId}`, normalized)
+  }
+  return overrides.size ? Array.from(overrides.values()) : undefined
+}
+
 const normalizeResponsesConversation = (value: unknown): AiResponsesConversationState | undefined => {
   if (!isRecord(value)) return undefined
   const modelRef = normalizeModelRef(value.modelRef)
@@ -881,6 +913,7 @@ const normalizeChatSession = (value: unknown): AiChatSession => {
     selectedModel: normalizeModelRef(value.selectedModel),
     requestBodyPresetOverrides: normalizeRequestBodyPresetOverrides(value.requestBodyPresetOverrides ?? legacyPresetOverrides),
     reasoningEffortOverrides: normalizeReasoningEffortOverrides(value.reasoningEffortOverrides),
+    verbosityOverrides: normalizeVerbosityOverrides(value.verbosityOverrides),
     responsesConversation: normalizeResponsesConversation(value.responsesConversation),
     contextSummary: typeof value.contextSummary === 'string'
       ? value.contextSummary.trim().slice(0, MAX_CONTEXT_SUMMARY_CHARS) || undefined
@@ -1296,7 +1329,7 @@ export class AiService {
           protocol: connection.protocol
         },
         requestBodyPreset: resolveRequestBodyPreset(model, undefined)
-      }, connectionTestSystemPrompt, [{ role: 'user', content: connectionTestUserPrompt }], `test-${crypto.randomUUID()}`)
+      }, connectionTestSystemPrompt, [{ role: 'user', content: connectionTestUserPrompt }], `test-${crypto.randomUUID()}`, undefined, { omitVerbosity: true })
       connectionLog('test succeeded connectionId=%s model=%s', connection.id, model.model)
       return { ok: true, message: 'Connection succeeded.' }
     } catch (error) {
@@ -1517,6 +1550,14 @@ export class AiService {
           delete reasoning.generate_summary
           if (Object.keys(reasoning).length) body.reasoning = reasoning
           else delete body.reasoning
+          const text = isRecord(body.text) ? { ...body.text } : {}
+          const verbosity = options.omitVerbosity
+            ? undefined
+            : options.verbosity ?? responseOptions?.verbosity
+          if (verbosity) text.verbosity = verbosity
+          else delete text.verbosity
+          if (Object.keys(text).length) body.text = text
+          else delete body.text
           body.model = model
           body.instructions = effectiveSystem
           body.input = serializeResponsesInput(messages)
@@ -1946,7 +1987,7 @@ export class AiService {
         [{ role: 'user', content: summaryPrompt.content }],
         requestId,
         signal,
-        { stream: false, maxTokens: 512, attempt: 2, omitRequestBodyPreset: true }
+        { stream: false, maxTokens: 512, attempt: 2, omitRequestBodyPreset: true, omitVerbosity: true }
       )
       onResponse(generated)
       const summary = normalizeContextSummary(generated.content)
@@ -1978,6 +2019,9 @@ export class AiService {
     const target = await this.resolveModelTarget(request.modelRef, state)
     if (target.connection.protocol === 'openai-responses' && request.reasoningEffortOverride !== undefined && request.reasoningEffortOverride !== null && !isReasoningEffort(request.reasoningEffortOverride)) {
       throw new Error('Responses reasoning effort is unsupported. Choose a standard effort or Provider default.')
+    }
+    if (target.connection.protocol === 'openai-responses' && request.verbosityOverride !== undefined && request.verbosityOverride !== null && !isVerbosity(request.verbosityOverride)) {
+      throw new Error('Responses verbosity is unsupported. Choose low, medium, high, or Provider default.')
     }
     target.requestBodyPreset = resolveRequestBodyPreset(target.model, request.requestBodyPresetOverride)
     requestBodyPresetLog(
@@ -2167,6 +2211,7 @@ export class AiService {
             stream: true,
             maxTokens: 3072,
             allowEmptyToolResponse: true,
+            omitVerbosity: true,
             attempt,
             ...makeProviderProgress(attempt)
           }
@@ -2229,6 +2274,13 @@ export class AiService {
           : {}),
         ...(settings.protocol === 'openai-responses'
           ? { reasoningSummary: target.model.capabilities?.responses?.reasoningSummary === true }
+          : {}),
+        ...(settings.protocol === 'openai-responses'
+          ? request.verbosityOverride === null
+            ? { omitVerbosity: true }
+            : request.verbosityOverride !== undefined
+              ? { verbosity: request.verbosityOverride }
+              : {}
           : {}),
         attempt: 1,
         ...makeProviderProgress(1)
@@ -2337,7 +2389,7 @@ export class AiService {
           messages,
           request.requestId,
           controller.signal,
-          { stream: true, attempt: 1, ...makeProviderProgress(1) }
+          { stream: true, attempt: 1, omitVerbosity: true, ...makeProviderProgress(1) }
         )
         rememberProviderResponse(result)
         if (result.truncated) throw new Error('The model response was truncated before a complete document was returned.')
@@ -2357,7 +2409,7 @@ export class AiService {
           controller.signal,
           true,
           true,
-          { stream: true, attempt: 2, ...makeProviderProgress(2) }
+          { stream: true, attempt: 2, omitVerbosity: true, ...makeProviderProgress(2) }
         )
         const markdown = repaired.content
         const contextSummaryCandidate = state.settings.contextMode === 'summary'
@@ -2432,6 +2484,7 @@ export class AiService {
             maxTokens,
             allowEmptyToolResponse: true,
             disableStreamFallback: true,
+            omitVerbosity: true,
             attempt: agentRequest.attempt ?? 1,
             ...makeProviderProgress(agentRequest.attempt ?? 1),
             ...(transport === 'native-strict'
@@ -2536,6 +2589,7 @@ export class AiService {
             agentRequest.signal,
             {
               stream: true,
+              omitVerbosity: true,
               attempt: agentRequest.attempt ?? 1,
               ...makeProviderProgress(agentRequest.attempt ?? 1)
             }
