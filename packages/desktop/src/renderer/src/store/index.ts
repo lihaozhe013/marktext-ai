@@ -8,6 +8,7 @@ export const useMainStore = defineStore('main', () => {
   // Platform of system: 'darwin' | 'win32' | 'linux'
   const platform = ref<NodeJS.Platform>(window.electron.process.platform)
   const appVersion = ref<string>(window.electron.process.env.MARKTEXT_VERSION_STRING ?? '')
+  const gitHash = ref<string>(window.electron.process.env.MARKTEXT_GIT_HASH ?? '')
   // Whether current window is active or focused
   const windowActive = ref(true)
   // Whether MarkText is initialized
@@ -32,6 +33,7 @@ export const useMainStore = defineStore('main', () => {
   return {
     platform,
     appVersion,
+    gitHash,
     windowActive,
     init,
     SET_WIN_STATUS,

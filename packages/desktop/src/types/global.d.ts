@@ -17,6 +17,7 @@ declare global {
   // ---- Build-time defines (electron-vite `define`) ----
   const MARKTEXT_VERSION: string
   const MARKTEXT_VERSION_STRING: string
+  const MARKTEXT_GIT_HASH: string
   const __static: string
 
   // ---- contextBridge surface ----

@@ -1,4 +1,5 @@
 import { resolve, dirname } from 'path'
+import { execSync } from 'child_process'
 import type { PluginOption } from 'vite'
 import { defineConfig } from 'electron-vite'
 import vue from '@vitejs/plugin-vue'
@@ -9,6 +10,13 @@ import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
+
+let gitHash = 'unknown'
+try {
+  gitHash = execSync('git rev-parse --short HEAD', { cwd: __dirname }).toString().trim()
+} catch {
+  // Not in a git repo (e.g. building from a release tarball) — fall back to 'unknown'
+}
 
 export default defineConfig({
   main: {
@@ -29,7 +37,8 @@ export default defineConfig({
     },
     define: {
       MARKTEXT_VERSION: JSON.stringify(packageJson.version),
-      MARKTEXT_VERSION_STRING: JSON.stringify(`v${packageJson.version}`)
+      MARKTEXT_VERSION_STRING: JSON.stringify(`v${packageJson.version}`),
+      MARKTEXT_GIT_HASH: JSON.stringify(gitHash)
     },
     resolve: {
       alias: {

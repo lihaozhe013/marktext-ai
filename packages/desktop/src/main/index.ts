@@ -17,6 +17,7 @@ import { registerSandboxIpcHandlers } from './ipc'
 // Set version strings into global and process.versions
 process.env.MARKTEXT_VERSION = MARKTEXT_VERSION
 process.env.MARKTEXT_VERSION_STRING = MARKTEXT_VERSION_STRING
+process.env.MARKTEXT_GIT_HASH = MARKTEXT_GIT_HASH
 
 // -----------------------------------------------
 // Exception handling and logging setup
