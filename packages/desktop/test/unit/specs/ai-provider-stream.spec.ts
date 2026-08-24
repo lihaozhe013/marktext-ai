@@ -119,6 +119,68 @@ describe('provider response streams', () => {
     expect(result.reasoning).toBe('Plan')
   })
 
+  it('assembles a typed Responses stream, summary, response id, and usage', async() => {
+    const result = await consumeProviderStream(
+      'openai-responses',
+      streamFrom([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}\n\n',
+        'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"Plan first."}\n\n',
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Done"}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"Plan first."}]},{"type":"message","content":[{"type":"output_text","text":"Done"}]}],"usage":{"input_tokens":12,"output_tokens":3}}}\n\n'
+      ]),
+      undefined
+    )
+
+    expect(result.content).toBe('Done')
+    expect(result.reasoning).toBe('Plan first.')
+    expect(result.responseId).toBe('resp_1')
+    expect(result.usage).toEqual({ inputTokens: 12, outputTokens: 3 })
+  })
+
+  it('assembles Responses function-call argument deltas and rejects incomplete streams', async() => {
+    const result = await consumeProviderStream(
+      'openai-responses',
+      streamFrom([
+        'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"apply_markdown_edit"}}\n\n',
+        'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"{\\"search\\":\\"old\\"}"}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"apply_markdown_edit","arguments":"{\\"search\\":\\"old\\"}"}]}}\n\n'
+      ]),
+      undefined
+    )
+    expect(result.toolCalls).toEqual([{ id: 'call_1', name: 'apply_markdown_edit', input: { search: 'old' }, rawInput: '{"search":"old"}' }])
+
+    await expect(consumeProviderStream(
+      'openai-responses',
+      streamFrom(['event: response.output_text.delta\ndata: {"delta":"partial"}\n\n']),
+      undefined
+    )).rejects.toThrow('terminal event')
+  })
+
+  it('reports a Responses refusal separately from answer content', async() => {
+    await expect(consumeProviderStream(
+      'openai-responses',
+      streamFrom([
+        'event: response.refusal.delta\ndata: {"type":"response.refusal.delta","delta":"Not "}\n\n',
+        'event: response.refusal.delta\ndata: {"type":"response.refusal.delta","delta":"allowed"}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_3","status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"Not allowed"}]}]}}\n\n'
+      ]),
+      undefined
+    )).rejects.toThrow('Provider refusal: Not allowed')
+  })
+
+  it('marks max_output_tokens Responses completions as truncated', async() => {
+    const result = await consumeProviderStream(
+      'openai-responses',
+      streamFrom([
+        'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"id":"resp_4","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"Partial"}]}]}}\n\n'
+      ]),
+      undefined
+    )
+    expect(result.content).toBe('Partial')
+    expect(result.truncated).toBe(true)
+    expect(result.finishReason).toBe('incomplete')
+  })
+
   it('stops promptly when the signal is aborted', async() => {
     const controller = new AbortController()
     const body = new ReadableStream<Uint8Array>({

@@ -40,6 +40,12 @@ export class AiChatStore {
         ...(normalized.requestBodyPresetOverrides?.length
           ? { requestBodyPresetOverrides: normalized.requestBodyPresetOverrides }
           : {}),
+        ...(normalized.reasoningEffortOverrides?.length
+          ? { reasoningEffortOverrides: normalized.reasoningEffortOverrides }
+          : {}),
+        ...(normalized.responsesConversation
+          ? { responsesConversation: normalized.responsesConversation }
+          : {}),
         ...(normalized.contextSummary
           ? { contextSummary: normalized.contextSummary }
           : {})

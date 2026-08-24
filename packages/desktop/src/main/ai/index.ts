@@ -20,8 +20,12 @@ import type {
   AiJsonValue,
   AiRequestBodyPreset,
   AiRequestBodyPresetOverride,
+  AiReasoningEffort,
   AiReasoningField,
   AiReasoningTag,
+  AiReasoningEffortOverride,
+  AiResponsesModelOptions,
+  AiResponsesConversationState,
   AiRecoveryInfo,
   AiPreparedRevision,
   AiRequest,
@@ -39,7 +43,7 @@ import {
 } from '@shared/types/ai'
 import { runDocumentEditAgent, type AgentPlanStep } from './documentEditAgent'
 import { AiAttachmentStore, normalizeAttachmentUploads, normalizeImageAttachment, normalizeImageUpload, normalizePdfAttachment, orderAttachmentLocations } from './attachments'
-import { serializeProviderMessages, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition, type ProviderToolResult } from './providerMessages'
+import { serializeProviderMessages, serializeResponsesInput, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition, type ProviderToolResult } from './providerMessages'
 import { consumeProviderStream, estimateTokenCount, type ProviderStreamProgress, type ProviderUsage } from './providerStream'
 import { extractProviderContentParts, normalizeProviderContent, readReasoningField, type ProviderReasoningCompatibility } from './providerReasoning'
 import {
@@ -70,7 +74,9 @@ import {
   MAX_CONTEXT_SUMMARY_CHARS
 } from './contextCompaction'
 
-const DEFAULT_PROTOCOL = 'openai-chat-completions' as const
+// The new protocol fields are additive and remain compatible with the existing
+// persisted schema. Keep the version stable so legacy migrations continue to
+// preserve their established on-disk contract.
 const SETTINGS_SCHEMA_VERSION = 8
 const SETTINGS_FILE = 'ai-connection.json'
 const KEY_FILE = 'ai-connection-key.json'
@@ -104,6 +110,7 @@ interface ProviderResponse {
   toolCalls?: ProviderToolCall[]
   usage?: ProviderUsage
   finishReason?: string
+  responseId?: string
 }
 
 export type ProviderToolChoice = 'required' | 'auto' | { name: string }
@@ -120,6 +127,11 @@ interface ProviderRequestOptions {
   attempt?: number
   onWaiting?: () => void
   onProgress?: (progress: ProviderStreamProgress) => void
+  previousResponseId?: string
+  store?: boolean
+  reasoningEffort?: AiReasoningEffort
+  omitReasoningEffort?: boolean
+  reasoningSummary?: boolean
 }
 
 type AgentTransportMode = 'native-strict' | 'native-compatible' | 'json-envelope'
@@ -129,6 +141,7 @@ type AiProgressSink = (event: AiProgressEvent) => void
 interface RepairedMarkdownResult {
   content: string
   reasoning?: string
+  responseId?: string
   recovery: AiRecoveryInfo
 }
 
@@ -403,6 +416,26 @@ const mergeJsonValue = (base: unknown, override: AiJsonValue): unknown => {
 const mergeRequestBodyPreset = (body: Record<string, unknown>, preset: AiRequestBodyPreset): Record<string, unknown> =>
   mergeJsonValue(body, preset.body) as Record<string, unknown>
 
+const validateResponsesPresetBody = (body: Record<string, AiJsonValue>): void => {
+  const reserved = new Set([
+    'model',
+    'input',
+    'instructions',
+    'stream',
+    'store',
+    'previous_response_id',
+    'tools',
+    'tool_choice',
+    'parallel_tool_calls'
+  ])
+  const conflict = Object.keys(body).find(key => reserved.has(key))
+  const reasoning = isRecord(body.reasoning) ? body.reasoning : undefined
+  const reasoningConflict = reasoning && ('effort' in reasoning || 'summary' in reasoning || 'generate_summary' in reasoning)
+  if (conflict || reasoningConflict) {
+    throw new Error('Responses advanced JSON cannot override model input, session state, tools, stream, or reasoning effort/summary. Use the standard controls instead.')
+  }
+}
+
 const normalizeEditAutoRetryCount = (value: unknown): number => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_EDIT_AUTO_RETRY_COUNT
   return Math.min(MAX_EDIT_AUTO_RETRY_COUNT, Math.max(0, Math.floor(value)))
@@ -416,6 +449,28 @@ const normalizeFailureOutputAfter = (value: unknown): number => {
 const normalizeContextMode = (value: unknown): StoredSettings['contextMode'] =>
   value === 'summary' ? 'summary' : DEFAULT_CONTEXT_MODE
 
+const isReasoningEffort = (value: unknown): value is AiReasoningEffort =>
+  value === 'none' || value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max'
+
+const normalizeResponsesModelOptions = (value: unknown, strict = false): AiResponsesModelOptions | undefined => {
+  if (!isRecord(value)) return undefined
+  const reasoningEffort = value.reasoningEffort
+  const reasoningSummary = value.reasoningSummary
+  if (reasoningEffort !== undefined && !isReasoningEffort(reasoningEffort)) {
+    if (strict) throw new Error('Responses reasoning effort must be a supported effort value or empty.')
+    return undefined
+  }
+  if (reasoningSummary !== undefined && typeof reasoningSummary !== 'boolean') {
+    if (strict) throw new Error('Responses reasoning summary must be a boolean.')
+    return undefined
+  }
+  if (reasoningEffort === undefined && reasoningSummary === undefined) return undefined
+  return {
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    ...(reasoningSummary !== undefined ? { reasoningSummary } : {})
+  }
+}
+
 const normalizeModelCapabilities = (value: unknown, strict = false): AiModelProfile['capabilities'] => {
   if (!isRecord(value)) return undefined
   const requestBodyPresets = value.requestBodyPresets
@@ -423,6 +478,7 @@ const normalizeModelCapabilities = (value: unknown, strict = false): AiModelProf
   const reasoningField = value.reasoningField
   const reasoningTag = value.reasoningTag
   const replayReasoning = value.replayReasoning
+  const responses = normalizeResponsesModelOptions(value.responses, strict)
   const normalizedRequestBodyPresets = requestBodyPresets !== undefined
     ? normalizeRequestBodyPresetConfig(requestBodyPresets, strict)
     : legacyReasoningEffort !== undefined
@@ -436,9 +492,10 @@ const normalizeModelCapabilities = (value: unknown, strict = false): AiModelProf
     (reasoningTag !== undefined && reasoningTag !== 'think' && reasoningTag !== 'thinking' && reasoningTag !== 'analysis' && reasoningTag !== 'reasoning') ||
     (replayReasoning !== undefined && typeof replayReasoning !== 'boolean')
   ) return undefined
-  if (normalizedRequestBodyPresets === undefined && reasoningField === undefined && reasoningTag === undefined && replayReasoning === undefined) return undefined
+  if (normalizedRequestBodyPresets === undefined && responses === undefined && reasoningField === undefined && reasoningTag === undefined && replayReasoning === undefined) return undefined
   return {
     ...(normalizedRequestBodyPresets ? { requestBodyPresets: normalizedRequestBodyPresets } : {}),
+    ...(responses ? { responses } : {}),
     ...(reasoningField !== undefined ? { reasoningField: reasoningField as AiReasoningField } : {}),
     ...(reasoningTag !== undefined ? { reasoningTag: reasoningTag as AiReasoningTag } : {}),
     ...(replayReasoning !== undefined ? { replayReasoning } : {})
@@ -460,7 +517,11 @@ const normalizeModelProfile = (value: unknown, strict = false): AiModelProfile |
 
 const normalizeStoredConnection = (value: unknown, index: number): StoredConnection | undefined => {
   if (!isRecord(value)) return undefined
-  const protocol = value.protocol === 'anthropic-messages' ? 'anthropic-messages' : DEFAULT_PROTOCOL
+  const protocol = value.protocol === 'anthropic-messages'
+    ? 'anthropic-messages'
+    : value.protocol === 'openai-responses'
+      ? 'openai-responses'
+      : 'openai-chat-completions'
   const endpoint = typeof value.endpoint === 'string' ? value.endpoint : ''
   const models = Array.isArray(value.models)
     ? value.models.map(model => normalizeModelProfile(model)).filter((model): model is AiModelProfile => !!model)
@@ -513,7 +574,7 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
   const legacyConnection: StoredConnection = {
     id: 'legacy-default',
     name: 'Default connection',
-    protocol: legacyValue.protocol === 'anthropic-messages' ? 'anthropic-messages' : DEFAULT_PROTOCOL,
+    protocol: legacyValue.protocol === 'anthropic-messages' ? 'anthropic-messages' : 'openai-chat-completions',
     endpoint: typeof legacyValue.endpoint === 'string' ? legacyValue.endpoint : '',
     models: legacyModel
       ? [{ id: 'legacy-default-model', model: legacyModel, label: legacyModel, source: 'manual' }]
@@ -556,7 +617,7 @@ const validateConnectionInput = (input: AiConnectionInput): {
   endpoint: string
   models: AiModelProfile[]
 } => {
-  if (input.protocol !== 'openai-chat-completions' && input.protocol !== 'anthropic-messages') {
+  if (input.protocol !== 'openai-responses' && input.protocol !== 'openai-chat-completions' && input.protocol !== 'anthropic-messages') {
     throw new Error('Unsupported AI protocol.')
   }
   const endpoint = validateEndpoint(input.endpoint)
@@ -565,6 +626,11 @@ const validateConnectionInput = (input: AiConnectionInput): {
   const models = input.models
     .map(model => normalizeModelProfile({ ...model, model: model.model.trim() }, true))
     .filter((model): model is AiModelProfile => !!model)
+  if (input.protocol === 'openai-responses') {
+    for (const model of models) {
+      for (const preset of model.capabilities?.requestBodyPresets?.presets ?? []) validateResponsesPresetBody(preset.body)
+    }
+  }
   const dedupedModels = Array.from(new Map(models.map(model => [model.model, model])).values())
   return {
     id: input.id?.trim() || `connection-${crypto.randomUUID()}`,
@@ -617,7 +683,7 @@ const normalizeMessageModel = (value: unknown): AiMessageModel | undefined => {
     typeof value.modelId !== 'string' ||
     typeof value.connectionName !== 'string' ||
     typeof value.model !== 'string' ||
-    (value.protocol !== 'openai-chat-completions' && value.protocol !== 'anthropic-messages')
+    (value.protocol !== 'openai-responses' && value.protocol !== 'openai-chat-completions' && value.protocol !== 'anthropic-messages')
   ) return undefined
   return {
     connectionId: value.connectionId,
@@ -779,13 +845,43 @@ const normalizeRequestBodyPresetOverrides = (value: unknown): AiRequestBodyPrese
   return overrides.size ? Array.from(overrides.values()) : undefined
 }
 
+const normalizeReasoningEffortOverrides = (value: unknown): AiReasoningEffortOverride[] | undefined => {
+  if (!Array.isArray(value)) return undefined
+  const overrides = new Map<string, AiReasoningEffortOverride>()
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const modelRef = normalizeModelRef(item.modelRef)
+    if (!modelRef) continue
+    if (item.effort !== null && !isReasoningEffort(item.effort)) continue
+    const normalized = { modelRef, effort: item.effort as AiReasoningEffort | null }
+    overrides.set(`${modelRef.connectionId}\u0000${modelRef.modelId}`, normalized)
+  }
+  return overrides.size ? Array.from(overrides.values()) : undefined
+}
+
+const normalizeResponsesConversation = (value: unknown): AiResponsesConversationState | undefined => {
+  if (!isRecord(value)) return undefined
+  const modelRef = normalizeModelRef(value.modelRef)
+  if (!modelRef || typeof value.previousResponseId !== 'string' || !value.previousResponseId.trim() || typeof value.anchorMessageId !== 'string' || !value.anchorMessageId.trim()) return undefined
+  return {
+    modelRef,
+    previousResponseId: value.previousResponseId.trim(),
+    anchorMessageId: value.anchorMessageId.trim()
+  }
+}
+
 const normalizeChatSession = (value: unknown): AiChatSession => {
   if (Array.isArray(value)) return { messages: normalizeMessages(value) }
   if (!isRecord(value)) return { messages: [] }
+  const legacyPresetOverrides = Array.isArray(value.reasoningEffortOverrides)
+    ? value.reasoningEffortOverrides.filter(item => isRecord(item) && item.effort === undefined)
+    : undefined
   return {
     messages: normalizeMessages(value.messages),
     selectedModel: normalizeModelRef(value.selectedModel),
-    requestBodyPresetOverrides: normalizeRequestBodyPresetOverrides(value.requestBodyPresetOverrides ?? value.reasoningEffortOverrides),
+    requestBodyPresetOverrides: normalizeRequestBodyPresetOverrides(value.requestBodyPresetOverrides ?? legacyPresetOverrides),
+    reasoningEffortOverrides: normalizeReasoningEffortOverrides(value.reasoningEffortOverrides),
+    responsesConversation: normalizeResponsesConversation(value.responsesConversation),
     contextSummary: typeof value.contextSummary === 'string'
       ? value.contextSummary.trim().slice(0, MAX_CONTEXT_SUMMARY_CHARS) || undefined
       : undefined
@@ -796,8 +892,33 @@ const extractResponseContent = (
   payload: unknown,
   protocol: AiProtocol,
   compatibility: ProviderReasoningCompatibility
-): { content: string; rawContent?: string; reasoning?: string } => {
+): { content: string; rawContent?: string; reasoning?: string; refusal?: string } => {
   if (!isRecord(payload)) return { content: '' }
+  if (protocol === 'openai-responses') {
+    const output = Array.isArray(payload.output) ? payload.output : []
+    const visible: string[] = []
+    const reasoning: string[] = []
+    const refusals: string[] = []
+    for (const item of output) {
+      if (!isRecord(item)) continue
+      if (item.type === 'message' && Array.isArray(item.content)) {
+        for (const part of item.content) {
+          if (!isRecord(part)) continue
+          if (part.type === 'output_text' && typeof part.text === 'string') visible.push(part.text)
+          else if (part.type === 'refusal' && typeof part.refusal === 'string') refusals.push(part.refusal)
+        }
+      } else if (item.type === 'reasoning' && Array.isArray(item.summary)) {
+        for (const part of item.summary) {
+          if (isRecord(part) && part.type === 'summary_text' && typeof part.text === 'string') reasoning.push(part.text)
+        }
+      }
+    }
+    if (!visible.length && typeof payload.output_text === 'string') visible.push(payload.output_text)
+    return {
+      ...normalizeProviderContent(visible.join(''), reasoning.join('\n\n'), compatibility, 'native'),
+      ...(refusals.length ? { refusal: refusals.join('\n\n') } : {})
+    }
+  }
   if (protocol === 'anthropic-messages') {
     const native = extractProviderContentParts(payload, protocol, compatibility)
     if (native.content || native.reasoning) return native
@@ -848,6 +969,10 @@ const extractResponseContent = (
 
 const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean => {
   if (!isRecord(payload)) return false
+  if (protocol === 'openai-responses') {
+    const incomplete = isRecord(payload.incomplete_details) ? payload.incomplete_details : undefined
+    return payload.status === 'incomplete' || incomplete?.reason === 'max_output_tokens'
+  }
   if (protocol === 'anthropic-messages') return payload.stop_reason === 'max_tokens'
   const choices = payload.choices
   if (!Array.isArray(choices) || !isRecord(choices[0])) return false
@@ -856,6 +981,11 @@ const isTruncatedResponse = (payload: unknown, protocol: AiProtocol): boolean =>
 
 const extractFinishReason = (payload: unknown, protocol: AiProtocol): string | undefined => {
   if (!isRecord(payload)) return undefined
+  if (protocol === 'openai-responses') {
+    if (typeof payload.status === 'string') return payload.status
+    const incomplete = isRecord(payload.incomplete_details) ? payload.incomplete_details : undefined
+    return typeof incomplete?.reason === 'string' ? incomplete.reason : undefined
+  }
   if (protocol === 'anthropic-messages') return typeof payload.stop_reason === 'string' ? payload.stop_reason : undefined
   const choices = payload.choices
   if (!Array.isArray(choices) || !isRecord(choices[0])) return undefined
@@ -864,6 +994,22 @@ const extractFinishReason = (payload: unknown, protocol: AiProtocol): string | u
 
 const extractUsage = (payload: unknown, protocol: AiProtocol): ProviderUsage | undefined => {
   if (!isRecord(payload)) return undefined
+  if (protocol === 'openai-responses') {
+    const usage = isRecord(payload.usage) ? payload.usage : undefined
+    if (!usage) return undefined
+    const inputDetails = isRecord(usage.input_tokens_details) ? usage.input_tokens_details : undefined
+    const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : undefined
+    const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : undefined
+    const cachedInputTokens = typeof inputDetails?.cached_tokens === 'number' ? inputDetails.cached_tokens : undefined
+    const cacheWriteInputTokens = typeof inputDetails?.cache_write_tokens === 'number' ? inputDetails.cache_write_tokens : undefined
+    if (inputTokens === undefined && outputTokens === undefined && cachedInputTokens === undefined && cacheWriteInputTokens === undefined) return undefined
+    return {
+      ...(inputTokens !== undefined ? { inputTokens } : {}),
+      ...(outputTokens !== undefined ? { outputTokens } : {}),
+      ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+      ...(cacheWriteInputTokens !== undefined ? { cacheWriteInputTokens } : {})
+    }
+  }
   const usage = isRecord(payload.usage)
     ? payload.usage
     : protocol === 'anthropic-messages' && isRecord(payload.message) && isRecord(payload.message.usage)
@@ -1289,6 +1435,33 @@ export class AiService {
                 ? { type: 'tool', name: options.toolChoice.name }
                 : { type: 'any' }
           }
+        } else if (settings.protocol === 'openai-responses') {
+          headers.authorization = `Bearer ${apiKey}`
+          headers['api-key'] = apiKey
+          body = {
+            model,
+            instructions: effectiveSystem,
+            input: serializeResponsesInput(messages),
+            max_output_tokens: options.maxTokens ?? 8192,
+            ...(streaming ? { stream: true } : {}),
+            store: options.store ?? false,
+            ...(options.previousResponseId ? { previous_response_id: options.previousResponseId } : {})
+          }
+          if (options.tools?.length) {
+            body.tools = options.tools.map(tool => ({
+              type: 'function',
+              name: tool.name,
+              description: tool.description,
+              parameters: tool.parameters,
+              ...(tool.strict !== undefined ? { strict: tool.strict } : {})
+            }))
+            body.tool_choice = options.toolChoice === 'auto'
+              ? 'auto'
+              : typeof options.toolChoice === 'object'
+                ? { type: 'function', name: options.toolChoice.name }
+                : 'required'
+            if (options.parallelToolCalls !== undefined) body.parallel_tool_calls = options.parallelToolCalls
+          }
         } else {
           headers.authorization = `Bearer ${apiKey}`
           // Some OpenAI-compatible gateways, including MiMo Token Plan, document
@@ -1319,6 +1492,7 @@ export class AiService {
           }
         }
         if (!options.omitRequestBodyPreset && target.requestBodyPreset) {
+          if (settings.protocol === 'openai-responses') validateResponsesPresetBody(target.requestBodyPreset.body)
           body = mergeRequestBodyPreset(body, target.requestBodyPreset)
           requestBodyPresetLog(
             'applied presetId=%s presetName=%s topLevelKeys=%s model=%s requestId=%s',
@@ -1328,6 +1502,29 @@ export class AiService {
             model,
             requestId
           )
+        }
+        if (settings.protocol === 'openai-responses') {
+          const responseOptions = target.model.capabilities?.responses
+          const reasoning = isRecord(body.reasoning) ? body.reasoning : {}
+          const effort = options.omitReasoningEffort
+            ? undefined
+            : options.reasoningEffort ?? responseOptions?.reasoningEffort
+          if (effort) reasoning.effort = effort
+          else delete reasoning.effort
+          const summary = options.reasoningSummary ?? responseOptions?.reasoningSummary
+          if (summary) reasoning.summary = 'auto'
+          else delete reasoning.summary
+          delete reasoning.generate_summary
+          if (Object.keys(reasoning).length) body.reasoning = reasoning
+          else delete body.reasoning
+          body.model = model
+          body.instructions = effectiveSystem
+          body.input = serializeResponsesInput(messages)
+          body.store = options.store ?? false
+          if (options.previousResponseId) body.previous_response_id = options.previousResponseId
+          else delete body.previous_response_id
+          if (streaming) body.stream = true
+          else delete body.stream
         }
         if (streamFallbackOverride === false) delete body.stream
         else if (streamFallbackOverride === true) body.stream = true
@@ -1431,6 +1628,9 @@ export class AiService {
         const extracted = extractResponseContent(payload, settings.protocol, compatibility)
         const content = extracted.content
         const toolCalls = extractToolCalls(payload, settings.protocol)
+        if (settings.protocol === 'openai-responses' && extracted.refusal && !content && !toolCalls.length) {
+          throw new Error(`Provider refusal: ${extracted.refusal}`)
+        }
         if (!content && !toolCalls.length && !options.allowEmptyToolResponse) throw new Error('The provider returned no text content.')
         const usage = extractUsage(payload, settings.protocol)
         options.onProgress?.({
@@ -1447,7 +1647,10 @@ export class AiService {
           toolCalls,
           usage,
           truncated: isTruncatedResponse(payload, settings.protocol),
-          finishReason: extractFinishReason(payload, settings.protocol)
+          finishReason: extractFinishReason(payload, settings.protocol),
+          ...(settings.protocol === 'openai-responses' && isRecord(payload) && typeof payload.id === 'string'
+            ? { responseId: payload.id }
+            : {})
         }
       }
     } catch (error) {
@@ -1646,6 +1849,7 @@ export class AiService {
       return {
         content: normalized.content.trim(),
         reasoning: generated.reasoning,
+        responseId: generated.responseId,
         recovery: {
           strategy: normalized.changes.length ? 'local-normalization' : 'direct',
           attempts: 1,
@@ -1655,24 +1859,37 @@ export class AiService {
     }
     const failure = inspection.issues.map(issue => issue.message).join(' ')
     try {
+      const continueResponsesConversation = target.connection.protocol === 'openai-responses' && providerOptions.store === true && !strict && !!generated.responseId
+      const repairMessages = continueResponsesConversation
+        ? [{ role: 'user' as const, content: buildMarkdownFormatRepairPrompt(failure) }]
+        : [
+          ...messages,
+          { role: 'assistant' as const, content: generated.content, reasoning: generated.reasoning },
+          { role: 'user' as const, content: buildMarkdownFormatRepairPrompt(failure) }
+        ]
       const repaired = await this.requestProvider(
         target,
         system,
-        [
-          ...messages,
-          { role: 'assistant', content: generated.content, reasoning: generated.reasoning },
-          { role: 'user', content: buildMarkdownFormatRepairPrompt(failure) }
-        ],
+        repairMessages,
         requestId,
         signal,
-        providerOptions
+        {
+          ...providerOptions,
+          ...(continueResponsesConversation
+            ? { previousResponseId: generated.responseId, store: true }
+            : {})
+        }
       )
       const repairedNormalized = normalizeGeneratedMarkdown(repaired.content, { stripOuterFence })
+      if (target.connection.protocol === 'openai-responses' && repaired.truncated) {
+        throw new Error('The Responses API repair response was truncated before a complete document was returned.')
+      }
       const repairedInspection = inspectMarkdown(repairedNormalized.content)
       if (repairedInspection.issues.length) throw new Error(repairedInspection.issues.map(issue => issue.message).join(' '))
       return {
         content: repairedNormalized.content.trim(),
         reasoning: repaired.reasoning ?? generated.reasoning,
+        responseId: repaired.responseId ?? generated.responseId,
         recovery: {
           strategy: 'model-repair',
           attempts: 2,
@@ -1684,6 +1901,7 @@ export class AiService {
         return {
           content: normalized.content.trim(),
           reasoning: generated.reasoning,
+          responseId: generated.responseId,
           recovery: {
             strategy: normalized.changes.length ? 'local-normalization' : 'direct',
             attempts: 2,
@@ -1758,6 +1976,9 @@ export class AiService {
     if (!request.requestId || !request.documentId) throw new Error('Invalid AI request.')
     const state = await this.readSettingsState()
     const target = await this.resolveModelTarget(request.modelRef, state)
+    if (target.connection.protocol === 'openai-responses' && request.reasoningEffortOverride !== undefined && request.reasoningEffortOverride !== null && !isReasoningEffort(request.reasoningEffortOverride)) {
+      throw new Error('Responses reasoning effort is unsupported. Choose a standard effort or Provider default.')
+    }
     target.requestBodyPreset = resolveRequestBodyPreset(target.model, request.requestBodyPresetOverride)
     requestBodyPresetLog(
       'resolved presetId=%s override=%s model=%s requestId=%s',
@@ -1969,19 +2190,81 @@ export class AiService {
     }
     if (request.mode === 'answer') {
       const promptToken = makePromptToken('MT_CONTEXT')
-      const messages = await this.hydrateProviderMessages([
+      const fullMessages = await this.hydrateProviderMessages([
         ...recentMessages,
         { role: 'user', content: buildDocumentPrompt(request.prompt, request.markdown, promptToken), attachments: currentAttachments }
       ], priorityAttachmentIds, request.renderedPdfPages)
-      const result = await this.requestProvider(
-        target,
-        buildAnswerSystemPrompt(promptToken),
-        messages,
-        request.requestId,
-        undefined,
-        { stream: true, attempt: 1, ...makeProviderProgress(1) }
-      )
+      const latestAssistant = normalizedRequestMessages
+        .filter(message => message.kind !== 'status' && message.role === 'assistant')
+        .at(-1)
+      const latestConversationMessage = normalizedRequestMessages
+        .filter(message => message.kind !== 'status')
+        .at(-1)
+      const requestedConversation = normalizeResponsesConversation(request.responsesConversation)
+      const canContinueResponsesConversation = settings.protocol === 'openai-responses' &&
+        state.settings.contextMode === 'recent' &&
+        !!requestedConversation &&
+        requestedConversation.modelRef.connectionId === target.ref.connectionId &&
+        requestedConversation.modelRef.modelId === target.ref.modelId &&
+        !!latestAssistant &&
+        latestConversationMessage?.role === 'assistant' &&
+        latestAssistant.id === requestedConversation.anchorMessageId
+      const messages = canContinueResponsesConversation
+        ? await this.hydrateProviderMessages([
+          { role: 'user', content: buildDocumentPrompt(request.prompt, request.markdown, promptToken), attachments: currentAttachments }
+        ], priorityAttachmentIds, request.renderedPdfPages)
+        : fullMessages
+      const responseOptions: ProviderRequestOptions = {
+        stream: true,
+        store: settings.protocol === 'openai-responses' && state.settings.contextMode === 'recent',
+        ...(canContinueResponsesConversation && requestedConversation
+          ? { previousResponseId: requestedConversation.previousResponseId }
+          : {}),
+        ...(settings.protocol === 'openai-responses'
+          ? request.reasoningEffortOverride === null
+            ? { omitReasoningEffort: true }
+            : request.reasoningEffortOverride !== undefined
+              ? { reasoningEffort: request.reasoningEffortOverride }
+              : {}
+          : {}),
+        ...(settings.protocol === 'openai-responses'
+          ? { reasoningSummary: target.model.capabilities?.responses?.reasoningSummary === true }
+          : {}),
+        attempt: 1,
+        ...makeProviderProgress(1)
+      }
+      let result: ProviderResponse
+      try {
+        result = await this.requestProvider(
+          target,
+          buildAnswerSystemPrompt(promptToken),
+          messages,
+          request.requestId,
+          undefined,
+          responseOptions
+        )
+      } catch (error) {
+        const providerError = error instanceof ProviderRequestError ? error : undefined
+        const errorText = providerError ? `${providerError.providerMessage} ${providerError.providerParam ?? ''}` : ''
+        const previousIdRejected = canContinueResponsesConversation &&
+          !!providerError &&
+          [400, 404].includes(providerError.status) &&
+          /previous[_ -]?response[_ -]?id|previous response/i.test(errorText)
+        if (!previousIdRejected) throw error
+        featureLog('responses conversation expired; rebuilding local context requestId=%s', request.requestId)
+        result = await this.requestProvider(
+          target,
+          buildAnswerSystemPrompt(promptToken),
+          fullMessages,
+          request.requestId,
+          undefined,
+          { ...responseOptions, previousResponseId: undefined, attempt: 2, ...makeProviderProgress(2) }
+        )
+      }
       rememberProviderResponse(result)
+      if (settings.protocol === 'openai-responses' && result.truncated) {
+        throw new Error('The Responses API response was truncated before a complete answer was returned.')
+      }
       emitProgress('validating', 1, {
         outputTokens: result.usage?.outputTokens ?? estimateTokenCount(result.content),
         outputTokensEstimated: result.usage?.outputTokens === undefined,
@@ -1998,7 +2281,7 @@ export class AiService {
         undefined,
         false,
         false,
-        { stream: true, attempt: 2, ...makeProviderProgress(2) }
+        { ...responseOptions, attempt: 2, ...makeProviderProgress(2) }
       )
       const contextSummaryCandidate = state.settings.contextMode === 'summary'
         ? await this.createContextSummary(
@@ -2027,6 +2310,9 @@ export class AiService {
         reasoning: repaired.reasoning,
         contextSummaryCandidate,
         recovery: repaired.recovery,
+        ...(settings.protocol === 'openai-responses' && responseOptions.store === true && repaired.responseId
+          ? { responsesConversationCandidate: { modelRef: target.ref, previousResponseId: repaired.responseId } }
+          : {}),
         documentId: request.documentId,
         baseMarkdown: request.markdown,
         model: toMessageModel(target)
@@ -2462,6 +2748,24 @@ const parseToolInput = (value: unknown): unknown => {
 
 const extractToolCalls = (payload: unknown, protocol: AiProtocol): ProviderToolCall[] => {
   if (!isRecord(payload)) return []
+  if (protocol === 'openai-responses') {
+    const output = payload.output
+    if (!Array.isArray(output)) return []
+    return output
+      .filter(isRecord)
+      .filter(item => item.type === 'function_call' && typeof item.name === 'string')
+      .map(item => {
+        const rawInput = typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {})
+        const input = parseToolInput(rawInput)
+        return {
+          id: typeof item.call_id === 'string' ? item.call_id : typeof item.id === 'string' ? item.id : '',
+          name: item.name as string,
+          input,
+          rawInput,
+          ...(input === undefined ? { parseError: 'The provider returned invalid JSON tool arguments.' } : {})
+        }
+      })
+  }
   if (protocol === 'anthropic-messages') {
     const content = payload.content
     if (!Array.isArray(content)) return []

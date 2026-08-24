@@ -28,6 +28,9 @@ import type {
   AiPreparedRevision,
   AiModelRef,
   AiRequestBodyPresetOverride,
+  AiReasoningEffort,
+  AiReasoningEffortOverride,
+  AiResponsesConversationState,
   AiProgressEvent,
   AiProgressInfo,
   AiProgressPhase,
@@ -130,6 +133,8 @@ export const useAiStore = defineStore('ai', () => {
   const contextSummary = ref<string | undefined>()
   const selectedModel = ref<AiModelRef | undefined>()
   const requestBodyPresetOverrides = ref<AiRequestBodyPresetOverride[]>([])
+  const reasoningEffortOverrides = ref<AiReasoningEffortOverride[]>([])
+  const responsesConversation = ref<AiResponsesConversationState | undefined>()
   const pendingAttachments = ref<PendingAiAttachment[]>([])
   const attachmentError = ref<AiAttachmentError>('')
   const loading = ref(false)
@@ -167,7 +172,10 @@ export const useAiStore = defineStore('ai', () => {
     label: model.label,
     protocol: connection.protocol,
     hasApiKey: connection.hasApiKey,
-    requestBodyPresets: model.capabilities?.requestBodyPresets
+    requestBodyPresets: model.capabilities?.requestBodyPresets,
+    ...(connection.protocol === 'openai-responses'
+      ? { responses: model.capabilities?.responses ?? {} }
+      : {})
   }))))
   const hasAnyApiKey = computed(() => settings.value.connections.some(connection => connection.hasApiKey))
 
@@ -190,11 +198,43 @@ export const useAiStore = defineStore('ai', () => {
     modelOptions.value.find(option => modelRefKey(option.ref) === modelRefKey(selectedModel.value))
   )
   const selectedRequestBodyPresets = computed(() => selectedModelOption.value?.requestBodyPresets)
+  const selectedResponsesModelOptions = computed(() => selectedModelOption.value?.responses)
   const requestBodyPresetSelection = computed(() => {
     const override = requestBodyPresetOverrideFor(selectedModel.value)
     if (override === undefined) return '__model_default__'
     return override === null ? '__omit__' : override
   })
+
+  const reasoningEffortOverrideFor = (modelRef: AiModelRef | undefined): AiReasoningEffort | null | undefined => {
+    if (!modelRef) return undefined
+    return reasoningEffortOverrides.value.find(item => modelRefKey(item.modelRef) === modelRefKey(modelRef))?.effort
+  }
+
+  const pruneReasoningEffortOverrides = (): void => {
+    reasoningEffortOverrides.value = reasoningEffortOverrides.value.filter(override => {
+      const option = modelOptions.value.find(item => modelRefKey(item.ref) === modelRefKey(override.modelRef))
+      return !!option?.responses
+    })
+  }
+
+  const reasoningEffortSelection = computed(() => {
+    const override = reasoningEffortOverrideFor(selectedModel.value)
+    if (override === undefined) return '__model_default__'
+    return override === null ? '__provider_default__' : override
+  })
+
+  const setReasoningEffort = (selection: string): void => {
+    const modelRef = selectedModel.value
+    if (!modelRef || !selectedResponsesModelOptions.value) return
+    reasoningEffortOverrides.value = reasoningEffortOverrides.value.filter(item => modelRefKey(item.modelRef) !== modelRefKey(modelRef))
+    if (selection !== '__model_default__') {
+      const effort = selection === '__provider_default__' ? null : selection as AiReasoningEffort
+      const valid: AiReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+      if (effort !== null && !valid.includes(effort)) return
+      reasoningEffortOverrides.value.push({ modelRef: { ...modelRef }, effort })
+    }
+    saveChat().catch(err => featureLog('reasoning effort save failed reason=%s', err instanceof Error ? err.message : String(err)))
+  }
 
   const setRequestBodyPreset = (selection: string): void => {
     const modelRef = selectedModel.value
@@ -336,13 +376,16 @@ export const useAiStore = defineStore('ai', () => {
   }
 
   const setSettings = (value: AiConnectionSettings): void => {
+    if (settings.value.contextMode !== value.contextMode) responsesConversation.value = undefined
     settings.value = value
     pruneRequestBodyPresetOverrides()
+    pruneReasoningEffortOverrides()
     if (!isValidModelRef(selectedModel.value)) resolveSelectedModel()
   }
 
   const selectModel = (value: AiModelRef): void => {
     if (!isValidModelRef(value)) return
+    if (modelRefKey(selectedModel.value) !== modelRefKey(value)) responsesConversation.value = undefined
     selectedModel.value = { ...value }
     saveChat().catch(err => featureLog('model selection save failed reason=%s', err instanceof Error ? err.message : String(err)))
   }
@@ -371,7 +414,10 @@ export const useAiStore = defineStore('ai', () => {
       messages.value = loadedSession.messages
       contextSummary.value = loadedSession.contextSummary
       requestBodyPresetOverrides.value = loadedSession.requestBodyPresetOverrides ?? []
+      reasoningEffortOverrides.value = loadedSession.reasoningEffortOverrides ?? []
+      responsesConversation.value = loadedSession.responsesConversation
       pruneRequestBodyPresetOverrides()
+      pruneReasoningEffortOverrides()
       selectedModel.value = loadedSession.selectedModel
       resolveSelectedModel()
       loadedChatDocumentId = documentId
@@ -381,6 +427,8 @@ export const useAiStore = defineStore('ai', () => {
       messages.value = []
       contextSummary.value = undefined
       requestBodyPresetOverrides.value = []
+      reasoningEffortOverrides.value = []
+      responsesConversation.value = undefined
       resolveSelectedModel()
       loadedChatDocumentId = documentId
     }
@@ -397,6 +445,10 @@ export const useAiStore = defineStore('ai', () => {
       messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
       selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined,
       requestBodyPresetOverrides: requestBodyPresetOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, presetId: item.presetId })),
+      reasoningEffortOverrides: reasoningEffortOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, effort: item.effort })),
+      responsesConversation: responsesConversation.value
+        ? { modelRef: { ...responsesConversation.value.modelRef }, previousResponseId: responsesConversation.value.previousResponseId, anchorMessageId: responsesConversation.value.anchorMessageId }
+        : undefined,
       contextSummary: contextSummary.value
     }
     return enqueueChatPersistence(() => window.electron.ipcRenderer.invoke('mt::ai::chat-save', documentId, session))
@@ -407,6 +459,8 @@ export const useAiStore = defineStore('ai', () => {
     messages.value = []
     contextSummary.value = undefined
     requestBodyPresetOverrides.value = []
+    reasoningEffortOverrides.value = []
+    responsesConversation.value = undefined
     selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
     currentProgress.value = undefined
@@ -434,17 +488,19 @@ export const useAiStore = defineStore('ai', () => {
       kind?: AiChatMessage['kind']
       progress?: AiProgressInfo
     } = {}
-  ): void => {
-    messages.value.push({
+  ): AiChatMessage => {
+    const message: AiChatMessage = {
       id: createId(),
       role,
       mode: messageMode,
       content,
       createdAt: Date.now(),
       ...options
-    })
+    }
+    messages.value.push(message)
     const retainedMessages = messages.value.slice(-MAX_STORED_CHAT_MESSAGES)
     messages.value = retainedMessages
+    return message
   }
 
   const currentProgress = ref<AiProgressInfo | undefined>()
@@ -761,6 +817,9 @@ export const useAiStore = defineStore('ai', () => {
         return
       }
       const contextMessages = messages.value.slice()
+      const requestResponsesConversation = responsesConversation.value
+        ? { ...responsesConversation.value, modelRef: { ...responsesConversation.value.modelRef } }
+        : undefined
       loading.value = true
       activeRequestId.value = requestId
       startLiveProgress(requestId, requestMode)
@@ -769,6 +828,7 @@ export const useAiStore = defineStore('ai', () => {
       await preparePendingPdfSelections(pending)
       const attachments = pending.map(item => item.attachment)
       const uploads: AiAttachmentUpload[] = pending.map(item => ({ ...item.attachment, data: new Uint8Array(item.data) }))
+      if (requestMode !== 'answer') responsesConversation.value = undefined
       appendMessage('user', value, requestMode, { attachments })
       await saveChat()
       if (renderingPdf.value) await enqueueProgress('pdf-rendering')
@@ -805,6 +865,8 @@ export const useAiStore = defineStore('ai', () => {
         markdown: baseMarkdown,
         modelRef: requestModel,
         requestBodyPresetOverride: requestBodyPresetOverrideFor(requestModel),
+        reasoningEffortOverride: reasoningEffortOverrideFor(requestModel),
+        responsesConversation: requestResponsesConversation,
         attachments: uploads,
         messages: toIpcChatMessages(contextMessages),
         contextSummary: contextSummary.value,
@@ -814,7 +876,10 @@ export const useAiStore = defineStore('ai', () => {
       await enqueueProgress('responded')
       if (requestMode === 'answer') {
         commitContextSummary(response)
-        appendMessage('assistant', response.content, requestMode, { model: response.model, reasoning: response.reasoning })
+        const assistantMessage = appendMessage('assistant', response.content, requestMode, { model: response.model, reasoning: response.reasoning })
+        responsesConversation.value = response.responsesConversationCandidate
+          ? { ...response.responsesConversationCandidate, anchorMessageId: assistantMessage.id }
+          : undefined
         lastAnswer.value = response.content
         await saveChat()
         await enqueueProgress('completed', finalProgressDetails())
@@ -842,6 +907,10 @@ export const useAiStore = defineStore('ai', () => {
       }
     } catch (err) {
       if (requestId === activeRequestId.value) {
+        if (requestMode === 'answer') {
+          responsesConversation.value = undefined
+          await saveChat()
+        }
         const partialFinalized = requestMode !== 'answer' && progressiveEditRequests.has(requestId)
           ? await finalizeUnexpectedProgressiveEdit(requestId, requestTabId, requestMode, baseMarkdown)
           : false
@@ -1213,6 +1282,8 @@ export const useAiStore = defineStore('ai', () => {
     selectedModelOption,
     selectedRequestBodyPresets,
     requestBodyPresetSelection,
+    selectedResponsesModelOptions,
+    reasoningEffortSelection,
     selectedModelKey: computed(() => modelRefKey(selectedModel.value)),
     mode,
     visible,
@@ -1236,6 +1307,7 @@ export const useAiStore = defineStore('ai', () => {
     setSettings,
     selectModel,
     setRequestBodyPreset,
+    setReasoningEffort,
     setDefaultModel,
     setWidth,
     addImageFiles,

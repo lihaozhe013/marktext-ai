@@ -126,8 +126,11 @@
         <section class="ai-setting-group">
           <label>{{ labels.protocol }}</label>
           <select v-model="form.protocol">
+            <option value="openai-responses">
+              OpenAI Responses / Compatible (Recommended)
+            </option>
             <option value="openai-chat-completions">
-              OpenAI Chat Completions / Compatible
+              OpenAI Chat Completions / Compatible (Legacy)
             </option>
             <option value="anthropic-messages">
               Anthropic Messages
@@ -196,8 +199,52 @@
                 ×
               </button>
             </div>
+            <div
+              v-if="form.protocol === 'openai-responses'"
+              class="responses-model-options"
+            >
+              <label>{{ labels.reasoningEffort }}</label>
+              <select
+                :value="model.capabilities?.responses?.reasoningEffort || ''"
+                @change="setResponsesReasoningEffort(model, ($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">
+                  {{ labels.providerDefault }}
+                </option>
+                <option value="none">
+                  none
+                </option>
+                <option value="minimal">
+                  minimal
+                </option>
+                <option value="low">
+                  low
+                </option>
+                <option value="medium">
+                  medium
+                </option>
+                <option value="high">
+                  high
+                </option>
+                <option value="xhigh">
+                  xhigh
+                </option>
+                <option value="max">
+                  max
+                </option>
+              </select>
+              <label class="checkbox-row">
+                <input
+                  type="checkbox"
+                  :checked="model.capabilities?.responses?.reasoningSummary === true"
+                  @change="setResponsesReasoningSummary(model, ($event.target as HTMLInputElement).checked)"
+                >
+                <span>{{ labels.reasoningSummary }}</span>
+              </label>
+              <small>{{ labels.responsesHint }}</small>
+            </div>
             <details class="model-advanced">
-              <summary>{{ labels.modelAdvanced }}</summary>
+              <summary>{{ labels.advancedCompatibility }}</summary>
               <label class="checkbox-row">
                 <input
                   type="checkbox"
@@ -388,7 +435,8 @@ import type {
   AiDiscoveredModel,
   AiModelCapabilities,
   AiRequestBodyPreset,
-  AiJsonValue
+  AiJsonValue,
+  AiReasoningEffort
 } from '@shared/types/ai'
 
 type FormModel = AiConnectionInput['models'][number]
@@ -397,7 +445,7 @@ const ai = useAiStore()
 const settings = ref<AiConnectionSettings>({ connections: [] })
 const form = reactive<AiConnectionInput>({
   name: '',
-  protocol: 'openai-chat-completions',
+  protocol: 'openai-responses',
   endpoint: '',
   models: []
 })
@@ -423,7 +471,7 @@ const labels = computed(() =>
     ? {
         title: 'AI 连接与模型',
         description:
-          '配置多个兼容 OpenAI Chat Completions 或 Anthropic Messages 的连接。密钥只保存在本机用户数据目录，不会发送到渲染进程。',
+          '配置多个 AI 连接。新连接默认优先使用 OpenAI Responses；Chat Completions 作为 Legacy compatibility 保留。密钥只保存在本机用户数据目录。',
         contextMode: '上下文模式',
         contextModeRecent: '保留最近对话',
         contextModeSummary: '自动摘要（适合便宜模型）',
@@ -435,6 +483,10 @@ const labels = computed(() =>
         deleteConnection: '删除连接',
         connectionName: '连接名称',
         protocol: '协议',
+        reasoningEffort: '推理 effort（模型默认）',
+        providerDefault: 'Provider default',
+        reasoningSummary: '显示推理摘要',
+        responsesHint: 'Responses API 使用标准 reasoning.effort；无需手写 JSON。摘要默认关闭。',
         endpoint: 'API 地址 / Base URL',
         endpointHint:
           '支持 Base URL 或完整端点，必须使用 HTTPS。模型列表接口不可用时仍可手动添加模型。',
@@ -455,8 +507,9 @@ const labels = computed(() =>
         refreshing: '刷新中…',
         discoveredModels: '发现的模型',
         modelAdvanced: '模型高级设置',
+        advancedCompatibility: '高级兼容选项（JSON 预设）',
         requestBodyPresetsEnabled: '配置请求 JSON 预设',
-        requestBodyPresetsHint: '根据模型或网关文档填写 JSON 对象；应用不会自动判断模型能力。预设可以覆盖 model、messages、tools、stream 等字段。',
+        requestBodyPresetsHint: '仅用于 Chat/Anthropic 或特殊兼容网关；Responses 预设不能覆盖应用管理的请求字段。',
         requestBodyPresetName: '预设名称',
         requestBodyPresetBody: '{"thinking":{"type":"enabled"}}',
         addRequestBodyPreset: '添加预设',
@@ -483,7 +536,7 @@ const labels = computed(() =>
     : {
         title: 'AI Connections & Models',
         description:
-          'Configure multiple connections compatible with OpenAI Chat Completions or Anthropic Messages. Keys stay in local user data and never enter the renderer.',
+          'Configure AI connections. New connections use OpenAI Responses by default; Chat Completions remains available as Legacy compatibility. Keys stay in local user data.',
         contextMode: 'Context mode',
         contextModeRecent: 'Keep recent messages',
         contextModeSummary: 'Automatic summary (for cheaper models)',
@@ -495,6 +548,10 @@ const labels = computed(() =>
         deleteConnection: 'Delete connection',
         connectionName: 'Connection name',
         protocol: 'Protocol',
+        reasoningEffort: 'Reasoning effort (model default)',
+        providerDefault: 'Provider default',
+        reasoningSummary: 'Show reasoning summary',
+        responsesHint: 'Responses API uses standard reasoning.effort; no JSON is required. Summaries are off by default.',
         endpoint: 'API endpoint / Base URL',
         endpointHint:
           'Base URLs and complete endpoints are supported over HTTPS. Models can still be added manually when discovery is unavailable.',
@@ -515,8 +572,9 @@ const labels = computed(() =>
         refreshing: 'Refreshing…',
         discoveredModels: 'Discovered models',
         modelAdvanced: 'Advanced model settings',
+        advancedCompatibility: 'Advanced compatibility options (JSON presets)',
         requestBodyPresetsEnabled: 'Configure request JSON presets',
-        requestBodyPresetsHint: 'Enter JSON objects from the model or gateway documentation. The app does not detect capabilities. Presets can override model, messages, tools, stream, and other request fields.',
+        requestBodyPresetsHint: 'Use for Chat/Anthropic or special compatibility gateways; Responses presets cannot override app-managed request fields.',
         requestBodyPresetName: 'Preset name',
         requestBodyPresetBody: '{"thinking":{"type":"enabled"}}',
         addRequestBodyPreset: 'Add preset',
@@ -595,6 +653,27 @@ const toggleRequestBodyPresets = (model: FormModel, enabled: boolean): void => {
   setRequestBodyPresetConfig(model, capabilities && Object.keys(capabilities).length ? capabilities : undefined)
 }
 
+const setResponsesReasoningEffort = (model: FormModel, value: string): void => {
+  const capabilities = { ...(model.capabilities ?? {}) }
+  const responses = { ...(capabilities.responses ?? {}) }
+  const valid: AiReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+  if (!value) delete responses.reasoningEffort
+  else if (valid.includes(value as AiReasoningEffort)) responses.reasoningEffort = value as AiReasoningEffort
+  if (Object.keys(responses).length) capabilities.responses = responses
+  else delete capabilities.responses
+  model.capabilities = Object.keys(capabilities).length ? capabilities : undefined
+}
+
+const setResponsesReasoningSummary = (model: FormModel, enabled: boolean): void => {
+  const capabilities = { ...(model.capabilities ?? {}) }
+  const responses = { ...(capabilities.responses ?? {}) }
+  if (enabled) responses.reasoningSummary = true
+  else delete responses.reasoningSummary
+  if (Object.keys(responses).length) capabilities.responses = responses
+  else delete capabilities.responses
+  model.capabilities = Object.keys(capabilities).length ? capabilities : undefined
+}
+
 const addRequestBodyPreset = (model: FormModel): void => {
   const config = model.capabilities?.requestBodyPresets
   if (!config || config.presets.length >= 16) return
@@ -653,22 +732,24 @@ const setEditAgentPreset = (model: FormModel, value: string): void => {
 
 const cloneCapabilities = (capabilities: AiModelCapabilities | undefined, model?: FormModel): AiModelCapabilities | undefined => {
   if (!capabilities) return undefined
-  if (!capabilities.requestBodyPresets) return { ...capabilities }
-  const presets = capabilities.requestBodyPresets.presets.map(preset => {
+  const presets = capabilities.requestBodyPresets?.presets.map(preset => {
     const draft = model ? requestBodyPresetDrafts[requestBodyPresetKey(model, preset)] : undefined
     const body = draft === undefined ? preset.body : JSON.parse(draft) as Record<string, AiJsonValue>
     return { ...preset, body: JSON.parse(JSON.stringify(body)) }
   })
   return {
     ...capabilities,
-    requestBodyPresets: { ...capabilities.requestBodyPresets, presets }
+    ...(capabilities.responses ? { responses: { ...capabilities.responses } } : {}),
+    ...(capabilities.requestBodyPresets && presets
+      ? { requestBodyPresets: { ...capabilities.requestBodyPresets, presets } }
+      : {})
   }
 }
 
 const resetForm = (): void => {
   form.id = undefined
   form.name = chinese.value ? '新连接' : 'New connection'
-  form.protocol = 'openai-chat-completions'
+  form.protocol = 'openai-responses'
   form.endpoint = ''
   form.models = []
   defaultModelId.value = ''
@@ -1032,6 +1113,26 @@ onMounted(() => {
 }
 .model-row button {
   height: 30px;
+}
+.responses-model-options {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--floatBorderColor);
+  border-radius: 4px;
+}
+.responses-model-options > label:first-child {
+  color: var(--editorColor60);
+  font-size: 12px;
+}
+.responses-model-options select {
+  margin-top: 0;
+}
+.responses-model-options small {
+  color: var(--editorColor50);
+  font-size: 11px;
 }
 .model-advanced {
   margin-top: 6px;
