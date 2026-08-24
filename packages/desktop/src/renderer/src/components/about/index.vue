@@ -19,7 +19,7 @@
         </el-col>
         <el-col :span="24">
           <div class="text">
-            {{ store.appVersion }}
+            {{ store.appVersion }} ({{ store.gitHash }})
           </div>
         </el-col>
         <el-col :span="24">
