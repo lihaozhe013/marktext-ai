@@ -93,7 +93,7 @@
         @change="selectReasoningEffort"
       >
         <option value="__model_default__">
-          {{ labels.reasoningEffortModelDefault }}
+          {{ labels.reasoningEffortModelDefault(ai.selectedResponsesModelOptions?.reasoningEffort) }}
         </option>
         <option value="__provider_default__">
           {{ labels.reasoningEffortProviderDefault }}
@@ -134,7 +134,7 @@
         @change="selectVerbosity"
       >
         <option value="__model_default__">
-          {{ labels.verbosityModelDefault }}
+          {{ labels.verbosityModelDefault(ai.selectedResponsesModelOptions?.verbosity) }}
         </option>
         <option value="__provider_default__">
           {{ labels.verbosityProviderDefault }}

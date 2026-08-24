@@ -1155,12 +1155,13 @@ onMounted(() => {
   border: 1px solid var(--floatBorderColor);
   border-radius: 4px;
 }
-.responses-model-options > label:first-child {
+.responses-model-options > label:not(.checkbox-row) {
   color: var(--editorColor60);
   font-size: 12px;
 }
 .responses-model-options select {
   margin-top: 0;
+  font-size: 12px;
 }
 .responses-model-options small {
   color: var(--editorColor50);
