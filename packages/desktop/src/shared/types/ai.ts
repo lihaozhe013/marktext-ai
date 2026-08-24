@@ -6,10 +6,12 @@ export type AiModelSource = 'manual' | 'discovered'
 export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_content' | 'reasoning_text'
 export type AiReasoningTag = 'think' | 'thinking' | 'analysis' | 'reasoning'
 export type AiReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type AiVerbosity = 'low' | 'medium' | 'high'
 
 export interface AiResponsesModelOptions {
   reasoningEffort?: AiReasoningEffort
   reasoningSummary?: boolean
+  verbosity?: AiVerbosity
 }
 
 export interface AiResponsesConversationState {
@@ -26,6 +28,11 @@ export interface AiResponsesConversationCandidate {
 export interface AiReasoningEffortOverride {
   modelRef: AiModelRef
   effort: AiReasoningEffort | null
+}
+
+export interface AiVerbosityOverride {
+  modelRef: AiModelRef
+  verbosity: AiVerbosity | null
 }
 
 export interface AiRecoveryInfo {
@@ -334,6 +341,7 @@ export interface AiChatSession {
   selectedModel?: AiModelRef
   requestBodyPresetOverrides?: AiRequestBodyPresetOverride[]
   reasoningEffortOverrides?: AiReasoningEffortOverride[]
+  verbosityOverrides?: AiVerbosityOverride[]
   responsesConversation?: AiResponsesConversationState
   /** Bounded document-scoped memory used when contextMode is summary. */
   contextSummary?: string
@@ -355,6 +363,7 @@ export interface AiRequest {
   modelRef: AiModelRef
   requestBodyPresetOverride?: string | null
   reasoningEffortOverride?: AiReasoningEffort | null
+  verbosityOverride?: AiVerbosity | null
   responsesConversation?: AiResponsesConversationState
   attachments?: AiAttachmentUpload[]
   renderedPdfPages?: AiRenderedPdfPages[]

@@ -80,6 +80,15 @@ and connection tests use `store: false` and never read or update the answer
 chain. Reasoning summaries remain separate collapsed UI content and are not
 replayed as ordinary Markdown context.
 
+Responses answer requests may set `text.verbosity` to `low`, `medium`, or
+`high`. The model profile can provide a default and the document session can
+override it with either a concrete level, Model default, or an explicit
+Provider default (which omits the field). Verbosity is carried into answer
+Markdown repair, but is omitted from edit Agent calls, rewrites, attachment
+extraction, hidden summaries, and connection tests so structured protocols are
+not affected. Responses JSON presets cannot override `text.verbosity`; users
+must use the standard model or session control.
+
 The renderer then records `sending`, `sent`, and `waiting` progress. The main
 process emits provider and Agent progress through `mt::ai::progress` while the
 request is running.

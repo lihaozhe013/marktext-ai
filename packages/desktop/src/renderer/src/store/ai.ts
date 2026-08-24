@@ -30,6 +30,8 @@ import type {
   AiRequestBodyPresetOverride,
   AiReasoningEffort,
   AiReasoningEffortOverride,
+  AiVerbosity,
+  AiVerbosityOverride,
   AiResponsesConversationState,
   AiProgressEvent,
   AiProgressInfo,
@@ -134,6 +136,7 @@ export const useAiStore = defineStore('ai', () => {
   const selectedModel = ref<AiModelRef | undefined>()
   const requestBodyPresetOverrides = ref<AiRequestBodyPresetOverride[]>([])
   const reasoningEffortOverrides = ref<AiReasoningEffortOverride[]>([])
+  const verbosityOverrides = ref<AiVerbosityOverride[]>([])
   const responsesConversation = ref<AiResponsesConversationState | undefined>()
   const pendingAttachments = ref<PendingAiAttachment[]>([])
   const attachmentError = ref<AiAttachmentError>('')
@@ -223,6 +226,24 @@ export const useAiStore = defineStore('ai', () => {
     return override === null ? '__provider_default__' : override
   })
 
+  const verbosityOverrideFor = (modelRef: AiModelRef | undefined): AiVerbosity | null | undefined => {
+    if (!modelRef) return undefined
+    return verbosityOverrides.value.find(item => modelRefKey(item.modelRef) === modelRefKey(modelRef))?.verbosity
+  }
+
+  const pruneVerbosityOverrides = (): void => {
+    verbosityOverrides.value = verbosityOverrides.value.filter(override => {
+      const option = modelOptions.value.find(item => modelRefKey(item.ref) === modelRefKey(override.modelRef))
+      return !!option?.responses
+    })
+  }
+
+  const verbositySelection = computed(() => {
+    const override = verbosityOverrideFor(selectedModel.value)
+    if (override === undefined) return '__model_default__'
+    return override === null ? '__provider_default__' : override
+  })
+
   const setReasoningEffort = (selection: string): void => {
     const modelRef = selectedModel.value
     if (!modelRef || !selectedResponsesModelOptions.value) return
@@ -234,6 +255,19 @@ export const useAiStore = defineStore('ai', () => {
       reasoningEffortOverrides.value.push({ modelRef: { ...modelRef }, effort })
     }
     saveChat().catch(err => featureLog('reasoning effort save failed reason=%s', err instanceof Error ? err.message : String(err)))
+  }
+
+  const setVerbosity = (selection: string): void => {
+    const modelRef = selectedModel.value
+    if (!modelRef || !selectedResponsesModelOptions.value) return
+    verbosityOverrides.value = verbosityOverrides.value.filter(item => modelRefKey(item.modelRef) !== modelRefKey(modelRef))
+    if (selection !== '__model_default__') {
+      const verbosity = selection === '__provider_default__' ? null : selection as AiVerbosity
+      const valid: AiVerbosity[] = ['low', 'medium', 'high']
+      if (verbosity !== null && !valid.includes(verbosity)) return
+      verbosityOverrides.value.push({ modelRef: { ...modelRef }, verbosity })
+    }
+    saveChat().catch(err => featureLog('verbosity save failed reason=%s', err instanceof Error ? err.message : String(err)))
   }
 
   const setRequestBodyPreset = (selection: string): void => {
@@ -380,6 +414,7 @@ export const useAiStore = defineStore('ai', () => {
     settings.value = value
     pruneRequestBodyPresetOverrides()
     pruneReasoningEffortOverrides()
+    pruneVerbosityOverrides()
     if (!isValidModelRef(selectedModel.value)) resolveSelectedModel()
   }
 
@@ -415,9 +450,11 @@ export const useAiStore = defineStore('ai', () => {
       contextSummary.value = loadedSession.contextSummary
       requestBodyPresetOverrides.value = loadedSession.requestBodyPresetOverrides ?? []
       reasoningEffortOverrides.value = loadedSession.reasoningEffortOverrides ?? []
+      verbosityOverrides.value = loadedSession.verbosityOverrides ?? []
       responsesConversation.value = loadedSession.responsesConversation
       pruneRequestBodyPresetOverrides()
       pruneReasoningEffortOverrides()
+      pruneVerbosityOverrides()
       selectedModel.value = loadedSession.selectedModel
       resolveSelectedModel()
       loadedChatDocumentId = documentId
@@ -428,6 +465,7 @@ export const useAiStore = defineStore('ai', () => {
       contextSummary.value = undefined
       requestBodyPresetOverrides.value = []
       reasoningEffortOverrides.value = []
+      verbosityOverrides.value = []
       responsesConversation.value = undefined
       resolveSelectedModel()
       loadedChatDocumentId = documentId
@@ -446,6 +484,7 @@ export const useAiStore = defineStore('ai', () => {
       selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined,
       requestBodyPresetOverrides: requestBodyPresetOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, presetId: item.presetId })),
       reasoningEffortOverrides: reasoningEffortOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, effort: item.effort })),
+      verbosityOverrides: verbosityOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, verbosity: item.verbosity })),
       responsesConversation: responsesConversation.value
         ? { modelRef: { ...responsesConversation.value.modelRef }, previousResponseId: responsesConversation.value.previousResponseId, anchorMessageId: responsesConversation.value.anchorMessageId }
         : undefined,
@@ -460,6 +499,7 @@ export const useAiStore = defineStore('ai', () => {
     contextSummary.value = undefined
     requestBodyPresetOverrides.value = []
     reasoningEffortOverrides.value = []
+    verbosityOverrides.value = []
     responsesConversation.value = undefined
     selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
@@ -866,6 +906,7 @@ export const useAiStore = defineStore('ai', () => {
         modelRef: requestModel,
         requestBodyPresetOverride: requestBodyPresetOverrideFor(requestModel),
         reasoningEffortOverride: reasoningEffortOverrideFor(requestModel),
+        verbosityOverride: requestMode === 'answer' ? verbosityOverrideFor(requestModel) : undefined,
         responsesConversation: requestResponsesConversation,
         attachments: uploads,
         messages: toIpcChatMessages(contextMessages),
@@ -1284,6 +1325,7 @@ export const useAiStore = defineStore('ai', () => {
     requestBodyPresetSelection,
     selectedResponsesModelOptions,
     reasoningEffortSelection,
+    verbositySelection,
     selectedModelKey: computed(() => modelRefKey(selectedModel.value)),
     mode,
     visible,
@@ -1308,6 +1350,7 @@ export const useAiStore = defineStore('ai', () => {
     selectModel,
     setRequestBodyPreset,
     setReasoningEffort,
+    setVerbosity,
     setDefaultModel,
     setWidth,
     addImageFiles,
