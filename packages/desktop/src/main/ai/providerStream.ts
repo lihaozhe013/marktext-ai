@@ -33,6 +33,30 @@ export interface ProviderStreamResult {
   responseId?: string
 }
 
+export interface ProviderStreamErrorDetails {
+  event: string
+  message: string
+  type?: string
+  code?: string
+  param?: string
+}
+
+export class ProviderStreamError extends Error {
+  readonly event: string
+  readonly type?: string
+  readonly code?: string
+  readonly param?: string
+
+  constructor(details: ProviderStreamErrorDetails) {
+    super(details.message)
+    this.name = 'ProviderStreamError'
+    this.event = details.event
+    this.type = details.type
+    this.code = details.code
+    this.param = details.param
+  }
+}
+
 interface SseEvent {
   event?: string
   data: string
@@ -62,7 +86,7 @@ interface ProviderStreamState {
   responseId?: string
   responseStatus?: string
   terminal?: boolean
-  error?: string
+  error?: ProviderStreamErrorDetails
   refusal?: string
   finalResponse?: Record<string, unknown>
 }
@@ -357,6 +381,24 @@ const readResponsesOutput = (
   if (response.status === 'incomplete' || incomplete?.reason === 'max_output_tokens') state.truncated = true
 }
 
+const readResponsesError = (event: string, payload: Record<string, unknown>): ProviderStreamErrorDetails => {
+  const response = isRecord(payload.response) ? payload.response : undefined
+  const error = isRecord(payload.error)
+    ? payload.error
+    : response && isRecord(response.error)
+      ? response.error
+      : payload
+  return {
+    event,
+    message: typeof error.message === 'string' && error.message
+      ? error.message
+      : 'The Responses API request failed.',
+    ...(typeof error.type === 'string' ? { type: error.type } : {}),
+    ...(typeof error.code === 'string' ? { code: error.code } : {}),
+    ...(typeof error.param === 'string' ? { param: error.param } : {})
+  }
+}
+
 const readResponsesDelta = (
   event: SseEvent,
   payload: Record<string, unknown>,
@@ -415,8 +457,7 @@ const readResponsesDelta = (
   } else if (eventType === 'response.failed' || eventType === 'response.error' || eventType === 'error') {
     state.terminal = true
     state.finishReason = 'failed'
-    const error = isRecord(payload.error) ? payload.error : payload
-    state.error = typeof error.message === 'string' ? error.message : 'The Responses API request failed.'
+    state.error = readResponsesError(eventType, payload)
   }
   return { content: '', reasoning: '' }
 }
@@ -484,7 +525,7 @@ export const consumeProviderStream = async(
   })
 
   if (protocol === 'openai-responses') {
-    if (state.error) throw new Error(state.error)
+    if (state.error) throw new ProviderStreamError(state.error)
     if (!state.terminal) throw new Error('The Responses API stream ended without a terminal event.')
   }
 
