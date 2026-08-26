@@ -29,8 +29,10 @@ import type {
   AiModelRef,
   AiRequestBodyPresetOverride,
   AiReasoningEffort,
+  AiReasoningEffortPreference,
   AiReasoningEffortOverride,
   AiVerbosity,
+  AiVerbosityPreference,
   AiVerbosityOverride,
   AiResponsesConversationState,
   AiProgressEvent,
@@ -158,6 +160,8 @@ export const useAiStore = defineStore('ai', () => {
   const changeVersion = ref(0)
   let chatLoadSequence = 0
   let loadedChatDocumentId = ''
+  let legacySelectionMigrationAttempted = false
+  let legacyResponseOptionsMigrationAttempted = false
   const chatPersistence = createAiChatPersistenceQueue(error => {
     featureLog('chat save failed reason=%s', error instanceof Error ? error.message : String(error))
   })
@@ -165,6 +169,45 @@ export const useAiStore = defineStore('ai', () => {
   const modelRefKey = (value: AiModelRef | undefined): string => value
     ? JSON.stringify(value)
     : ''
+
+  const reasoningEfforts: AiReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+  const verbosities: AiVerbosity[] = ['low', 'medium', 'high']
+
+  const reasoningEffortPreferenceToSelection = (preference: AiReasoningEffortPreference): string => {
+    if (preference === 'model-default') return '__model_default__'
+    if (preference === 'provider-default') return '__provider_default__'
+    return preference
+  }
+
+  const selectionToReasoningEffortPreference = (selection: string): AiReasoningEffortPreference | undefined => {
+    if (selection === '__model_default__') return 'model-default'
+    if (selection === '__provider_default__') return 'provider-default'
+    return reasoningEfforts.includes(selection as AiReasoningEffort) ? selection as AiReasoningEffort : undefined
+  }
+
+  const verbosityPreferenceToSelection = (preference: AiVerbosityPreference): string => {
+    if (preference === 'model-default') return '__model_default__'
+    if (preference === 'provider-default') return '__provider_default__'
+    return preference
+  }
+
+  const selectionToVerbosityPreference = (selection: string): AiVerbosityPreference | undefined => {
+    if (selection === '__model_default__') return 'model-default'
+    if (selection === '__provider_default__') return 'provider-default'
+    return verbosities.includes(selection as AiVerbosity) ? selection as AiVerbosity : undefined
+  }
+
+  const reasoningEffortOverrideFromPreference = (preference: AiReasoningEffortPreference): AiReasoningEffort | null | undefined => {
+    if (preference === 'model-default') return undefined
+    if (preference === 'provider-default') return null
+    return preference
+  }
+
+  const verbosityOverrideFromPreference = (preference: AiVerbosityPreference): AiVerbosity | null | undefined => {
+    if (preference === 'model-default') return undefined
+    if (preference === 'provider-default') return null
+    return preference
+  }
 
   const modelOptions = computed(() => settings.value.connections.flatMap(connection => connection.models.map(model => ({
     ref: { connectionId: connection.id, modelId: model.id },
@@ -210,6 +253,9 @@ export const useAiStore = defineStore('ai', () => {
 
   const reasoningEffortOverrideFor = (modelRef: AiModelRef | undefined): AiReasoningEffort | null | undefined => {
     if (!modelRef) return undefined
+    if (settings.value.lastUsedReasoningEffort !== undefined) {
+      return reasoningEffortOverrideFromPreference(settings.value.lastUsedReasoningEffort)
+    }
     return reasoningEffortOverrides.value.find(item => modelRefKey(item.modelRef) === modelRefKey(modelRef))?.effort
   }
 
@@ -221,6 +267,9 @@ export const useAiStore = defineStore('ai', () => {
   }
 
   const reasoningEffortSelection = computed(() => {
+    if (settings.value.lastUsedReasoningEffort !== undefined) {
+      return reasoningEffortPreferenceToSelection(settings.value.lastUsedReasoningEffort)
+    }
     const override = reasoningEffortOverrideFor(selectedModel.value)
     if (override === undefined) return '__model_default__'
     return override === null ? '__provider_default__' : override
@@ -228,6 +277,9 @@ export const useAiStore = defineStore('ai', () => {
 
   const verbosityOverrideFor = (modelRef: AiModelRef | undefined): AiVerbosity | null | undefined => {
     if (!modelRef) return undefined
+    if (settings.value.lastUsedVerbosity !== undefined) {
+      return verbosityOverrideFromPreference(settings.value.lastUsedVerbosity)
+    }
     return verbosityOverrides.value.find(item => modelRefKey(item.modelRef) === modelRefKey(modelRef))?.verbosity
   }
 
@@ -239,6 +291,9 @@ export const useAiStore = defineStore('ai', () => {
   }
 
   const verbositySelection = computed(() => {
+    if (settings.value.lastUsedVerbosity !== undefined) {
+      return verbosityPreferenceToSelection(settings.value.lastUsedVerbosity)
+    }
     const override = verbosityOverrideFor(selectedModel.value)
     if (override === undefined) return '__model_default__'
     return override === null ? '__provider_default__' : override
@@ -247,26 +302,36 @@ export const useAiStore = defineStore('ai', () => {
   const setReasoningEffort = (selection: string): void => {
     const modelRef = selectedModel.value
     if (!modelRef || !selectedResponsesModelOptions.value) return
+    const preference = selectionToReasoningEffortPreference(selection)
+    if (!preference) return
     reasoningEffortOverrides.value = reasoningEffortOverrides.value.filter(item => modelRefKey(item.modelRef) !== modelRefKey(modelRef))
-    if (selection !== '__model_default__') {
-      const effort = selection === '__provider_default__' ? null : selection as AiReasoningEffort
-      const valid: AiReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
-      if (effort !== null && !valid.includes(effort)) return
+    if (preference !== 'model-default') {
+      const effort = reasoningEffortOverrideFromPreference(preference)
+      if (effort === undefined) return
       reasoningEffortOverrides.value.push({ modelRef: { ...modelRef }, effort })
     }
+    settings.value = { ...settings.value, lastUsedReasoningEffort: preference }
+    window.electron.ipcRenderer.invoke('mt::ai::set-last-used-reasoning-effort', preference).catch(err => {
+      featureLog('last used reasoning effort save failed reason=%s', err instanceof Error ? err.message : String(err))
+    })
     saveChat().catch(err => featureLog('reasoning effort save failed reason=%s', err instanceof Error ? err.message : String(err)))
   }
 
   const setVerbosity = (selection: string): void => {
     const modelRef = selectedModel.value
     if (!modelRef || !selectedResponsesModelOptions.value) return
+    const preference = selectionToVerbosityPreference(selection)
+    if (!preference) return
     verbosityOverrides.value = verbosityOverrides.value.filter(item => modelRefKey(item.modelRef) !== modelRefKey(modelRef))
-    if (selection !== '__model_default__') {
-      const verbosity = selection === '__provider_default__' ? null : selection as AiVerbosity
-      const valid: AiVerbosity[] = ['low', 'medium', 'high']
-      if (verbosity !== null && !valid.includes(verbosity)) return
+    if (preference !== 'model-default') {
+      const verbosity = verbosityOverrideFromPreference(preference)
+      if (verbosity === undefined) return
       verbosityOverrides.value.push({ modelRef: { ...modelRef }, verbosity })
     }
+    settings.value = { ...settings.value, lastUsedVerbosity: preference }
+    window.electron.ipcRenderer.invoke('mt::ai::set-last-used-verbosity', preference).catch(err => {
+      featureLog('last used verbosity save failed reason=%s', err instanceof Error ? err.message : String(err))
+    })
     saveChat().catch(err => featureLog('verbosity save failed reason=%s', err instanceof Error ? err.message : String(err)))
   }
 
@@ -285,6 +350,11 @@ export const useAiStore = defineStore('ai', () => {
   }
 
   const resolveSelectedModel = (): AiModelRef | undefined => {
+    const lastUsedModel = settings.value.lastUsedModel
+    if (isValidModelRef(lastUsedModel)) {
+      selectedModel.value = { ...lastUsedModel }
+      return { ...lastUsedModel }
+    }
     if (isValidModelRef(selectedModel.value)) return { ...selectedModel.value }
     const fallback = settings.value.defaultModel
     if (isValidModelRef(fallback)) {
@@ -415,14 +485,22 @@ export const useAiStore = defineStore('ai', () => {
     pruneRequestBodyPresetOverrides()
     pruneReasoningEffortOverrides()
     pruneVerbosityOverrides()
-    if (!isValidModelRef(selectedModel.value)) resolveSelectedModel()
+    if (isValidModelRef(value.lastUsedModel)) {
+      if (modelRefKey(selectedModel.value) !== modelRefKey(value.lastUsedModel)) responsesConversation.value = undefined
+      selectedModel.value = { ...value.lastUsedModel }
+    } else if (!isValidModelRef(selectedModel.value)) {
+      resolveSelectedModel()
+    }
   }
 
   const selectModel = (value: AiModelRef): void => {
     if (!isValidModelRef(value)) return
     if (modelRefKey(selectedModel.value) !== modelRefKey(value)) responsesConversation.value = undefined
     selectedModel.value = { ...value }
-    saveChat().catch(err => featureLog('model selection save failed reason=%s', err instanceof Error ? err.message : String(err)))
+    settings.value = { ...settings.value, lastUsedModel: { ...value } }
+    window.electron.ipcRenderer.invoke('mt::ai::set-last-used-model', value).catch(err => {
+      featureLog('last used model save failed reason=%s', err instanceof Error ? err.message : String(err))
+    })
   }
 
   const setDefaultModel = async(value: AiModelRef | null): Promise<AiConnectionSettings> => {
@@ -455,8 +533,48 @@ export const useAiStore = defineStore('ai', () => {
       pruneRequestBodyPresetOverrides()
       pruneReasoningEffortOverrides()
       pruneVerbosityOverrides()
-      selectedModel.value = loadedSession.selectedModel
+      if (!legacySelectionMigrationAttempted) {
+        legacySelectionMigrationAttempted = true
+        if (!isValidModelRef(settings.value.lastUsedModel) && isValidModelRef(loadedSession.selectedModel)) {
+          selectedModel.value = { ...loadedSession.selectedModel }
+          settings.value = { ...settings.value, lastUsedModel: { ...loadedSession.selectedModel } }
+          window.electron.ipcRenderer.invoke('mt::ai::set-last-used-model', loadedSession.selectedModel).catch(err => {
+            featureLog('legacy model migration failed reason=%s', err instanceof Error ? err.message : String(err))
+          })
+        }
+      }
       resolveSelectedModel()
+      if (!legacyResponseOptionsMigrationAttempted) {
+        legacyResponseOptionsMigrationAttempted = true
+        const migratedSettings: Partial<AiConnectionSettings> = {}
+        if (settings.value.lastUsedReasoningEffort === undefined) {
+          const effort = reasoningEffortOverrideFor(selectedModel.value)
+          migratedSettings.lastUsedReasoningEffort = effort === undefined ? 'model-default' : effort === null ? 'provider-default' : effort
+        }
+        if (settings.value.lastUsedVerbosity === undefined) {
+          const verbosity = verbosityOverrideFor(selectedModel.value)
+          migratedSettings.lastUsedVerbosity = verbosity === undefined ? 'model-default' : verbosity === null ? 'provider-default' : verbosity
+        }
+        if (migratedSettings.lastUsedReasoningEffort !== undefined || migratedSettings.lastUsedVerbosity !== undefined) {
+          settings.value = { ...settings.value, ...migratedSettings }
+          if (migratedSettings.lastUsedReasoningEffort !== undefined) {
+            window.electron.ipcRenderer.invoke('mt::ai::set-last-used-reasoning-effort', migratedSettings.lastUsedReasoningEffort).catch(err => {
+              featureLog('legacy reasoning effort migration failed reason=%s', err instanceof Error ? err.message : String(err))
+            })
+          }
+          if (migratedSettings.lastUsedVerbosity !== undefined) {
+            window.electron.ipcRenderer.invoke('mt::ai::set-last-used-verbosity', migratedSettings.lastUsedVerbosity).catch(err => {
+              featureLog('legacy verbosity migration failed reason=%s', err instanceof Error ? err.message : String(err))
+            })
+          }
+        }
+      }
+      if (
+        responsesConversation.value &&
+        modelRefKey(responsesConversation.value.modelRef) !== modelRefKey(selectedModel.value)
+      ) {
+        responsesConversation.value = undefined
+      }
       loadedChatDocumentId = documentId
     } catch (err) {
       if (loadSequence !== chatLoadSequence || documentId !== currentDocumentId.value) return
@@ -481,7 +599,6 @@ export const useAiStore = defineStore('ai', () => {
     if (!documentId) return Promise.resolve()
     const session: AiChatSession = {
       messages: toIpcChatMessages(messages.value.slice(-MAX_STORED_CHAT_MESSAGES)),
-      selectedModel: selectedModel.value ? { ...selectedModel.value } : undefined,
       requestBodyPresetOverrides: requestBodyPresetOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, presetId: item.presetId })),
       reasoningEffortOverrides: reasoningEffortOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, effort: item.effort })),
       verbosityOverrides: verbosityOverrides.value.map(item => ({ modelRef: { ...item.modelRef }, verbosity: item.verbosity })),
@@ -501,7 +618,6 @@ export const useAiStore = defineStore('ai', () => {
     reasoningEffortOverrides.value = []
     verbosityOverrides.value = []
     responsesConversation.value = undefined
-    selectedModel.value = resolveSelectedModel()
     lastAnswer.value = ''
     currentProgress.value = undefined
     attachmentError.value = ''

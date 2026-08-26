@@ -88,6 +88,116 @@ describe('AI connection profiles and model routing', () => {
     expect(JSON.stringify(saved)).not.toContain('key-b')
   })
 
+  it('persists provider order and keeps default and last-used models independent', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-ordering-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+
+    const first = await service.saveConnection(connection('Provider A', 'https://a.example/v1', 'model-a', 'key-a'))
+    const second = await service.saveConnection(connection('Provider B', 'https://b.example/v1', 'model-b', 'key-b'))
+    const third = await service.saveConnection(connection('Provider C', 'https://c.example/v1', 'model-c', 'key-c'))
+    const firstRef = { connectionId: first.connections[0].id, modelId: first.connections[0].models[0].id }
+    const secondRef = { connectionId: second.connections[1].id, modelId: second.connections[1].models[0].id }
+    const thirdId = third.connections[2].id
+
+    await service.setDefaultModel(firstRef)
+    const withLastUsed = await service.setLastUsedModel(secondRef)
+    expect(withLastUsed.defaultModel).toEqual(firstRef)
+    expect(withLastUsed.lastUsedModel).toEqual(secondRef)
+
+    const reordered = await service.reorderConnections([thirdId, firstRef.connectionId, secondRef.connectionId])
+    expect(reordered.connections.map(item => item.id)).toEqual([thirdId, firstRef.connectionId, secondRef.connectionId])
+    expect(reordered.defaultModel).toEqual(firstRef)
+    expect(reordered.lastUsedModel).toEqual(secondRef)
+
+    const reloaded = new AiService(directory)
+    const persisted = await reloaded.getSettings()
+    expect(persisted.connections.map(item => item.id)).toEqual([thirdId, firstRef.connectionId, secondRef.connectionId])
+    expect(persisted.defaultModel).toEqual(firstRef)
+    expect(persisted.lastUsedModel).toEqual(secondRef)
+
+    await expect(reloaded.reorderConnections([thirdId, thirdId, firstRef.connectionId])).rejects.toThrow('exactly once')
+    expect((await reloaded.getSettings()).connections.map(item => item.id)).toEqual([thirdId, firstRef.connectionId, secondRef.connectionId])
+  })
+
+  it('persists model ordering and falls back when the last-used model is removed', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-model-ordering-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const initial = await service.saveConnection({
+      name: 'Models',
+      protocol: 'openai-chat-completions',
+      endpoint: 'https://models.example/v1',
+      models: [
+        { model: 'model-a', label: 'A' },
+        { model: 'model-b', label: 'B' },
+        { model: 'model-c', label: 'C' }
+      ],
+      apiKey: 'models-key'
+    })
+    const savedConnection = initial.connections[0]
+    const modelRefs = savedConnection.models.map(model => ({ connectionId: savedConnection.id, modelId: model.id }))
+    await service.setDefaultModel(modelRefs[0])
+    await service.setLastUsedModel(modelRefs[2])
+
+    const reordered = await service.saveConnection({
+      id: savedConnection.id,
+      name: savedConnection.name,
+      protocol: savedConnection.protocol,
+      endpoint: savedConnection.endpoint,
+      models: savedConnection.models.slice().reverse().map(model => ({
+        id: model.id,
+        model: model.model,
+        label: model.label,
+        source: model.source,
+        capabilities: model.capabilities
+      }))
+    })
+    expect(reordered.connections[0].models.map(model => model.model)).toEqual(['model-c', 'model-b', 'model-a'])
+    expect(reordered.lastUsedModel).toEqual(modelRefs[2])
+
+    const withoutLastUsed = await service.saveConnection({
+      id: savedConnection.id,
+      name: savedConnection.name,
+      protocol: savedConnection.protocol,
+      endpoint: savedConnection.endpoint,
+      models: [savedConnection.models[0]]
+    })
+    expect(withoutLastUsed.defaultModel).toEqual(modelRefs[0])
+    expect(withoutLastUsed.lastUsedModel).toEqual(modelRefs[0])
+  })
+
+  it('persists last-used reasoning effort and verbosity independently from the model', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-response-preferences-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    await service.saveConnection({
+      name: 'Responses',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses.example/v1',
+      models: [{
+        model: 'response-model',
+        capabilities: { responses: { reasoningEffort: 'low', verbosity: 'medium' } }
+      }],
+      apiKey: 'responses-key'
+    })
+
+    const saved = await service.setLastUsedReasoningEffort('high')
+    expect(saved.lastUsedReasoningEffort).toBe('high')
+    expect(saved.lastUsedVerbosity).toBeUndefined()
+    const withVerbosity = await service.setLastUsedVerbosity('low')
+    expect(withVerbosity.lastUsedReasoningEffort).toBe('high')
+    expect(withVerbosity.lastUsedVerbosity).toBe('low')
+
+    const reloaded = new AiService(directory)
+    expect((await reloaded.getSettings()).lastUsedReasoningEffort).toBe('high')
+    expect((await reloaded.getSettings()).lastUsedVerbosity).toBe('low')
+
+    const reset = await reloaded.setLastUsedReasoningEffort('model-default')
+    expect(reset.lastUsedReasoningEffort).toBe('model-default')
+    expect((await reloaded.setLastUsedVerbosity('provider-default')).lastUsedVerbosity).toBe('provider-default')
+  })
+
   it('migrates the legacy single connection and key format', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-migration-'))
     directories.push(directory)
@@ -1675,7 +1785,7 @@ describe('AI connection profiles and model routing', () => {
     ])
   })
 
-  it('loads legacy chat arrays and saves selected model metadata', async() => {
+  it('loads legacy chat arrays without continuing per-document model persistence', async() => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-chat-migration-'))
     directories.push(directory)
     await writeFile(path.join(directory, 'ai-chat.json'), JSON.stringify({
@@ -1700,10 +1810,10 @@ describe('AI connection profiles and model routing', () => {
     })
     const stored = JSON.parse(await readFile(path.join(directory, 'ai-chat.json'), 'utf8'))
     expect(stored['tab:test']).toMatchObject({
-      selectedModel: { connectionId: 'connection-a', modelId: 'model-a' },
       requestBodyPresetOverrides: [{ modelRef: { connectionId: 'connection-a', modelId: 'model-a' }, presetId: 'preset-high' }],
       verbosityOverrides: [{ modelRef: { connectionId: 'connection-a', modelId: 'model-a' }, verbosity: null }]
     })
+    expect(stored['tab:test'].selectedModel).toBeUndefined()
     expect((await service.loadChat('tab:test')).verbosityOverrides).toEqual([{
       modelRef: { connectionId: 'connection-a', modelId: 'model-a' },
       verbosity: null

@@ -40,6 +40,7 @@ import type {
   AiDiscoveredModel,
   AiModelListInput,
   AiModelRef,
+  AiReasoningEffortPreference,
   AiPreparedRevision,
   AiProgressEvent,
   AiRequest,
@@ -47,6 +48,7 @@ import type {
   AiSettings,
   AiTestResult,
   AiUndoResult,
+  AiVerbosityPreference,
   AiRevisionRequest
 } from './ai'
 
@@ -64,6 +66,10 @@ export interface IpcInvokeChannels {
   'mt::ai::delete-connection': { args: [connectionId: string]; ret: AiSettings }
   'mt::ai::delete-connection-key': { args: [connectionId: string]; ret: AiSettings }
   'mt::ai::set-default-model': { args: [modelRef: AiModelRef | null]; ret: AiSettings }
+  'mt::ai::set-last-used-model': { args: [modelRef: AiModelRef | null]; ret: AiSettings }
+  'mt::ai::set-last-used-reasoning-effort': { args: [preference: AiReasoningEffortPreference | null]; ret: AiSettings }
+  'mt::ai::set-last-used-verbosity': { args: [preference: AiVerbosityPreference | null]; ret: AiSettings }
+  'mt::ai::reorder-connections': { args: [connectionIds: string[]]; ret: AiSettings }
   'mt::ai::test-connection': { args: [connection: AiConnectionInput]; ret: AiTestResult }
   'mt::ai::list-models': { args: [connection: AiModelListInput]; ret: AiDiscoveredModel[] }
   'mt::ai::request': { args: [request: AiRequest]; ret: AiResponse }

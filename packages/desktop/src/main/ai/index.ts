@@ -21,10 +21,12 @@ import type {
   AiRequestBodyPreset,
   AiRequestBodyPresetOverride,
   AiReasoningEffort,
+  AiReasoningEffortPreference,
   AiReasoningField,
   AiReasoningTag,
   AiReasoningEffortOverride,
   AiVerbosity,
+  AiVerbosityPreference,
   AiVerbosityOverride,
   AiResponsesModelOptions,
   AiResponsesConversationState,
@@ -222,6 +224,9 @@ export interface StoredSettings {
   schemaVersion: typeof SETTINGS_SCHEMA_VERSION
   connections: StoredConnection[]
   defaultModel?: AiModelRef
+  lastUsedModel?: AiModelRef
+  lastUsedReasoningEffort?: AiReasoningEffortPreference
+  lastUsedVerbosity?: AiVerbosityPreference
   editAutoRetryCount: number
   editAgentMaxSteps: number
   failureOutputAfter: number
@@ -484,6 +489,18 @@ const isReasoningEffort = (value: unknown): value is AiReasoningEffort =>
 const isVerbosity = (value: unknown): value is AiVerbosity =>
   value === 'low' || value === 'medium' || value === 'high'
 
+const isReasoningEffortPreference = (value: unknown): value is AiReasoningEffortPreference =>
+  value === 'model-default' || value === 'provider-default' || isReasoningEffort(value)
+
+const isVerbosityPreference = (value: unknown): value is AiVerbosityPreference =>
+  value === 'model-default' || value === 'provider-default' || isVerbosity(value)
+
+const normalizeReasoningEffortPreference = (value: unknown): AiReasoningEffortPreference | undefined =>
+  isReasoningEffortPreference(value) ? value : undefined
+
+const normalizeVerbosityPreference = (value: unknown): AiVerbosityPreference | undefined =>
+  isVerbosityPreference(value) ? value : undefined
+
 const normalizeResponsesModelOptions = (value: unknown, strict = false): AiResponsesModelOptions | undefined => {
   if (!isRecord(value)) return undefined
   const reasoningEffort = value.reasoningEffort
@@ -596,6 +613,9 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
       schemaVersion: SETTINGS_SCHEMA_VERSION,
       connections,
       defaultModel: normalizeModelRef(value.defaultModel),
+      lastUsedModel: normalizeModelRef(value.lastUsedModel),
+      lastUsedReasoningEffort: normalizeReasoningEffortPreference(value.lastUsedReasoningEffort),
+      lastUsedVerbosity: normalizeVerbosityPreference(value.lastUsedVerbosity),
       editAutoRetryCount: normalizeEditAutoRetryCount(value.editAutoRetryCount),
       editAgentMaxSteps: normalizeEditAgentMaxSteps(value.editAgentMaxSteps),
       failureOutputAfter: normalizeFailureOutputAfter(value.failureOutputAfter),
@@ -625,6 +645,11 @@ const normalizeStoredSettings = (value: unknown): { settings: StoredSettings; le
       defaultModel: legacyModel
         ? { connectionId: legacyConnection.id, modelId: legacyConnection.models[0].id }
         : undefined,
+      lastUsedModel: legacyModel
+        ? { connectionId: legacyConnection.id, modelId: legacyConnection.models[0].id }
+        : undefined,
+      lastUsedReasoningEffort: undefined,
+      lastUsedVerbosity: undefined,
       editAutoRetryCount: DEFAULT_EDIT_AUTO_RETRY_COUNT,
       editAgentMaxSteps: DEFAULT_EDIT_AGENT_MAX_STEPS,
       failureOutputAfter: DEFAULT_FAILURE_OUTPUT_AFTER,
@@ -679,8 +704,24 @@ const validateConnectionInput = (input: AiConnectionInput): {
   }
 }
 
+const hasStoredModelRef = (connections: StoredConnection[], modelRef: AiModelRef | undefined): modelRef is AiModelRef =>
+  !!modelRef && connections.some(connection =>
+    connection.id === modelRef.connectionId && connection.models.some(model => model.id === modelRef.modelId)
+  )
+
+const firstStoredModelRef = (connections: StoredConnection[]): AiModelRef | undefined => {
+  for (const connection of connections) {
+    const model = connection.models[0]
+    if (model) return { connectionId: connection.id, modelId: model.id }
+  }
+  return undefined
+}
+
 const toPublicSettings = (settings: StoredSettings, keys: StoredKeys): AiSettings => ({
   defaultModel: settings.defaultModel,
+  lastUsedModel: settings.lastUsedModel,
+  lastUsedReasoningEffort: settings.lastUsedReasoningEffort,
+  lastUsedVerbosity: settings.lastUsedVerbosity,
   contextMode: settings.contextMode,
   editAutoRetryCount: settings.editAutoRetryCount,
   editAgentMaxSteps: settings.editAgentMaxSteps,
@@ -1121,7 +1162,6 @@ export class AiService {
     this.revisionStore = new AiRevisionStore(path.join(userDataPath, REVISION_FILE))
     this.chatStore = new AiChatStore(this.chatPath, {
       normalizeMessages,
-      normalizeModel: normalizeModelRef,
       normalizeSession: normalizeChatSession,
       clearPendingAttachments: documentId => {
         for (const [id, pendingDocumentId] of this.pendingAttachmentDocuments) {
@@ -1199,11 +1239,19 @@ export class AiService {
         : connection.models[0]
           ? { connectionId: connection.id, modelId: connection.models[0].id }
           : undefined
+      const lastUsedModel = current.settings.lastUsedModel === undefined
+        ? undefined
+        : hasStoredModelRef(connections, current.settings.lastUsedModel)
+          ? current.settings.lastUsedModel
+          : hasStoredModelRef(connections, defaultModel)
+            ? defaultModel
+            : firstStoredModelRef(connections)
       const settings: StoredSettings = {
         ...current.settings,
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         connections,
-        defaultModel
+        defaultModel,
+        lastUsedModel
       }
       const keys = { ...current.keys }
       if (typeof input.apiKey === 'string' && input.apiKey.trim()) keys[connection.id] = input.apiKey.trim()
@@ -1227,11 +1275,19 @@ export class AiService {
           ? { connectionId: fallbackConnection.id, modelId: fallbackConnection.models[0].id }
           : undefined
         : current.settings.defaultModel
+      const lastUsedModel = current.settings.lastUsedModel === undefined
+        ? undefined
+        : hasStoredModelRef(connections, current.settings.lastUsedModel)
+          ? current.settings.lastUsedModel
+          : hasStoredModelRef(connections, defaultModel)
+            ? defaultModel
+            : firstStoredModelRef(connections)
       const settings: StoredSettings = {
         ...current.settings,
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         connections,
-        defaultModel
+        defaultModel,
+        lastUsedModel
       }
       await writeJsonAtomic(this.settingsPath, settings)
       await writeJsonAtomic(this.keyPath, keys)
@@ -1266,6 +1322,82 @@ export class AiService {
         defaultModel: modelRef ?? undefined
       }
       await writeJsonAtomic(this.settingsPath, settings)
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
+  async setLastUsedModel(modelRef: AiModelRef | null): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      if (modelRef && !hasStoredModelRef(current.settings.connections, modelRef)) {
+        throw new Error('The selected AI model no longer exists.')
+      }
+      const settings: StoredSettings = {
+        ...current.settings,
+        lastUsedModel: modelRef ?? undefined
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog(
+        'last used model updated connectionId=%s modelId=%s',
+        modelRef?.connectionId ?? 'none',
+        modelRef?.modelId ?? 'none'
+      )
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
+  async setLastUsedReasoningEffort(preference: AiReasoningEffortPreference | null): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      if (preference !== null && !isReasoningEffortPreference(preference)) {
+        throw new Error('The selected reasoning effort is invalid.')
+      }
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        lastUsedReasoningEffort: preference ?? undefined
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('last used reasoning effort updated preference=%s', preference ?? 'none')
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
+  async setLastUsedVerbosity(preference: AiVerbosityPreference | null): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      if (preference !== null && !isVerbosityPreference(preference)) {
+        throw new Error('The selected verbosity is invalid.')
+      }
+      const current = await this.readSettingsState()
+      const settings: StoredSettings = {
+        ...current.settings,
+        lastUsedVerbosity: preference ?? undefined
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('last used verbosity updated preference=%s', preference ?? 'none')
+      return toPublicSettings(settings, current.keys)
+    })
+  }
+
+  async reorderConnections(connectionIds: string[]): Promise<AiSettings> {
+    return this.queueSettingsMutation(async() => {
+      const current = await this.readSettingsState()
+      const existingIds = current.settings.connections.map(connection => connection.id)
+      const requestedIds = Array.isArray(connectionIds) ? connectionIds : []
+      if (
+        requestedIds.length !== existingIds.length ||
+        new Set(requestedIds).size !== requestedIds.length ||
+        requestedIds.some(id => !existingIds.includes(id))
+      ) {
+        throw new Error('The AI connection order must contain every configured connection exactly once.')
+      }
+      const connectionsById = new Map(current.settings.connections.map(connection => [connection.id, connection]))
+      const connections = requestedIds.map(id => connectionsById.get(id) as StoredConnection)
+      const settings: StoredSettings = {
+        ...current.settings,
+        connections
+      }
+      await writeJsonAtomic(this.settingsPath, settings)
+      featureLog('connection order updated order=%s', requestedIds.join(','))
       return toPublicSettings(settings, current.keys)
     })
   }

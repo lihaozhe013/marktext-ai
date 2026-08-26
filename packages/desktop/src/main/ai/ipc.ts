@@ -22,6 +22,10 @@ type AiIpcService = Pick<
   | 'deleteConnection'
   | 'deleteConnectionKey'
   | 'setDefaultModel'
+  | 'setLastUsedModel'
+  | 'setLastUsedReasoningEffort'
+  | 'setLastUsedVerbosity'
+  | 'reorderConnections'
   | 'testConnection'
   | 'listModels'
   | 'request'
@@ -82,6 +86,26 @@ export const registerAiIpcHandlers = (aiService: AiIpcService): void => {
   })
   ipcMain.handle('mt::ai::set-default-model', async(_event, modelRef) => {
     const saved = await aiService.setDefaultModel(modelRef)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-last-used-model', async(_event, modelRef) => {
+    const saved = await aiService.setLastUsedModel(modelRef)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-last-used-reasoning-effort', async(_event, preference) => {
+    const saved = await aiService.setLastUsedReasoningEffort(preference)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::set-last-used-verbosity', async(_event, preference) => {
+    const saved = await aiService.setLastUsedVerbosity(preference)
+    broadcastSettings(saved)
+    return saved
+  })
+  ipcMain.handle('mt::ai::reorder-connections', async(_event, connectionIds: string[]) => {
+    const saved = await aiService.reorderConnections(connectionIds)
     broadcastSettings(saved)
     return saved
   })
