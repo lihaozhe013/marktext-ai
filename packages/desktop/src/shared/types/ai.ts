@@ -7,6 +7,8 @@ export type AiReasoningField = 'reasoning' | 'reasoning_content' | 'reason_conte
 export type AiReasoningTag = 'think' | 'thinking' | 'analysis' | 'reasoning'
 export type AiReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AiVerbosity = 'low' | 'medium' | 'high'
+export type AiReasoningEffortPreference = AiReasoningEffort | 'model-default' | 'provider-default'
+export type AiVerbosityPreference = AiVerbosity | 'model-default' | 'provider-default'
 
 export interface AiResponsesModelOptions {
   reasoningEffort?: AiReasoningEffort
@@ -163,6 +165,12 @@ export interface AiModelRef {
 export interface AiSettings {
   connections: AiConnectionProfile[]
   defaultModel?: AiModelRef
+  /** The model most recently selected in the AI panel, shared by all chats. */
+  lastUsedModel?: AiModelRef
+  /** The reasoning effort most recently selected in the AI panel, shared by all chats. */
+  lastUsedReasoningEffort?: AiReasoningEffortPreference
+  /** The response verbosity most recently selected in the AI panel, shared by all chats. */
+  lastUsedVerbosity?: AiVerbosityPreference
   /** Selects whether provider requests use recent chat messages or a rolling summary. */
   contextMode?: AiContextMode
   /** Number of protocol repair attempts after the initial edit generation. */
@@ -338,6 +346,7 @@ export interface AiChatMessage {
 
 export interface AiChatSession {
   messages: AiChatMessage[]
+  /** Legacy per-document selection retained only when reading old chat files. */
   selectedModel?: AiModelRef
   requestBodyPresetOverrides?: AiRequestBodyPresetOverride[]
   reasoningEffortOverrides?: AiReasoningEffortOverride[]

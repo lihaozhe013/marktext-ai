@@ -84,18 +84,44 @@
 
     <div class="connection-layout">
       <div class="connection-list">
-        <button
-          v-for="connection in settings.connections"
+        <div
+          v-for="(connection, index) in settings.connections"
           :key="connection.id"
-          type="button"
           class="connection-card"
           :class="{ active: connection.id === form.id }"
-          @click="selectConnection(connection.id)"
         >
-          <strong>{{ connection.name }}</strong>
-          <span>{{ connection.models.length }} {{ labels.models }}</span>
-          <small>{{ connection.hasApiKey ? labels.keyPresent : labels.keyMissing }}</small>
-        </button>
+          <button
+            type="button"
+            class="connection-select"
+            @click="selectConnection(connection.id)"
+          >
+            <strong>{{ connection.name }}</strong>
+            <span>{{ connection.models.length }} {{ labels.models }}</span>
+            <small>{{ connection.hasApiKey ? labels.keyPresent : labels.keyMissing }}</small>
+          </button>
+          <div class="connection-actions">
+            <button
+              type="button"
+              class="order-button"
+              :title="labels.moveConnectionUp"
+              :aria-label="labels.moveConnectionUp"
+              :disabled="reorderingConnections || index === 0"
+              @click="moveConnection(index, -1)"
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              class="order-button"
+              :title="labels.moveConnectionDown"
+              :aria-label="labels.moveConnectionDown"
+              :disabled="reorderingConnections || index === settings.connections.length - 1"
+              @click="moveConnection(index, 1)"
+            >
+              ↓
+            </button>
+          </div>
+        </div>
       </div>
 
       <section
@@ -175,7 +201,7 @@
             </button>
           </div>
           <div
-            v-for="model in form.models"
+            v-for="(model, index) in form.models"
             :key="model.id || model.model"
             class="model-editor"
           >
@@ -190,6 +216,28 @@
                 type="text"
                 :placeholder="labels.modelLabel"
               >
+              <div class="model-order-actions">
+                <button
+                  class="order-button"
+                  type="button"
+                  :title="labels.moveModelUp"
+                  :aria-label="labels.moveModelUp"
+                  :disabled="index === 0"
+                  @click="moveModel(index, -1)"
+                >
+                  ↑
+                </button>
+                <button
+                  class="order-button"
+                  type="button"
+                  :title="labels.moveModelDown"
+                  :aria-label="labels.moveModelDown"
+                  :disabled="index === form.models.length - 1"
+                  @click="moveModel(index, 1)"
+                >
+                  ↓
+                </button>
+              </div>
               <button
                 class="icon-danger"
                 type="button"
@@ -274,7 +322,7 @@
               <template v-if="model.capabilities?.requestBodyPresets">
                 <small>{{ labels.requestBodyPresetsHint }}</small>
                 <div
-                  v-for="(preset, index) in model.capabilities.requestBodyPresets.presets"
+                  v-for="(preset, presetIndex) in model.capabilities.requestBodyPresets.presets"
                   :key="preset.id"
                   class="request-preset-editor"
                 >
@@ -288,7 +336,7 @@
                     class="icon-danger"
                     type="button"
                     :title="labels.removeRequestBodyPreset"
-                    @click="removeRequestBodyPreset(model, index)"
+                    @click="removeRequestBodyPreset(model, presetIndex)"
                   >
                     ×
                   </button>
@@ -372,6 +420,7 @@
               {{ model.label || model.model }}
             </option>
           </select>
+          <small>{{ labels.defaultModelHint }}</small>
           <small>{{ labels.modelHint }}</small>
         </section>
 
@@ -472,6 +521,7 @@ const apiKey = ref('')
 const saving = ref(false)
 const testing = ref(false)
 const refreshing = ref(false)
+const reorderingConnections = ref(false)
 const status = ref('')
 const statusOk = ref(true)
 const discoveredModels = ref<AiDiscoveredModel[]>([])
@@ -520,9 +570,13 @@ const labels = computed(() =>
         modelId: '模型 ID',
         modelLabel: '显示名称（可选）',
         models: '个模型',
-        modelHint: '可手动添加模型，也可尝试刷新服务端模型列表。',
+        modelHint: '可手动添加模型、调整模型顺序，也可尝试刷新服务端模型列表；模型顺序会随连接保存。',
         addModel: '手动添加模型',
         removeModel: '移除模型',
+        moveConnectionUp: 'Provider 上移',
+        moveConnectionDown: 'Provider 下移',
+        moveModelUp: '模型上移',
+        moveModelDown: '模型下移',
         refreshModels: '刷新模型列表',
         refreshing: '刷新中…',
         discoveredModels: '发现的模型',
@@ -545,6 +599,7 @@ const labels = computed(() =>
         test: '测试连接',
         testing: '测试中…',
         defaultModel: '选择默认模型',
+        defaultModelHint: '默认模型只在没有最近使用模型，或最近使用模型失效时作为回退。',
         setDefault: '保存默认模型',
         deleteKey: '删除密钥',
         editAgentMaxSteps: '精准编辑 Agent 最大步骤数',
@@ -586,9 +641,13 @@ const labels = computed(() =>
         modelId: 'Model ID',
         modelLabel: 'Display name (optional)',
         models: 'models',
-        modelHint: 'Add model IDs manually or refresh the provider model list.',
+        modelHint: 'Add model IDs manually, adjust their order, or refresh the provider model list; model order is saved with the connection.',
         addModel: 'Add model manually',
         removeModel: 'Remove model',
+        moveConnectionUp: 'Move provider up',
+        moveConnectionDown: 'Move provider down',
+        moveModelUp: 'Move model up',
+        moveModelDown: 'Move model down',
         refreshModels: 'Refresh models',
         refreshing: 'Refreshing…',
         discoveredModels: 'Discovered models',
@@ -611,6 +670,7 @@ const labels = computed(() =>
         test: 'Test connection',
         testing: 'Testing…',
         defaultModel: 'Choose default model',
+        defaultModelHint: 'The default is used only when there is no valid recently used model.',
         setDefault: 'Save default model',
         deleteKey: 'Delete key',
         editAgentMaxSteps: 'Maximum Agent steps for precise editing',
@@ -810,6 +870,42 @@ const selectConnection = (id: string): void => {
   apiKey.value = ''
   discoveredModels.value = []
   status.value = ''
+}
+
+const moveConnection = async (index: number, direction: -1 | 1): Promise<void> => {
+  const targetIndex = index + direction
+  if (
+    reorderingConnections.value ||
+    index < 0 ||
+    index >= settings.value.connections.length ||
+    targetIndex < 0 ||
+    targetIndex >= settings.value.connections.length
+  ) return
+  const connectionIds = settings.value.connections.map(connection => connection.id)
+  const [moved] = connectionIds.splice(index, 1)
+  if (!moved) return
+  connectionIds.splice(targetIndex, 0, moved)
+  reorderingConnections.value = true
+  status.value = ''
+  try {
+    const value = await window.electron.ipcRenderer.invoke('mt::ai::reorder-connections', connectionIds)
+    settings.value = value
+    ai.setSettings(value)
+    statusOk.value = true
+    status.value = chinese.value ? 'Provider 顺序已保存。' : 'Provider order saved.'
+  } catch (err) {
+    statusOk.value = false
+    status.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    reorderingConnections.value = false
+  }
+}
+
+const moveModel = (index: number, direction: -1 | 1): void => {
+  const targetIndex = index + direction
+  if (index < 0 || index >= form.models.length || targetIndex < 0 || targetIndex >= form.models.length) return
+  const [moved] = form.models.splice(index, 1)
+  if (moved) form.models.splice(targetIndex, 0, moved)
 }
 
 const createConnection = (): void => {
@@ -1064,25 +1160,48 @@ onMounted(() => {
 }
 .connection-card {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0;
   border: 1px solid var(--floatBorderColor);
   border-radius: 5px;
   color: var(--editorColor);
   background: var(--editorBgColor);
-  cursor: pointer;
-  text-align: left;
   font: inherit;
 }
 .connection-card.active {
   border-color: var(--highlightThemeColor);
   box-shadow: 0 0 0 1px var(--highlightThemeColor);
 }
-.connection-card span,
-.connection-card small {
+.connection-select {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border: 0;
+  color: var(--editorColor);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+.connection-select:hover {
+  background: var(--floatHoverColor);
+}
+.connection-select span,
+.connection-select small {
   color: var(--editorColor60);
   font-size: 12px;
+}
+.connection-actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px;
 }
 .connection-editor {
   min-width: 0;
@@ -1130,7 +1249,7 @@ onMounted(() => {
 }
 .model-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 28px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto 28px;
   gap: 6px;
   align-items: center;
 }
@@ -1145,6 +1264,10 @@ onMounted(() => {
 }
 .model-row button {
   height: 30px;
+}
+.model-order-actions {
+  display: flex;
+  gap: 2px;
 }
 .responses-model-options {
   display: flex;
@@ -1251,6 +1374,23 @@ onMounted(() => {
 }
 .compact-button {
   padding: 5px 8px;
+}
+.order-button {
+  width: 26px;
+  height: 26px;
+  padding: 2px 5px;
+  border: 1px solid var(--floatBorderColor);
+  border-radius: 4px;
+  color: var(--editorColor);
+  background: var(--editorBgColor);
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+}
+.order-button:hover:not(:disabled) {
+  border-color: var(--highlightThemeColor);
+  color: var(--highlightThemeColor);
+  background: var(--floatHoverColor);
 }
 .primary-button {
   color: #fff;

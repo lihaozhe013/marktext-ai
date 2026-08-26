@@ -3,7 +3,6 @@ import { readJson, writeJsonAtomic } from './storage'
 
 interface AiChatStoreDependencies {
   normalizeMessages: (messages: AiChatSession['messages']) => AiChatSession['messages']
-  normalizeModel: (value: unknown) => AiChatSession['selectedModel']
   normalizeSession: (value: unknown) => AiChatSession
   clearPendingAttachments: (documentId: string) => void
   pruneAttachments: (graceMs: number) => Promise<void>
@@ -36,7 +35,6 @@ export class AiChatStore {
       const normalized = this.dependencies.normalizeSession(session)
       all[documentId] = {
         messages: normalized.messages,
-        selectedModel: this.dependencies.normalizeModel(normalized.selectedModel),
         ...(normalized.requestBodyPresetOverrides?.length
           ? { requestBodyPresetOverrides: normalized.requestBodyPresetOverrides }
           : {}),

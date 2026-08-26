@@ -922,8 +922,8 @@ const stopResize = (): void => {
 }
 
 onMounted(() => {
-  ai.loadSettings().catch(() => undefined)
-  ai.loadChat()
+  ai.loadSettings()
+    .then(() => ai.loadChat())
     .then(() => scrollMessagesToBottom())
     .catch(() => undefined)
   stopProgressListener = ai.listenForProgress()
