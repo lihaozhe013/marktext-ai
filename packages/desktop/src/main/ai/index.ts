@@ -46,7 +46,7 @@ import {
 import { runDocumentEditAgent, type AgentPlanStep } from './documentEditAgent'
 import { AiAttachmentStore, normalizeAttachmentUploads, normalizeImageAttachment, normalizeImageUpload, normalizePdfAttachment, orderAttachmentLocations } from './attachments'
 import { serializeProviderMessages, serializeResponsesInput, type ProviderImage, type ProviderMessage, type ProviderToolCall, type ProviderToolDefinition, type ProviderToolResult } from './providerMessages'
-import { consumeProviderStream, estimateTokenCount, type ProviderStreamProgress, type ProviderUsage } from './providerStream'
+import { consumeProviderStream, estimateTokenCount, ProviderStreamError, type ProviderStreamProgress, type ProviderUsage } from './providerStream'
 import { extractProviderContentParts, normalizeProviderContent, readReasoningField, type ProviderReasoningCompatibility } from './providerReasoning'
 import {
   buildAnswerSystemPrompt,
@@ -120,6 +120,7 @@ export type ProviderToolChoice = 'required' | 'auto' | { name: string }
 interface ProviderRequestOptions {
   tools?: ProviderToolDefinition[]
   toolChoice?: ProviderToolChoice
+  toolChoiceStyle?: 'named-function' | 'allowed-tools'
   parallelToolCalls?: boolean
   allowEmptyToolResponse?: boolean
   disableStreamFallback?: boolean
@@ -138,7 +139,7 @@ interface ProviderRequestOptions {
   omitVerbosity?: boolean
 }
 
-type AgentTransportMode = 'native-strict' | 'native-compatible' | 'json-envelope'
+type AgentTransportMode = 'native-strict' | 'native-compatible' | 'native-allowed-tools' | 'json-envelope'
 
 type AiProgressSink = (event: AiProgressEvent) => void
 
@@ -154,26 +155,45 @@ class ProviderRequestError extends Error {
   readonly toolRequest: boolean
   readonly providerMessage: string
   readonly providerParam?: string
+  readonly providerType?: string
+  readonly providerCode?: string
+  readonly streamFailure: boolean
 
-  constructor(message: string, status: number, toolRequest: boolean, providerMessage = message, providerParam?: string) {
+  constructor(
+    message: string,
+    status: number,
+    toolRequest: boolean,
+    providerMessage = message,
+    providerParam?: string,
+    metadata: { providerType?: string; providerCode?: string; streamFailure?: boolean } = {}
+  ) {
     super(message)
     this.name = 'ProviderRequestError'
     this.status = status
     this.toolRequest = toolRequest
     this.providerMessage = providerMessage
     this.providerParam = providerParam
+    this.providerType = metadata.providerType
+    this.providerCode = metadata.providerCode
+    this.streamFailure = metadata.streamFailure === true
   }
 }
 
 type AgentTransportRejection = 'strict' | 'tools'
 
 const classifyAgentTransportRejection = (error: unknown): AgentTransportRejection | undefined => {
-  if (!(error instanceof ProviderRequestError) || !error.toolRequest || ![400, 404, 422].includes(error.status)) return undefined
-  const message = `${error.providerMessage} ${error.providerParam ?? ''}`
+  if (
+    !(error instanceof ProviderRequestError) ||
+    !error.toolRequest ||
+    (!error.streamFailure && ![400, 404, 422].includes(error.status))
+  ) return undefined
+  const message = `${error.providerMessage} ${error.providerParam ?? ''} ${error.providerType ?? ''} ${error.providerCode ?? ''}`
   const mentionsTools = /\btools?\b|\btool[_ -]?choice\b|\bparallel[_ -]?tool[_ -]?calls\b|\btool calling\b|\bfunction calling\b/i.test(message)
-  const mentionsStrict = /\bstrict\b|function schema|function parameters|schema validation/i.test(message)
+  const mentionsStrict = /\bstrict\b|function schema|function parameters|schema validation|\bschema\b/i.test(message)
   if (!mentionsTools && !mentionsStrict) return undefined
-  if (!/unsupported|not support|does not support|unknown|unrecognized|invalid|not allowed|forbidden|rejected|unexpected|cannot|must be|does not accept/i.test(message)) return undefined
+  const mentionsUnsupported = /unsupported|not support|does not support|unknown|unrecognized|invalid|not allowed|forbidden|rejected|unexpected|cannot|must be|does not accept/i.test(message)
+  const explicitToolParameter = /\btools?\b|\btool[_ -]?choice\b|\bparallel[_ -]?tool[_ -]?calls\b|\bstrict\b|\bschema\b/i.test(error.providerParam ?? '')
+  if (!mentionsUnsupported && !explicitToolParameter) return undefined
   return mentionsStrict && !mentionsTools ? 'strict' : 'tools'
 }
 
@@ -1490,9 +1510,15 @@ export class AiService {
             }))
             body.tool_choice = options.toolChoice === 'auto'
               ? 'auto'
-              : typeof options.toolChoice === 'object'
-                ? { type: 'function', name: options.toolChoice.name }
-                : 'required'
+              : options.toolChoiceStyle === 'allowed-tools' && typeof options.toolChoice === 'object'
+                ? {
+                  type: 'allowed_tools',
+                  mode: 'required',
+                  tools: [{ type: 'function', name: options.toolChoice.name }]
+                }
+                : typeof options.toolChoice === 'object'
+                  ? { type: 'function', name: options.toolChoice.name }
+                  : 'required'
             if (options.parallelToolCalls !== undefined) body.parallel_tool_calls = options.parallelToolCalls
           }
         } else {
@@ -1605,7 +1631,29 @@ export class AiService {
         )
         if (response.ok && streaming && contentType.toLowerCase().includes('text/event-stream')) {
           if (!response.body) throw new Error('The provider returned an empty event stream.')
-          const streamed = await consumeProviderStream(settings.protocol, response.body, controller.signal, options.onProgress, compatibility)
+          let streamed: Awaited<ReturnType<typeof consumeProviderStream>>
+          try {
+            streamed = await consumeProviderStream(settings.protocol, response.body, controller.signal, options.onProgress, compatibility)
+          } catch (error) {
+            if (!(error instanceof ProviderStreamError)) throw error
+            featureLog(
+              'provider stream error event=%s type=%s code=%s param=%s toolRequest=%s requestId=%s',
+              error.event,
+              error.type ?? 'unknown',
+              error.code ?? 'unknown',
+              error.param ?? 'unknown',
+              !!options.tools?.length,
+              requestId
+            )
+            throw new ProviderRequestError(
+              `Provider returned a failed Responses stream from ${requestEndpoint}. ${error.message}`,
+              response.status,
+              !!options.tools?.length,
+              error.message,
+              error.param,
+              { providerType: error.type, providerCode: error.code, streamFailure: true }
+            )
+          }
           featureLog(
             'request body complete protocol=%s stream=true contentChars=%s outputTokens=%s outputTokensEstimated=%s elapsedMs=%s requestId=%s',
             settings.protocol,
@@ -2491,7 +2539,9 @@ export class AiService {
               ? { tools: agentRequest.tools, toolChoice: { name: expectedTool }, parallelToolCalls: false }
               : transport === 'native-compatible'
                 ? { tools: withoutStrictToolSchemas(agentRequest.tools), toolChoice: 'required' as const }
-                : {})
+                : transport === 'native-allowed-tools'
+                  ? { tools: withoutStrictToolSchemas(agentRequest.tools), toolChoice: { name: expectedTool }, toolChoiceStyle: 'allowed-tools' as const }
+                  : {})
           })
           const system = `${agentRequest.system}\nCall exactly one of the supplied editing tools on every turn.`
           const invoke = async(transport: AgentTransportMode): Promise<ProviderResponse> => {
@@ -2504,31 +2554,31 @@ export class AiService {
           let transport = cachedTransport ?? 'native-strict'
           let fallbackUsed = false
           const invokeWithFallback = async(start: AgentTransportMode): Promise<{ transport: AgentTransportMode, response: ProviderResponse }> => {
-            try {
-              return { transport: start, response: await invoke(start) }
-            } catch (error) {
-              const rejection = classifyAgentTransportRejection(error)
-              if (start === 'native-strict' && rejection) {
-                featureLog('edit agent transport downgrade strict->compatible requestId=%s', request.requestId)
-                try {
-                  const response = await invoke('native-compatible')
-                  fallbackUsed = true
-                  return { transport: 'native-compatible', response }
-                } catch (compatibleError) {
-                  if (!classifyAgentTransportRejection(compatibleError)) throw compatibleError
-                  featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
-                  const response = await invoke('json-envelope')
-                  fallbackUsed = true
-                  return { transport: 'json-envelope', response }
-                }
-              }
-              if (start === 'native-compatible' && rejection) {
-                featureLog('edit agent transport downgrade compatible->json requestId=%s', request.requestId)
-                const response = await invoke('json-envelope')
+            let current = start
+            while (true) {
+              try {
+                return { transport: current, response: await invoke(current) }
+              } catch (error) {
+                const rejection = classifyAgentTransportRejection(error)
+                if (!rejection) throw error
+                const next = current === 'native-strict'
+                  ? 'native-compatible'
+                  : current === 'native-compatible'
+                    ? settings.protocol === 'openai-responses' ? 'native-allowed-tools' : 'json-envelope'
+                    : current === 'native-allowed-tools'
+                      ? 'json-envelope'
+                      : undefined
+                if (!next) throw error
+                featureLog(
+                  'edit agent transport downgrade from=%s to=%s reason=%s requestId=%s',
+                  current,
+                  next,
+                  rejection,
+                  request.requestId
+                )
                 fallbackUsed = true
-                return { transport: 'json-envelope', response }
+                current = next
               }
-              throw error
             }
           }
           const invoked = await invokeWithFallback(transport)

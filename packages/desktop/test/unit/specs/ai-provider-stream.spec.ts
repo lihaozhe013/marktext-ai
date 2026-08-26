@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { consumeProviderStream } from 'main_renderer/ai/providerStream'
+import { consumeProviderStream, ProviderStreamError } from 'main_renderer/ai/providerStream'
 
 const streamFrom = (chunks: string[]): ReadableStream<Uint8Array> => {
   const encoder = new TextEncoder()
@@ -166,6 +166,35 @@ describe('provider response streams', () => {
       ]),
       undefined
     )).rejects.toThrow('Provider refusal: Not allowed')
+  })
+
+  it('preserves structured Responses stream error metadata', async() => {
+    const error = await consumeProviderStream(
+      'openai-responses',
+      streamFrom([
+        `event: response.failed\ndata: ${JSON.stringify({
+          type: 'response.failed',
+          response: {
+            status: 'failed',
+            error: {
+              type: 'invalid_request_error',
+              code: 'invalid_parameter',
+              param: 'tool_choice',
+              message: 'named function tool_choice is unsupported'
+            }
+          }
+        })}\n\n`
+      ]),
+      undefined
+    ).catch(value => value)
+    expect(error).toBeInstanceOf(ProviderStreamError)
+    expect(error).toMatchObject({
+      event: 'response.failed',
+      type: 'invalid_request_error',
+      code: 'invalid_parameter',
+      param: 'tool_choice',
+      message: 'named function tool_choice is unsupported'
+    })
   })
 
   it('marks max_output_tokens Responses completions as truncated', async() => {

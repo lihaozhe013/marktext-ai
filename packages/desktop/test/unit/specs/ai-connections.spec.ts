@@ -32,6 +32,30 @@ const streamResponse = (events: string[], status = 200): Response => ({
   })
 } as unknown as Response)
 
+const responsesToolStream = (name: string, input: Record<string, unknown>, callId = `call-${name}`): Response => {
+  const argumentsValue = JSON.stringify(input)
+  return streamResponse([
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', item: { type: 'function_call', call_id: callId, name } })}\n\n`,
+    `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: callId, delta: argumentsValue })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: `resp-${callId}`, status: 'completed', output: [{ type: 'function_call', call_id: callId, name, arguments: argumentsValue }] } })}\n\n`
+  ])
+}
+
+const responsesTextStream = (content: string): Response => streamResponse([
+  `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', delta: content })}\n\n`,
+  `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp-text', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: content }] }] } })}\n\n`
+])
+
+const responsesToolFailureStream = (message: string, param = 'tool_choice'): Response => streamResponse([
+  `event: response.failed\ndata: ${JSON.stringify({
+    type: 'response.failed',
+    response: {
+      status: 'failed',
+      error: { type: 'invalid_request_error', code: 'invalid_parameter', param, message }
+    }
+  })}\n\n`
+])
+
 const connection = (name: string, endpoint: string, model: string, apiKey: string): AiConnectionInput => ({
   name,
   protocol: 'openai-chat-completions',
@@ -995,6 +1019,136 @@ describe('AI connection profiles and model routing', () => {
     expect(requests.every(body => body.parallel_tool_calls === false)).toBe(true)
     expect(requests.map(body => (body.tool_choice as { function: { name: string } }).function.name)).toEqual(['create_markdown_edit_plan', 'append_markdown'])
     expect((requests[0].tools as Array<{ function: { strict?: boolean } }>)[0].function.strict).toBe(true)
+  })
+
+  it('downgrades Responses SSE tool failures to required and caches the compatible transport', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-agent-compatible-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Responses gateway',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses-gateway.example/v1',
+      models: [{ model: 'responses-agent-model' }],
+      apiKey: 'responses-agent-key'
+    })
+    const requests: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const toolName = (body.tools as Array<{ name?: string }> | undefined)?.[0]?.name
+      if (body.tool_choice && typeof body.tool_choice === 'object' && (body.tool_choice as { type?: string }).type === 'function') {
+        return responsesToolFailureStream('named function tool_choice is unsupported')
+      }
+      if (!toolName) throw new Error('Expected a native tool request.')
+      const input = toolName === 'create_markdown_edit_plan'
+        ? { summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }
+        : { markdown: 'Notes', description: 'Appended notes.' }
+      return responsesToolStream(toolName, input)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'responses-agent-compatible-request',
+      documentId: 'tab:responses-agent-compatible',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(requests[0].tool_choice).toEqual({ type: 'function', name: 'create_markdown_edit_plan' })
+    expect(requests[1].tool_choice).toBe('required')
+    expect(requests[2].tool_choice).toBe('required')
+    expect((requests[0].tools as Array<{ strict?: boolean }>)[0].strict).toBe(true)
+    expect((requests[1].tools as Array<{ strict?: boolean }>)[0].strict).toBeUndefined()
+    expect((requests[2].tools as Array<{ strict?: boolean }>)[0].strict).toBeUndefined()
+    expect(requests[0].parallel_tool_calls).toBe(false)
+    expect(requests[1].parallel_tool_calls).toBeUndefined()
+  })
+
+  it('tries Responses allowed_tools before the JSON envelope', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-agent-ladder-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Responses compatibility ladder',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses-ladder.example/v1',
+      models: [{ model: 'responses-ladder-model' }],
+      apiKey: 'responses-ladder-key'
+    })
+    const requests: Array<Record<string, unknown>> = []
+    let jsonCalls = 0
+    const fetchMock = vi.fn(async(_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>
+      requests.push(body)
+      const toolChoice = body.tool_choice
+      if (body.tools) {
+        if (toolChoice && typeof toolChoice === 'object' && (toolChoice as { type?: string }).type === 'allowed_tools') {
+          return responsesToolFailureStream('allowed_tools tool_choice is unsupported')
+        }
+        if (toolChoice === 'required') return responsesToolFailureStream('required tool_choice is unsupported')
+        return responsesToolFailureStream('named function tool_choice is unsupported')
+      }
+      jsonCalls += 1
+      const payload = jsonCalls === 1
+        ? { summary: 'Append notes.', steps: [{ id: 'append', description: 'Append notes.', intent: 'Append notes.', operation: 'append', startAnchor: null, endAnchor: null, dependsOn: [] }] }
+        : { markdown: 'Notes', description: 'Appended notes.' }
+      return responsesTextStream(JSON.stringify(payload))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.request({
+      requestId: 'responses-agent-ladder-request',
+      documentId: 'tab:responses-agent-ladder',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })
+
+    expect(result.markdown).toBe('Existing\n\nNotes')
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(requests[0].tool_choice).toEqual({ type: 'function', name: 'create_markdown_edit_plan' })
+    expect(requests[1].tool_choice).toBe('required')
+    expect(requests[2].tool_choice).toEqual({
+      type: 'allowed_tools',
+      mode: 'required',
+      tools: [{ type: 'function', name: 'create_markdown_edit_plan' }]
+    })
+    expect(requests[3].tools).toBeUndefined()
+    expect(requests[4].tools).toBeUndefined()
+  })
+
+  it('does not downgrade an unrelated Responses SSE failure', async() => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'marktext-ai-responses-agent-error-'))
+    directories.push(directory)
+    const service = new AiService(directory)
+    const saved = await service.saveConnection({
+      name: 'Responses provider error',
+      protocol: 'openai-responses',
+      endpoint: 'https://responses-error.example/v1',
+      models: [{ model: 'responses-error-model' }],
+      apiKey: 'responses-error-key'
+    })
+    const fetchMock = vi.fn().mockResolvedValue(responsesToolFailureStream('model overloaded', ''))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(service.request({
+      requestId: 'responses-agent-error-request',
+      documentId: 'tab:responses-agent-error',
+      mode: 'edit',
+      prompt: 'Append notes.',
+      markdown: 'Existing',
+      messages: [],
+      modelRef: { connectionId: saved.connections[0].id, modelId: saved.connections[0].models[0].id }
+    })).rejects.toThrow('model overloaded')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('falls back to a complete JSON envelope when native tool transport is unsupported', async() => {
