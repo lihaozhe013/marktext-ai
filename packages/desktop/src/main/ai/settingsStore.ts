@@ -1,5 +1,5 @@
 import { readJson, writeJsonAtomic } from './storage'
-import type { StoredKeys, StoredSettings } from './index'
+import type { StoredKeys, StoredSettings } from './types'
 
 interface AiSettingsStoreDependencies {
   normalizeSettings: (value: unknown) => { settings: StoredSettings; legacy: boolean }
