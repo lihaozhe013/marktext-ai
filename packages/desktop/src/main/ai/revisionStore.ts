@@ -2,7 +2,7 @@ import crypto from 'crypto'
 import type { AiPreparedRevision, AiRevisionRequest, AiUndoResult } from '@shared/types/ai'
 import { readJson, writeJsonAtomic } from './storage'
 import { featureLog } from './logging'
-import type { StoredRevision, StoredRevisionState } from './index'
+import type { StoredRevision, StoredRevisionState } from './types'
 
 const normalizeRevisionMarkdown = (value: string): string => value.replace(/[\r\n]+$/, '')
 
