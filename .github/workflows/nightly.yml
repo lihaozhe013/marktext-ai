@@ -1,37 +1,21 @@
-name: Release MarkText
+name: Build and publish nightly
 
 on:
   push:
-    # Broad trigger so the validate job can reject malformed v-tags
-    # (e.g. `vbad.tag`) instead of them silently not triggering anything.
-    tags:
-      - 'v*'
+    branches:
+      - build
+      - publish
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate tag
-    runs-on: ubuntu-latest
-    steps:
-      - name: Validate semver tag
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          # SemVer 2.0.0 with leading "v"
-          if ! [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Tag '$tag' is not a valid semver (expected vX.Y.Z[-prerelease][+build])"
-            exit 1
-          fi
-          echo "Tag '$tag' is valid."
-
   build:
     name: Build (${{ matrix.name }})
-    needs: validate
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -59,8 +43,8 @@ jobs:
             arch: arm64
 
     steps:
-      - name: Check out Git repository
-        uses: actions/checkout@v4.3.1
+      - name: Check out source
+        uses: actions/checkout@v7
 
       - name: Enable Git long paths on Windows
         if: matrix.platform == 'windows'
@@ -71,8 +55,8 @@ jobs:
         if: matrix.platform == 'linux'
         run: sudo apt-get update && sudo apt-get install -y icnsutils graphicsmagick xz-utils libx11-dev libxkbfile-dev gnome-keyring libsecret-1-dev libfontconfig-dev rpm
 
-      - name: Install Python 3.12
-        uses: actions/setup-python@v5.6.0
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -83,7 +67,7 @@ jobs:
 
       # Cache Electron binary; key on package.json so it busts when Electron version changes.
       - name: Cache Electron binary
-        uses: actions/cache@v4.3.0
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/electron
@@ -108,7 +92,7 @@ jobs:
           npm_config_user_agent: 'pnpm'
           USE_ELECTRON_CLANG: ${{ matrix.platform == 'linux' && '0' || '' }}
 
-      - name: build-linux
+      - name: Build Linux packages
         if: matrix.platform == 'linux'
         run: pnpm run build:linux
         env:
@@ -119,20 +103,20 @@ jobs:
       # --arm64/--x64 flags are additive over the config's arch list, so
       # electron-builder.yml must not pin mac.target arches for the flag to
       # actually restrict the build to a single arch.
-      - name: build-mac
+      - name: Build macOS packages
         if: matrix.platform == 'macos'
         run: pnpm run build:mac:${{ matrix.arch }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: build-win
+      - name: Build Windows packages
         if: matrix.platform == 'windows'
         run: pnpm run build:win:${{ matrix.arch }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v7
         with:
           name: marktext-${{ matrix.name }}
           retention-days: 7
@@ -150,7 +134,8 @@ jobs:
             dist/*.tar.gz
 
   release:
-    name: Publish GitHub Release
+    name: Publish nightly release
+    if: github.ref == 'refs/heads/publish'
     needs: build
     runs-on: ubuntu-latest
     # Per-job permissions REPLACE workflow-level ones, so re-declare
@@ -159,16 +144,28 @@ jobs:
     permissions:
       contents: write
       actions: read
+
     steps:
-      # upload-artifact@v4 treats `dist/` as the common-ancestor root and
+      # upload-artifact treats `dist/` as the common-ancestor root and
       # stores files flat inside each artifact (no `dist/` prefix). Downloading
       # with `path: dist` + `merge-multiple` recreates `./dist/<file>` across
       # all platforms.
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify build assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          count="$(find dist -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' | wc -l | tr -d ' ')"
+          if [[ "$count" -eq 0 ]]; then
+            echo "No build assets were produced."
+            exit 1
+          fi
+          echo "$count build assets found."
 
       - name: Generate SHA256SUMS.txt
         working-directory: dist
@@ -182,14 +179,11 @@ jobs:
 
       - name: Compose release notes body
         env:
-          IS_PRERELEASE: ${{ contains(github.ref_name, '-') }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           {
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              echo "## ❗ This is a pre-release"
-              echo "- May contain bugs and unfinished features."
-              echo ""
-            fi
+            echo "Automated nightly build for commit ${COMMIT_SHA:0:7}."
+            echo ""
             echo "## ⚠️ Note for macOS users"
             echo "Builds are unsigned (no Apple Developer ID). After dragging MarkText into Applications, clear the quarantine flag once:"
             echo '```'
@@ -203,24 +197,68 @@ jobs:
             echo '```'
           } > release_body.md
 
-      # Immutable-release repos forbid adding assets to an already-published
-      # release, and action-gh-release publishes before uploading the assets.
-      # Create the release as a draft (assets allowed), then promote it to a
-      # published release in the next step.
-      - name: Create draft release with assets
-        uses: softprops/action-gh-release@v2.6.2
-        with:
-          draft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          generate_release_notes: true
-          name: ${{ github.ref_name }}
-          body_path: release_body.md
-          fail_on_unmatched_files: true
-          files: dist/*
+      - name: Update nightly tag
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
 
-      - name: Promote draft to published release
-        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --repo "${GITHUB_REPOSITORY}"
+          tag_lookup_ref="repos/${REPOSITORY}/git/ref/tags/nightly"
+          tag_update_ref="repos/${REPOSITORY}/git/refs/tags/nightly"
+          if gh api "${tag_lookup_ref}" >/dev/null 2>&1; then
+            gh api --method PATCH "${tag_update_ref}" \
+              -f "sha=${COMMIT_SHA}" \
+              -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/git/refs" \
+              -f ref=refs/tags/nightly \
+              -f "sha=${COMMIT_SHA}" >/dev/null
+          fi
+
+      # Immutable-release repos forbid adding assets to an already-published
+      # release, so create/update it as a draft (assets allowed), replace the
+      # assets, then promote it to a published release in the final step.
+      - name: Replace nightly release assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          releases_api="repos/${REPOSITORY}/releases"
+          release_id=""
+          if release_id="$(gh api "${releases_api}/tags/nightly" --jq '.id' 2>/dev/null)"; then
+            gh api --method PATCH "${releases_api}/${release_id}" \
+              -f name="MarkText Nightly" \
+              -F "body=@release_body.md" \
+              -F draft=true \
+              -F prerelease=true \
+              -f make_latest=false >/dev/null
+          else
+            release_id="$(gh api --method POST "${releases_api}" \
+              -f tag_name=nightly \
+              -f name="MarkText Nightly" \
+              -F "body=@release_body.md" \
+              -F draft=true \
+              -F prerelease=true \
+              -f make_latest=false \
+              --jq '.id')"
+          fi
+
+          asset_ids="$(gh api --paginate "${releases_api}/${release_id}/assets?per_page=100" --jq '.[].id')"
+          while IFS= read -r asset_id; do
+            if [[ -n "${asset_id}" ]]; then
+              gh api --method DELETE "${releases_api}/assets/${asset_id}" >/dev/null
+            fi
+          done <<< "${asset_ids}"
+
+          gh release upload nightly dist/* \
+            --repo "${REPOSITORY}" \
+            --clobber
+
+          gh api --method PATCH "${releases_api}/${release_id}" \
+            -F draft=false \
+            -F prerelease=true \
+            -f make_latest=false >/dev/null
